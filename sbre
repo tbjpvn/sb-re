@@ -865,7 +865,7 @@ uninstall_singbox() {
 create_shortcut() {
     cat > "$work_dir/sb.sh" << 'EOF'
 #!/usr/bin/env bash
-bash <(curl -Ls https://raw.githubusercontent.com/tbjpvn/Sing-box/main/sing-box.sh) $1
+bash <(curl -Ls https://raw.githubusercontent.com/tbjpvn/sb-re/main/sbre) $1
 EOF
     chmod +x "$work_dir/sb.sh"
     ln -sf "$work_dir/sb.sh" /usr/bin/sb
@@ -1840,7 +1840,11 @@ add_ss_outbound() {
         userinfo=""; host_port="$after_proto"
     fi
 
-    server="${host_port%%:*}"; port="${host_port##*:}"
+    if [[ "$host_port" =~ ^\[([0-9a-fA-F:]+)\]:([0-9]+)$ ]]; then
+        server="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+    else
+        server="${host_port%%:*}"; port="${host_port##*:}"
+    fi
     [ -z "$server" ] || [ -z "$port" ] && { red "格式错误：缺少ip或端口"; sleep 2; return; }
 
     method=""; password=""
@@ -1927,10 +1931,18 @@ add_socks5_proxy() {
         fi
     fi
 
-    server="${host_port%%:*}"; port="${host_port##*:}"
+    if [[ "$host_port" =~ ^\[([0-9a-fA-F:]+)\]:([0-9]+)$ ]]; then
+        server="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+    else
+        server="${host_port%%:*}"; port="${host_port##*:}"
+    fi
     [ -z "$server" ] || [ -z "$port" ] && { red "格式错误：缺少ip或端口"; sleep 2; return; }
 
     [[ "$proto" == "socks" || "$proto" == "socks5" ]] && check_proto="socks5" || check_proto="$proto"
+
+    # 拼URL用的地址：IPv6需要重新套上方括号，纯IPv4/域名不用
+    local url_server="$server"
+    [[ "$server" == *:* ]] && url_server="[${server}]"
 
     # 判断是否为本地地址，本地地址跳过外部 API 检测，直接用 curl 测试
     local is_local=false
@@ -1944,8 +1956,8 @@ add_socks5_proxy() {
 
     if [ "$is_local" = true ]; then
         # 本地代理：直接用 curl 通过代理访问外网测试连通性
-        yellow "检测到本地代理 ${check_proto}://${server}:${port}，跳过外部API检测，正在用curl测试连通性..."
-        local curl_proxy_url="${check_proto}://${proxy_auth}${server}:${port}"
+        yellow "检测到本地代理 ${check_proto}://${url_server}:${port}，跳过外部API检测，正在用curl测试连通性..."
+        local curl_proxy_url="${check_proto}://${proxy_auth}${url_server}:${port}"
         local test_result
         test_result=$(curl -s --max-time 8 --proxy "$curl_proxy_url" "https://api.ip.sb/ip" 2>/dev/null)
         if [ -z "$test_result" ]; then
@@ -1957,10 +1969,10 @@ add_socks5_proxy() {
         fi
     else
         # 远程代理：调用外部 API 检测
-        yellow "正在测试代理 ${check_proto}://${server}:${port} ..."
+        yellow "正在测试代理 ${check_proto}://${url_server}:${port} ..."
         local api_response
         api_response=$(curl -s --max-time 8 -G \
-            --data-urlencode "proxy=${check_proto}://${proxy_auth}${server}:${port}" \
+            --data-urlencode "proxy=${check_proto}://${proxy_auth}${url_server}:${port}" \
             "https://check.socks5.cmliussss.net/check" 2>/dev/null)
         [ -z "$api_response" ] && { red "API 请求失败"; sleep 2; return; }
 
@@ -2518,7 +2530,7 @@ menu() {
     clear; echo ""
     green "Telegram群组: ${purple}https://t.me/eooceu${re}"
     green "YouTube频道: ${purple}https://youtube.com/@eooce${re}"
-    green "Github地址: ${purple}https://github.com/tbjpvn/Sing-box${re}\n"
+    green "Github地址: ${purple}https://github.com/tbjpvn/sb-re${re}\n"
     purple "=== 老王sing-box四合一安装脚本 ===\n"
     purple "---Argo 状态: ${argo_status}"
     purple "--Nginx 状态: ${nginx_status}"
