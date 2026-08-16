@@ -524,7 +524,7 @@ EOF
       {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
       {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
     ],
-    "rules": [{"rule_set": []}],
+    "rules": [{"action": "sniff"}],
     "final": "direct"
   }
 }
@@ -1570,8 +1570,36 @@ change_cfip() {
     purple "$new_vmess_url\n"
 }
 
+# 确保路由在所有规则之前执行协议/域名嗅探。
+# 现代 sing-box 推荐使用 route.rules 的 action: sniff，
+# 而不是旧版 inbound.sniff / sniff_override_destination。
+ensure_sniff_rule() {
+    local file="${conf_dir}/route.json"
+    [ -f "$file" ] || return 0
+
+    jq '
+      .route.rules = ([.route.rules[]? | select(
+        (.action? == "sniff") or
+        (.rule_set? != null and (.rule_set | length) > 0) or
+        (.domain_suffix? != null) or
+        (.domain? != null) or
+        (.ip_cidr? != null) or
+        (.ip_is_private? != null) or
+        (.protocol? != null) or
+        (.network? != null) or
+        (.inbound? != null)
+      )]) |
+      if any(.route.rules[]?; .action? == "sniff")
+      then .
+      else .route.rules = [{"action":"sniff"}] + .route.rules
+      end
+    ' "$file" > "${file}.tmp" 2>/dev/null && mv "${file}.tmp" "$file"
+}
+
 # WARP 分流管理
 warp_manage() {
+    ensure_sniff_rule
+
     check_singbox &>/dev/null
     if [ $? -eq 2 ]; then
         yellow "sing-box 尚未安装！"; sleep 1; menu; return
@@ -1585,7 +1613,12 @@ warp_manage() {
     green "=== WARP 分流管理 ===\n"
     green "当前已启用的分流规则集:"
     jq -r '.route.rules[] | select(.rule_set != null) | .rule_set[]?' "$route_file" 2>/dev/null | sort -u | while read tag; do
-        echo -e " - ${skyblue}$tag${re}"
+        extra=$(extra_ai_domains "$tag")
+        if [ -n "$extra" ]; then
+            echo -e " - ${skyblue}$tag${re} ${yellow}(已叠加API域名补充规则)${re}"
+        else
+            echo -e " - ${skyblue}$tag${re}"
+        fi
     done || echo "  无"
     green "\n已添加的代理出站(socks/http/ss):"
     jq -r '.outbounds[] | select(.tag != "direct") | " - \(.tag) [\(.type)]"' "$outbound_file" 2>/dev/null || echo "  无"
@@ -1612,6 +1645,26 @@ warp_manage() {
         0)  menu ;;
         00) exit 0 ;;
         *)  red "无效选项"; sleep 1; warp_manage ;;
+    esac
+}
+
+# AI服务的补充域名(API端点)，跟rule_set规则集配合使用而非替代它
+# 原因：公共geosite规则集(包括gemini.srs等)大多只收录消费级网站域名(如gemini.google.com)，
+# 不包含程序化访问用的API端点(如generativelanguage.googleapis.com)，导致API调用无法被正确分流
+extra_ai_domains() {
+    case "$1" in
+        gemini)
+            echo '["gemini.google.com","generativelanguage.googleapis.com","proactivebackend-pa.googleapis.com","alkalimakersuite-pa.clients6.google.com","aistudio.google.com","makersuite.google.com","aitestkitchen.withgoogle.com"]'
+            ;;
+        openai)
+            echo '["openai.com","chatgpt.com","chat.openai.com","oaistatic.com","oaiusercontent.com","ai.com"]'
+            ;;
+        claude)
+            echo '["claude.ai","anthropic.com","claude.com"]'
+            ;;
+        *)
+            echo ''
+            ;;
     esac
 }
 
@@ -1656,9 +1709,10 @@ add_rule_menu() {
         yellow "规则集 '${rule_tag}' 已启用。"; sleep 1; warp_manage; return
     fi
 
-    jq 'if (.route.rules | length) == 1 and (.route.rules[0].rule_set | length) == 0
-        then .route.rules = []
-        else . end' \
+    # 确保 sniff 始终位于所有分流规则之前。
+    ensure_sniff_rule
+    # 清理旧版本脚本留下的空 rule_set 占位规则，但保留 sniff 和已有有效规则。
+    jq '.route.rules = [.route.rules[] | select(.action == "sniff" or (.rule_set != null and (.rule_set | length) > 0) or .domain_suffix != null or .domain != null or .ip_cidr != null or .ip_is_private != null or .protocol != null or .network != null or .inbound != null)]' \
         "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
 
     local out_tags=($(jq -r '.outbounds[] | select(.tag != "direct") | .tag' "$outbound_file" 2>/dev/null))
@@ -1692,6 +1746,18 @@ add_rule_menu() {
               end
         end
     ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+
+    # AI服务额外叠加domain_suffix补充规则(见 extra_ai_domains 说明)，跟rule_set是两条独立规则、互不影响
+    extra_domains_json=$(extra_ai_domains "$rule_tag")
+    if [ -n "$extra_domains_json" ]; then
+        if ! jq -e --argjson d "$extra_domains_json" --arg out "$selected_out" \
+            '.route.rules[] | select(.domain_suffix != null and .outbound == $out and (.domain_suffix == $d))' \
+            "$route_file" > /dev/null 2>&1; then
+            jq --argjson d "$extra_domains_json" --arg out "$selected_out" \
+                '.route.rules += [{"domain_suffix": $d, "outbound": $out}]' \
+                "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+        fi
+    fi
 
     restart_singbox
     green "'${rule_tag}' 已分流至出站 '${selected_out}'"
@@ -1760,11 +1826,13 @@ restore_direct_outbound() {
       {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
       {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
     ],
-    "rules": [{"rule_set": []}],
+    "rules": [{"action": "sniff"}],
     "final": "direct"
   }
 }
 EOF
+
+    ensure_sniff_rule
 
     # 恢复默认 endpoints.json
     cat > "${conf_dir}/endpoints.json" << EOF
@@ -1812,8 +1880,18 @@ delete_rule_menu() {
     fi
     jq --arg tag "$tag" \
        'del(.route.rules[] | select(.rule_set != null) | .rule_set[] | select(. == $tag)) |
-        .route.rules = [.route.rules[] | select(.rule_set != null and (.rule_set | length) > 0)]' \
+        .route.rules = [.route.rules[] | select(.action == "sniff" or (.rule_set != null and (.rule_set | length) > 0) or .domain_suffix != null or .domain != null or .ip_cidr != null or .ip_is_private != null or .protocol != null or .network != null or .inbound != null)] |
+        if any(.route.rules[]?; .action == "sniff") then . else .route.rules = [{"action":"sniff"}] + .route.rules end' \
        "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+
+    # 同步删除该服务的domain_suffix补充规则(如果有)
+    extra_domains_json=$(extra_ai_domains "$tag")
+    if [ -n "$extra_domains_json" ]; then
+        jq --argjson d "$extra_domains_json" \
+           '.route.rules = [.route.rules[] | select(.domain_suffix == null or (.domain_suffix != $d))]' \
+           "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    fi
+
     restart_singbox
     green "规则集 '${tag}' 已禁用。"
     sleep 1; warp_manage
@@ -2252,14 +2330,20 @@ add_socks5_proxy() {
            "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
     fi
 
-    if jq -e '.route.rules | length > 0' "$route_file" >/dev/null 2>&1; then
-        jq --arg tag "$tag" '.route.rules[].outbound = $tag' "$route_file" > "${route_file}.tmp" \
-            && mv "${route_file}.tmp" "$route_file"
-        yellow "已将现有分流规则出站切换为 '${tag}'。"
+    # 添加 Socks/HTTP 出站时也不覆盖已有分流规则。
+    # 需要使用它时，请在“设置分流服务”中单独选择对应出站。
+    ensure_sniff_rule
+
+    check_output=$(${work_dir}/${server_name} check -C "$conf_dir" 2>&1)
+    if [ $? -ne 0 ]; then
+        red "代理配置检查失败，已保留原有分流配置。"
+        echo "$check_output"
+        sleep 2
+        return
     fi
 
     restart_singbox
-    green "\n${tag} 代理出站已添加\n"
+    green "\n${tag} 代理出站已添加，不会自动修改现有分流规则。\n"
     sleep 2; warp_manage
 }
 
