@@ -1818,15 +1818,24 @@ delete_rule_menu() {
 }
 
 # 解析 ss:// (含ss2022) 链接，添加为 shadowsocks 出站，用于把指定域名流量转发给另一台机子的ss2022节点
-add_ss_outbound() {
+add_ss_outbound() (
     local proxy_url="$1"
     local after_proto tag_from_url userinfo host_port server port method password
+    local decoded_file raw_key_file method_file
+    local key_len expected_len
 
+    # 支持：
+    # 1) ss://BASE64(method:password)@host:port#tag
+    # 2) ss://method:password@host:port#tag
+    # 3) SS2022 的某些客户端把 method 后面的原始二进制 PSK 放进 Base64 userinfo。
+    #    对这种情况不能把二进制直接塞进 Bash 变量，否则会被破坏。
     after_proto="${proxy_url#ss://}"
 
     if [[ "$after_proto" == *"#"* ]]; then
         tag_from_url="${after_proto##*#}"
         after_proto="${after_proto%%#*}"
+        # 常见 URL 编码的标签简单解码
+        tag_from_url=$(printf '%b' "${tag_from_url//%/\\x}" 2>/dev/null || printf '%s' "$tag_from_url")
     else
         tag_from_url=""
     fi
@@ -1835,29 +1844,142 @@ add_ss_outbound() {
     after_proto="${after_proto%%\?*}"
 
     if [[ "$after_proto" == *"@"* ]]; then
-        userinfo="${after_proto%%@*}"; host_port="${after_proto##*@}"
+        userinfo="${after_proto%%@*}"
+        host_port="${after_proto##*@}"
     else
-        userinfo=""; host_port="$after_proto"
+        userinfo=""
+        host_port="$after_proto"
     fi
 
     if [[ "$host_port" =~ ^\[([0-9a-fA-F:]+)\]:([0-9]+)$ ]]; then
-        server="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+        server="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
     else
-        server="${host_port%%:*}"; port="${host_port##*:}"
+        server="${host_port%%:*}"
+        port="${host_port##*:}"
     fi
-    [ -z "$server" ] || [ -z "$port" ] && { red "格式错误：缺少ip或端口"; sleep 2; return; }
+    [ -z "$server" ] || [ -z "$port" ] && { red "格式错误：缺少IP或端口"; sleep 2; return; }
+    [[ "$port" =~ ^[0-9]+$ ]] || { red "格式错误：端口无效"; sleep 2; return; }
 
-    method=""; password=""
+    method=""
+    password=""
+    decoded_file=$(mktemp)
+    raw_key_file=$(mktemp)
+    method_file=$(mktemp)
+    trap 'rm -f "$decoded_file" "$raw_key_file" "$method_file" "${raw_key_file}.decoded"' EXIT
+
+    # -------------------------
+    # 解析 userinfo
+    # -------------------------
     if [[ "$userinfo" == *":"* ]]; then
-        # 部分客户端导出的是明文 method:password，未做base64
-        method="${userinfo%%:*}"; password="${userinfo#*:}"
+        # 明文 method:password 格式
+        method="${userinfo%%:*}"
+        password="${userinfo#*:}"
     else
-        # SIP002标准格式：base64(method:password)
-        decoded=$(echo "$userinfo" | base64 -d 2>/dev/null)
-        [ -z "$decoded" ] && { red "无法解析ss节点用户信息"; sleep 2; return; }
-        method="${decoded%%:*}"; password="${decoded#*:}"
+        # 标准/兼容格式：Base64(userinfo)
+        # 不使用 command substitution 保存解码结果，避免 SS2022 原始二进制 PSK 被 Bash 截断/损坏。
+        if ! printf '%s' "$userinfo" | base64 -d > "$decoded_file" 2>/dev/null; then
+            # 兼容 Base64URL
+            local normalized_userinfo="$userinfo"
+            normalized_userinfo="${normalized_userinfo//-/+}"
+            normalized_userinfo="${normalized_userinfo//_/\/}"
+            while (( ${#normalized_userinfo} % 4 != 0 )); do normalized_userinfo+='='; done
+            if ! printf '%s' "$normalized_userinfo" | base64 -d > "$decoded_file" 2>/dev/null; then
+                red "无法解析SS节点用户信息：userinfo不是有效Base64"; sleep 2; return
+            fi
+        fi
+
+        # method 位于第一个 ':' 之前，使用二进制安全的 grep -a。
+        method=$(LC_ALL=C grep -a -o -m1 -P '^[^:]+' "$decoded_file" 2>/dev/null || true)
+        [ -z "$method" ] && { red "无法解析SS节点：缺少加密方式"; sleep 2; return; }
+
+        # method 必须紧跟 ':'；计算冒号位置，从文件中提取其后的原始内容。
+        local method_bytes=${#method}
+        local key_start=$((method_bytes + 2))
+        local decoded_size
+        decoded_size=$(wc -c < "$decoded_file")
+        if (( decoded_size < key_start - 1 )); then
+            red "格式错误：SS userinfo 不完整"; sleep 2; return
+        fi
+
+        tail -c +"$key_start" "$decoded_file" > "$raw_key_file"
+
+        if [[ "$method" == 2022-* ]]; then
+            # SS2022 的 PSK 必须是固定长度二进制密钥；sing-box 配置中的 password
+            # 则使用该二进制 PSK 的 Base64 表示。绝不能把原始二进制直接传给 jq --arg。
+            case "$method" in
+                2022-blake3-aes-128-gcm) expected_len=16 ;;
+                2022-blake3-aes-256-gcm) expected_len=32 ;;
+                2022-blake3-chacha20-poly1305) expected_len=32 ;;
+                *) red "不支持的SS2022加密方式：$method"; sleep 2; return ;;
+            esac
+
+            # 如果冒号后的内容本身就是可打印的 Base64 字符串，优先按 Base64 密钥处理；
+            # 否则把原始二进制 PSK 重新 Base64 编码。
+            local raw_size
+            raw_size=$(wc -c < "$raw_key_file")
+            if LC_ALL=C grep -a -q -P '^[A-Za-z0-9+/=_-]+\r?$' "$raw_key_file" 2>/dev/null; then
+                local candidate
+                candidate=$(tr -d '\r\n' < "$raw_key_file")
+                candidate="${candidate//-/+}"
+                candidate="${candidate//_/\/}"
+                while (( ${#candidate} % 4 != 0 )); do candidate+='='; done
+                if printf '%s' "$candidate" | base64 -d > "${raw_key_file}.decoded" 2>/dev/null && \
+                   [ "$(wc -c < "${raw_key_file}.decoded")" -eq "$expected_len" ]; then
+                    password="$candidate"
+                else
+                    password=$(base64 -w0 "$raw_key_file")
+                fi
+                rm -f "${raw_key_file}.decoded"
+            else
+                password=$(base64 -w0 "$raw_key_file")
+            fi
+
+            key_len=$(printf '%s' "$password" | base64 -d 2>/dev/null | wc -c)
+            if [ "$key_len" -ne "$expected_len" ]; then
+                red "SS2022 密钥长度错误：$method 要求 ${expected_len} 字节，当前只有 ${key_len} 字节。"
+                red "请检查节点链接本身是否正确；脚本不会写入一个会导致 sing-box 启动失败的配置。"
+                sleep 3
+                return
+            fi
+        else
+            # 普通 SS：userinfo 解码后是 method:password 文本。
+            password=$(cat "$raw_key_file")
+        fi
     fi
+
+    # 明文 SS2022 / 明文 SS 也统一校验。
     [ -z "$method" ] || [ -z "$password" ] && { red "格式错误：无法解析加密方式或密码"; sleep 2; return; }
+
+    if [[ "$method" == 2022-* ]]; then
+        case "$method" in
+            2022-blake3-aes-128-gcm) expected_len=16 ;;
+            2022-blake3-aes-256-gcm) expected_len=32 ;;
+            2022-blake3-chacha20-poly1305) expected_len=32 ;;
+            *) red "不支持的SS2022加密方式：$method"; sleep 2; return ;;
+        esac
+
+        # 明文格式一般已经是 Base64 PSK；也兼容少数直接给原始 PSK 的情况。
+        local normalized_password="$password"
+        normalized_password="${normalized_password//-/+}"
+        normalized_password="${normalized_password//_/\/}"
+        while (( ${#normalized_password} % 4 != 0 )); do normalized_password+='='; done
+        if printf '%s' "$normalized_password" | base64 -d > "${raw_key_file}.decoded" 2>/dev/null; then
+            key_len=$(wc -c < "${raw_key_file}.decoded")
+            if [ "$key_len" -eq "$expected_len" ]; then
+                password="$normalized_password"
+            else
+                red "SS2022 密钥长度错误：$method 要求 ${expected_len} 字节，当前只有 ${key_len} 字节。"
+                red "请检查节点链接本身是否正确。"
+                sleep 3
+                return
+            fi
+        else
+            red "SS2022 密码不是有效Base64密钥。"
+            sleep 2
+            return
+        fi
+    fi
 
     yellow "正在测试 shadowsocks 节点 ${server}:${port} (${method}) 的端口连通性..."
     if timeout 5 bash -c "echo > /dev/tcp/${server}/${port}" 2>/dev/null; then
@@ -1872,21 +1994,46 @@ add_ss_outbound() {
     jq -e --arg tag "$tag" '.outbounds[] | select(.tag == $tag)' "$outbound_file" >/dev/null 2>&1 \
         && { red "出站标签 '${tag}' 已存在"; sleep 2; return; }
 
-    jq --arg tag "$tag" --arg server "$server" --arg port "$port" \
+    # 重要：password 始终以 sing-box 要求的 Base64 文本写入 JSON。
+    # 不再把 SS2022 原始二进制 PSK 放进 Bash 变量。
+    if ! jq --arg tag "$tag" --arg server "$server" --arg port "$port" \
        --arg method "$method" --arg password "$password" \
        '.outbounds += [{"type":"shadowsocks","tag":$tag,"server":$server,"server_port":($port|tonumber),"method":$method,"password":$password}]' \
-       "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+       "$outbound_file" > "${outbound_file}.tmp"; then
+        red "写入 shadowsocks 出站失败，原配置未修改。"
+        rm -f "${outbound_file}.tmp"
+        sleep 2
+        return
+    fi
+    mv "${outbound_file}.tmp" "$outbound_file"
 
-    if jq -e '.route.rules | length > 0' "$route_file" >/dev/null 2>&1; then
-        jq --arg tag "$tag" '.route.rules[].outbound = $tag' "$route_file" > "${route_file}.tmp" \
-            && mv "${route_file}.tmp" "$route_file"
-        yellow "已将现有分流规则出站切换为 '${tag}'。"
+    # 不要在“添加代理出站”时把现有所有分流规则强制切换到新代理。
+    # 添加 relay 只是增加一个可选出站；具体哪些服务走 relay，
+    # 由“设置分流服务”菜单逐项选择。这样不会破坏原有 WARP/其他代理分流。
+
+    if ! /etc/sing-box/sing-box check -C "$conf_dir" >/dev/null 2>&1; then
+        red "sing-box 配置检查失败，正在回滚刚添加的出站..."
+        jq --arg tag "$tag" 'del(.outbounds[] | select(.tag == $tag))' \
+           "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+        red "已回滚，未重启 sing-box。"
+        sleep 2
+        return
     fi
 
     restart_singbox
-    green "\n${tag} (shadowsocks) 代理出站已添加\n"
-    sleep 2; warp_manage
-}
+    if systemctl is-active --quiet sing-box 2>/dev/null; then
+        green "\n${tag} (shadowsocks) 代理出站已添加"
+        green "请进入“设置分流服务”，选择具体服务并指定出站 '${tag}'。"
+    else
+        red "sing-box 重启失败，正在回滚刚添加的出站..."
+        jq --arg tag "$tag" 'del(.outbounds[] | select(.tag == $tag))' \
+           "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+        restart_singbox
+        red "已回滚 ${tag}，请检查 sing-box 日志。"
+    fi
+    sleep 2
+    warp_manage
+)
 
 add_socks5_proxy() {
     clear
