@@ -867,7 +867,7 @@ uninstall_singbox() {
 create_shortcut() {
     cat > "$work_dir/sb.sh" << 'EOF'
 #!/usr/bin/env bash
-bash <(curl -Ls https://raw.githubusercontent.com/tbjpvn/sb-re/main/sbre.sh) $1
+bash <(curl -Ls https://raw.githubusercontent.com/tbjpvn/sb-re/main/sbre) $1
 EOF
     chmod +x "$work_dir/sb.sh"
     ln -sf "$work_dir/sb.sh" /usr/bin/sb
