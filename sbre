@@ -1705,13 +1705,13 @@ warp_manage() {
     esac
 }
 
-# AI服务的补充域名(API/Android端点)，跟rule_set规则集配合使用而非替代它
+# AI服务的补充域名(API端点)，跟rule_set规则集配合使用而非替代它
 # 原因：公共geosite规则集(包括gemini.srs等)大多只收录消费级网站域名(如gemini.google.com)，
 # 不包含程序化访问用的API端点(如generativelanguage.googleapis.com)，导致API调用无法被正确分流
 extra_ai_domains() {
     case "$1" in
         gemini)
-            echo '["gemini.google.com","generativelanguage.googleapis.com","proactivebackend-pa.googleapis.com","alkalimakersuite-pa.clients6.google.com","aistudio.google.com","makersuite.google.com","aitestkitchen.withgoogle.com","robinfrontend-pa.googleapis.com","optimizationguide-pa.googleapis.com"]'
+            echo '["gemini.google.com","generativelanguage.googleapis.com","proactivebackend-pa.googleapis.com","alkalimakersuite-pa.clients6.google.com","aistudio.google.com","makersuite.google.com","aitestkitchen.withgoogle.com"]'
             ;;
         openai)
             echo '["openai.com","chatgpt.com","chat.openai.com","oaistatic.com","oaiusercontent.com","ai.com"]'
