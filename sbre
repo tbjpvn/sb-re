@@ -5,8 +5,6 @@
 # vless-version-reality|vmess-ws-tls(tunnel)|hysteria2|tuic5|[可额外添加Anytls，socks5，ss2022等协议] 
 # 最后更新时间: 2026.6.7[添加hy2证书, 添加ipv4和ipv6切换]
 # 个人修改: 支持DOMAIN变量，用acme.sh申请Let's Encrypt真实域名证书替代自签证书(hy2/tuic)
-# SS2022分流修复版：支持v2rayN导出的SS2022 URI；按实际PSK长度自动校正AES-128/AES-256；
-# 添加SS2022出站时不覆盖现有分流规则，并在写入后执行sing-box配置检查，失败自动回滚。
 # =========================
 
 export LANG=en_US.UTF-8
@@ -1585,12 +1583,7 @@ warp_manage() {
     green "=== WARP 分流管理 ===\n"
     green "当前已启用的分流规则集:"
     jq -r '.route.rules[] | select(.rule_set != null) | .rule_set[]?' "$route_file" 2>/dev/null | sort -u | while read tag; do
-        extra=$(extra_ai_domains "$tag")
-        if [ -n "$extra" ]; then
-            echo -e " - ${skyblue}$tag${re} ${yellow}(已叠加API域名补充规则)${re}"
-        else
-            echo -e " - ${skyblue}$tag${re}"
-        fi
+        echo -e " - ${skyblue}$tag${re}"
     done || echo "  无"
     green "\n已添加的代理出站(socks/http/ss):"
     jq -r '.outbounds[] | select(.tag != "direct") | " - \(.tag) [\(.type)]"' "$outbound_file" 2>/dev/null || echo "  无"
@@ -1617,26 +1610,6 @@ warp_manage() {
         0)  menu ;;
         00) exit 0 ;;
         *)  red "无效选项"; sleep 1; warp_manage ;;
-    esac
-}
-
-# AI服务的补充域名(API端点)，跟rule_set规则集配合使用而非替代它
-# 原因：公共geosite规则集(包括gemini.srs等)大多只收录消费级网站域名(如gemini.google.com)，
-# 不包含程序化访问用的API端点(如generativelanguage.googleapis.com)，导致API调用无法被正确分流
-extra_ai_domains() {
-    case "$1" in
-        gemini)
-            echo '["gemini.google.com","generativelanguage.googleapis.com","proactivebackend-pa.googleapis.com","alkalimakersuite-pa.clients6.google.com","aistudio.google.com","makersuite.google.com","aitestkitchen.withgoogle.com"]'
-            ;;
-        openai)
-            echo '["openai.com","chatgpt.com","chat.openai.com","oaistatic.com","oaiusercontent.com","ai.com"]'
-            ;;
-        claude)
-            echo '["claude.ai","anthropic.com","claude.com"]'
-            ;;
-        *)
-            echo ''
-            ;;
     esac
 }
 
@@ -1717,18 +1690,6 @@ add_rule_menu() {
               end
         end
     ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
-
-    # AI服务额外叠加domain_suffix补充规则(见 extra_ai_domains 说明)，跟rule_set是两条独立规则、互不影响
-    extra_domains_json=$(extra_ai_domains "$rule_tag")
-    if [ -n "$extra_domains_json" ]; then
-        if ! jq -e --argjson d "$extra_domains_json" --arg out "$selected_out" \
-            '.route.rules[] | select(.domain_suffix != null and .outbound == $out and (.domain_suffix == $d))' \
-            "$route_file" > /dev/null 2>&1; then
-            jq --argjson d "$extra_domains_json" --arg out "$selected_out" \
-                '.route.rules += [{"domain_suffix": $d, "outbound": $out}]' \
-                "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
-        fi
-    fi
 
     restart_singbox
     green "'${rule_tag}' 已分流至出站 '${selected_out}'"
@@ -1851,15 +1812,6 @@ delete_rule_menu() {
        'del(.route.rules[] | select(.rule_set != null) | .rule_set[] | select(. == $tag)) |
         .route.rules = [.route.rules[] | select(.rule_set != null and (.rule_set | length) > 0)]' \
        "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
-
-    # 同步删除该服务的domain_suffix补充规则(如果有)
-    extra_domains_json=$(extra_ai_domains "$tag")
-    if [ -n "$extra_domains_json" ]; then
-        jq --argjson d "$extra_domains_json" \
-           '.route.rules = [.route.rules[] | select(.domain_suffix == null or (.domain_suffix != $d))]' \
-           "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
-    fi
-
     restart_singbox
     green "规则集 '${tag}' 已禁用。"
     sleep 1; warp_manage
@@ -1869,213 +1821,43 @@ delete_rule_menu() {
 add_ss_outbound() {
     local proxy_url="$1"
     local after_proto tag_from_url userinfo host_port server port method password
-    local decoded_file raw_key_file raw_userinfo expected_len actual_len normalized_method
-    local backup_outbound backup_route check_output restart_status
 
     after_proto="${proxy_url#ss://}"
 
-    # 处理 URL fragment/tag，并去掉可能存在的插件参数
     if [[ "$after_proto" == *"#"* ]]; then
         tag_from_url="${after_proto##*#}"
         after_proto="${after_proto%%#*}"
     else
         tag_from_url=""
     fi
+
+    # 去掉可能存在的插件参数部分 (?plugin=...)
     after_proto="${after_proto%%\?*}"
 
     if [[ "$after_proto" == *"@"* ]]; then
-        userinfo="${after_proto%%@*}"
-        host_port="${after_proto##*@}"
+        userinfo="${after_proto%%@*}"; host_port="${after_proto##*@}"
     else
-        userinfo=""
-        host_port="$after_proto"
+        userinfo=""; host_port="$after_proto"
     fi
 
-    # 解析服务器地址，兼容 IPv4 / 域名 / [IPv6]:port
     if [[ "$host_port" =~ ^\[([0-9a-fA-F:]+)\]:([0-9]+)$ ]]; then
-        server="${BASH_REMATCH[1]}"
-        port="${BASH_REMATCH[2]}"
+        server="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
     else
-        server="${host_port%%:*}"
-        port="${host_port##*:}"
+        server="${host_port%%:*}"; port="${host_port##*:}"
     fi
     [ -z "$server" ] || [ -z "$port" ] && { red "格式错误：缺少ip或端口"; sleep 2; return; }
-    [[ "$port" =~ ^[0-9]+$ ]] || { red "格式错误：端口无效"; sleep 2; return; }
 
-    method=""
-    password=""
-
-    # ============================================================
-    # SS / SS2022 链接解析
-    #
-    # 普通 SS：userinfo 通常是 base64(method:password)
-    # SS2022：userinfo 解码后为：method + ':' + 原始二进制 PSK
-    #
-    # 不能把 SS2022 的二进制 PSK 直接塞进 Bash 变量再交给 jq，
-    # 否则会经过 UTF-8/命令替换破坏二进制数据，导致：
-    #   decode key: illegal base64 data at input byte 0
-    #
-    # sing-box 的 SS2022 password 使用 PSK 的 Base64 表示，因此这里
-    # 始终从临时二进制文件提取 PSK，再重新 Base64 编码。
-    # ============================================================
-    decoded_file="$(mktemp)"
-    raw_key_file="$(mktemp)"
-
+    method=""; password=""
     if [[ "$userinfo" == *":"* ]]; then
-        # 明文 method:password 形式，主要兼容部分客户端导出的链接。
-        # 对 SS2022，如果 password 看起来是 Base64，则按 Base64 PSK 尝试；
-        # 如果不是，则按普通字符串处理。
-        method="${userinfo%%:*}"
-        password="${userinfo#*:}"
-
-        if [[ "$method" == 2022-* ]]; then
-            # 明文形式的 SS2022 一般 password 本身就是 Base64 PSK。
-            # 如果无法解码，则拒绝写入，避免产生坏配置。
-            if ! printf '%s' "$password" | base64 -d > "$raw_key_file" 2>/dev/null; then
-                red "SS2022 密钥不是有效的 Base64 格式。"
-                sleep 2
-                rm -f "$decoded_file" "$raw_key_file"
-                return
-            fi
-        fi
+        # 部分客户端导出的是明文 method:password，未做base64
+        method="${userinfo%%:*}"; password="${userinfo#*:}"
     else
-        # SIP002：base64(method:password)
-        # 同时兼容 URL-safe Base64 和缺少 '=' padding 的导出格式。
-        raw_userinfo="$userinfo"
-        raw_userinfo="${raw_userinfo//-/+}"
-        raw_userinfo="${raw_userinfo//_/\/}"
-        while (( ${#raw_userinfo} % 4 != 0 )); do
-            raw_userinfo+='='
-        done
-
-        if ! printf '%s' "$raw_userinfo" | base64 -d > "$decoded_file" 2>/dev/null; then
-            red "无法解析 SS 节点用户信息：Base64 格式错误。"
-            sleep 2
-            rm -f "$decoded_file" "$raw_key_file"
-            return
-        fi
-
-        # 二进制安全地提取第一个 ':' 前的 method。
-        # method 只包含 ASCII，因此这里用 awk/sed 不会影响后面的 PSK。
-        method="$(LC_ALL=C awk 'BEGIN{RS=""} {p=index($0,":"); if(p>0) printf "%s", substr($0,1,p-1)}' "$decoded_file")"
-        [ -z "$method" ] && { red "无法解析 SS 节点加密方式。"; sleep 2; return; }
-
-        if [[ "$method" == 2022-* ]]; then
-            # 不通过 Bash 变量保存二进制 PSK。
-            # 直接从 method 后面的原始字节提取密钥。
-            method_len=${#method}
-            # method 为 ASCII，长度可以安全用于字节偏移。
-            dd if="$decoded_file" of="$raw_key_file" bs=1 skip=$((method_len + 1)) status=none 2>/dev/null
-            actual_len=$(wc -c < "$raw_key_file")
-
-            [ "$actual_len" -gt 0 ] || { red "SS2022 节点没有有效的 PSK。"; sleep 2; return; }
-
-            # SS2022 的 PSK 长度决定真正的算法：
-            # AES-128-GCM = 16 bytes
-            # AES-256-GCM = 32 bytes
-            # ChaCha20-Poly1305 = 32 bytes
-            case "$method" in
-                2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm)
-                    if [ "$actual_len" -eq 16 ]; then
-                        normalized_method="2022-blake3-aes-128-gcm"
-                        expected_len=16
-                    elif [ "$actual_len" -eq 32 ]; then
-                        normalized_method="2022-blake3-aes-256-gcm"
-                        expected_len=32
-                    else
-                        red "SS2022 密钥长度错误：${method} 只能使用 16 或 32 字节 PSK，当前为 ${actual_len} 字节。"
-                        red "请检查节点链接或服务端配置。脚本不会写入无效的 sing-box 配置。"
-                        sleep 3
-                        rm -f "$decoded_file" "$raw_key_file"
-                        return
-                    fi
-                    if [ "$normalized_method" != "$method" ]; then
-                        yellow "检测到节点链接中的算法标记与实际 PSK 长度不一致。"
-                        yellow "${method} + ${actual_len} 字节 PSK → 自动修正为 ${normalized_method}。"
-                        method="$normalized_method"
-                    fi
-                    ;;
-                2022-blake3-chacha20-poly1305)
-                    expected_len=32
-                    if [ "$actual_len" -ne "$expected_len" ]; then
-                        red "SS2022 密钥长度错误：${method} 要求 32 字节，当前为 ${actual_len} 字节。"
-                        red "请检查节点链接或服务端配置。脚本不会写入无效的 sing-box 配置。"
-                        sleep 3
-                        rm -f "$decoded_file" "$raw_key_file"
-                        return
-                    fi
-                    ;;
-                *)
-                    # 未知 2022 method 不猜测算法，避免生成不可用配置。
-                    red "不支持的 SS2022 加密方式：${method}"
-                    red "当前支持：2022-blake3-aes-128-gcm、2022-blake3-aes-256-gcm、2022-blake3-chacha20-poly1305"
-                    sleep 3
-                    rm -f "$decoded_file" "$raw_key_file"
-                    return
-                    ;;
-            esac
-
-            # jq 参数必须是 ASCII/Base64 字符串，绝不把原始二进制 PSK
-            # 通过 shell 变量传递。
-            password="$(base64 "$raw_key_file" 2>/dev/null | tr -d '\n')"
-            [ -n "$password" ] || { red "SS2022 PSK Base64 编码失败。"; sleep 2; return; }
-        else
-            # 普通 SS 的 password 是文本，可以安全放入 shell 变量。
-            decoded_text="$(cat "$decoded_file")"
-            [[ "$decoded_text" == *":"* ]] || { red "格式错误：无法解析加密方式或密码。"; sleep 2; return; }
-            method="${decoded_text%%:*}"
-            password="${decoded_text#*:}"
-        fi
+        # SIP002标准格式：base64(method:password)
+        decoded=$(echo "$userinfo" | base64 -d 2>/dev/null)
+        [ -z "$decoded" ] && { red "无法解析ss节点用户信息"; sleep 2; return; }
+        method="${decoded%%:*}"; password="${decoded#*:}"
     fi
-
     [ -z "$method" ] || [ -z "$password" ] && { red "格式错误：无法解析加密方式或密码"; sleep 2; return; }
-
-    # 对明文 SS2022 形式再次进行长度/算法校正。
-    if [[ "$method" == 2022-* ]]; then
-        if [ ! -s "$raw_key_file" ]; then
-            # 明文形式已经尝试将 password 解码为原始 PSK。
-            printf '%s' "$password" | base64 -d > "$raw_key_file" 2>/dev/null || {
-                red "SS2022 密钥不是有效的 Base64 PSK。"
-                sleep 2
-                rm -f "$decoded_file" "$raw_key_file"
-                return
-            }
-        fi
-        actual_len=$(wc -c < "$raw_key_file")
-        case "$method" in
-            2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm)
-                if [ "$actual_len" -eq 16 ]; then
-                    normalized_method="2022-blake3-aes-128-gcm"
-                elif [ "$actual_len" -eq 32 ]; then
-                    normalized_method="2022-blake3-aes-256-gcm"
-                else
-                    red "SS2022 密钥长度错误：AES-128 要求 16 字节、AES-256 要求 32 字节，当前为 ${actual_len} 字节。"
-                    sleep 3
-                    rm -f "$decoded_file" "$raw_key_file"
-                    return
-                fi
-                if [ "$normalized_method" != "$method" ]; then
-                    yellow "检测到算法标记与实际 PSK 长度不一致：${method} → ${normalized_method}"
-                    method="$normalized_method"
-                fi
-                ;;
-            2022-blake3-chacha20-poly1305)
-                [ "$actual_len" -eq 32 ] || {
-                    red "SS2022 密钥长度错误：${method} 要求 32 字节，当前为 ${actual_len} 字节。"
-                    sleep 3
-                    rm -f "$decoded_file" "$raw_key_file"
-                    return
-                }
-                ;;
-            *)
-                red "不支持的 SS2022 加密方式：${method}"
-                sleep 3
-                rm -f "$decoded_file" "$raw_key_file"
-                return
-                ;;
-        esac
-        password="$(base64 "$raw_key_file" 2>/dev/null | tr -d '\n')"
-    fi
 
     yellow "正在测试 shadowsocks 节点 ${server}:${port} (${method}) 的端口连通性..."
     if timeout 5 bash -c "echo > /dev/tcp/${server}/${port}" 2>/dev/null; then
@@ -2090,98 +1872,22 @@ add_ss_outbound() {
     jq -e --arg tag "$tag" '.outbounds[] | select(.tag == $tag)' "$outbound_file" >/dev/null 2>&1 \
         && { red "出站标签 '${tag}' 已存在"; sleep 2; return; }
 
-    # ============================================================
-    # 先备份，写入后立即检查完整配置。
-    # SS2022 配置有问题时绝不直接重启 sing-box，避免所有现有节点一起掉线。
-    # ============================================================
-    backup_outbound="$(mktemp)"
-    backup_route="$(mktemp)"
-    cp -f "$outbound_file" "$backup_outbound" || {
-        red "无法备份 outbounds.json，已取消操作。"
-        rm -f "$backup_outbound" "$backup_route"
-        sleep 2
-        rm -f "$decoded_file" "$raw_key_file"
-        return
-    }
-    cp -f "$route_file" "$backup_route" 2>/dev/null || true
-
-    if ! jq --arg tag "$tag" --arg server "$server" --arg port "$port" \
+    jq --arg tag "$tag" --arg server "$server" --arg port "$port" \
        --arg method "$method" --arg password "$password" \
        '.outbounds += [{"type":"shadowsocks","tag":$tag,"server":$server,"server_port":($port|tonumber),"method":$method,"password":$password}]' \
-       "$outbound_file" > "${outbound_file}.tmp"; then
-        red "写入 SS 出站配置失败，未修改现有配置。"
-        rm -f "$backup_outbound" "$backup_route" "${outbound_file}.tmp"
-        sleep 2
-        rm -f "$decoded_file" "$raw_key_file"
-        return
-    fi
-    mv "${outbound_file}.tmp" "$outbound_file"
+       "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
 
-    # 重要：添加代理出站不自动修改现有分流规则。
-    # 用户应在“设置分流服务”中单独选择哪个 rule_set 使用 relay。
-
-    check_output=$("${work_dir}/${server_name}" check -C "$conf_dir" 2>&1)
-    if [ $? -ne 0 ]; then
-        red "SS2022 已添加，但 sing-box 配置检查失败："
-        echo "$check_output"
-        yellow "正在自动回滚本次修改..."
-        cp -f "$backup_outbound" "$outbound_file"
-        cp -f "$backup_route" "$route_file" 2>/dev/null || true
-        rm -f "$backup_outbound" "$backup_route"
-        red "已回滚，现有节点配置未被破坏。"
-        sleep 3
-        rm -f "$decoded_file" "$raw_key_file"
-        return
+    if jq -e '.route.rules | length > 0' "$route_file" >/dev/null 2>&1; then
+        jq --arg tag "$tag" '.route.rules[].outbound = $tag' "$route_file" > "${route_file}.tmp" \
+            && mv "${route_file}.tmp" "$route_file"
+        yellow "已将现有分流规则出站切换为 '${tag}'。"
     fi
 
-    green "sing-box 配置检查通过。"
     restart_singbox
-    restart_status=$?
-    if [ $restart_status -ne 0 ]; then
-        red "sing-box 重启失败，正在自动回滚本次 SS 出站修改..."
-        cp -f "$backup_outbound" "$outbound_file"
-        cp -f "$backup_route" "$route_file" 2>/dev/null || true
-        rm -f "$backup_outbound" "$backup_route"
-        restart_singbox >/dev/null 2>&1
-        red "已回滚。"
-        sleep 3
-        rm -f "$decoded_file" "$raw_key_file"
-        return
-    fi
-
-    # 再确认一次服务确实处于 active 状态。
-    if command_exists systemctl; then
-        if ! systemctl is-active --quiet sing-box; then
-            red "sing-box 重启后未处于运行状态，正在自动回滚..."
-            cp -f "$backup_outbound" "$outbound_file"
-            cp -f "$backup_route" "$route_file" 2>/dev/null || true
-            rm -f "$backup_outbound" "$backup_route"
-            restart_singbox >/dev/null 2>&1
-            red "已回滚。"
-            sleep 3
-            rm -f "$decoded_file" "$raw_key_file"
-            return
-        fi
-    elif command_exists rc-service; then
-        if ! rc-service sing-box status >/dev/null 2>&1; then
-            red "sing-box 重启后未处于运行状态，正在自动回滚..."
-            cp -f "$backup_outbound" "$outbound_file"
-            cp -f "$backup_route" "$route_file" 2>/dev/null || true
-            rm -f "$backup_outbound" "$backup_route"
-            restart_singbox >/dev/null 2>&1
-            red "已回滚。"
-            sleep 3
-            rm -f "$decoded_file" "$raw_key_file"
-            return
-        fi
-    fi
-
-    rm -f "$backup_outbound" "$backup_route"
-    rm -f "$decoded_file" "$raw_key_file"
-    green "\n${tag} (${method}) shadowsocks 代理出站已添加"
-    green "不会自动修改现有分流规则，请在“设置分流服务”中选择需要走 ${tag} 的规则集。\n"
+    green "\n${tag} (shadowsocks) 代理出站已添加\n"
     sleep 2; warp_manage
 }
+
 add_socks5_proxy() {
     clear
     reading "请输入代理URL (支持socks://,socks5://,http://,ss:// 支持v2rayN导出的节点链接): " proxy_url
