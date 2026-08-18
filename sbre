@@ -4,6 +4,9 @@
 # 老王sing-box四合一安装脚本
 # vless-version-reality|vmess-ws-tls(tunnel)|hysteria2|tuic5|[可额外添加Anytls，socks5，ss2022等协议] 
 # 最后更新时间: 2026.6.7[添加hy2证书, 添加ipv4和ipv6切换]
+# 个人修改: 支持DOMAIN变量，用acme.sh申请Let's Encrypt真实域名证书替代自签证书(hy2/tuic)
+# SS2022分流修复版：支持v2rayN导出的SS2022 URI；按实际PSK长度自动校正AES-128/AES-256；
+# 添加SS2022出站时不覆盖现有分流规则，并在写入后执行sing-box配置检查，失败自动回滚。
 # =========================
 
 export LANG=en_US.UTF-8
@@ -30,6 +33,9 @@ export vless_port=${PORT:-$(shuf -i 1000-65000 -n 1)}
 export CFIP=${CFIP:-'cdns.doon.eu.org'} 
 export ARGO_PORT=${ARGO_PORT:-'8001'} 
 export CFPORT=${CFPORT:-'443'} 
+export DOMAIN=${DOMAIN:-''}
+# 已安装过的机器，若本次运行未显式传DOMAIN，则读取上次安装记录的域名
+[ -z "$DOMAIN" ] && [ -f "${work_dir}/domain.txt" ] && DOMAIN=$(cat "${work_dir}/domain.txt")
 
 # 检查是否为root下运行
 [[ $EUID -ne 0 ]] && red "请在root用户下运行脚本，可输入 sudo -i 回车切换到root用户" && exit 1
@@ -215,6 +221,92 @@ allow_port() {
     fi
 }
 
+# 申请/切换域名证书，可传入域名字符串；传空则恢复自签证书
+# 成功后：写入 ${work_dir}/domain.txt，并设置全局变量 fingerprint(自签时用)
+issue_domain_cert() {
+    local domain="$1"
+
+    if [ -z "$domain" ]; then
+        openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
+        openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
+        fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
+        rm -f "${work_dir}/domain.txt"
+        DOMAIN=""
+        return 0
+    fi
+
+    yellow "\n检测到自定义域名 ${domain}，正在申请Let's Encrypt证书...\n"
+    manage_packages install socat curl
+
+    curl https://get.acme.sh | sh -s email=admin@${domain} > /dev/null 2>&1
+    export PATH="$HOME/.acme.sh:$PATH"
+
+    # 临时释放80端口：先尝试优雅停止常见的web服务，申请完证书后再恢复
+    local stopped_services=()
+    for svc in nginx apache2 httpd caddy lighttpd; do
+        if command_exists systemctl && systemctl is-active "$svc" &>/dev/null; then
+            yellow "检测到 ${svc} 占用80端口，临时停止..."
+            systemctl stop "$svc" > /dev/null 2>&1
+            stopped_services+=("$svc")
+        elif command_exists rc-service && rc-service "$svc" status 2>/dev/null | grep -q started; then
+            yellow "检测到 ${svc} 占用80端口，临时停止..."
+            rc-service "$svc" stop > /dev/null 2>&1
+            stopped_services+=("$svc")
+        fi
+    done
+
+    # 如果还有未知进程占用80端口，强制临时结束（不在已知服务列表里，无法自动恢复，需自行手动重启）
+    if lsof -i:80 -sTCP:LISTEN -t > /dev/null 2>&1; then
+        yellow "仍检测到有进程占用80端口，尝试临时终止..."
+        for pid in $(lsof -i:80 -sTCP:LISTEN -t 2>/dev/null); do
+            kill -9 "$pid" > /dev/null 2>&1
+        done
+        sleep 1
+    fi
+
+    if lsof -i:80 -sTCP:LISTEN -t > /dev/null 2>&1; then
+        red "80端口仍被占用，无法申请证书，将退回自签证书\n"
+        openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
+        openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
+        fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
+        DOMAIN=""
+        return 1
+    fi
+
+    ~/.acme.sh/acme.sh --issue -d "$domain" --standalone -k ec-256 --server letsencrypt
+
+    # 无论--issue命令的返回码是什么(已签发过会跳过续期并返回非0，但本地证书其实是有效的)，
+    # 都统一尝试安装证书，最后用生成的证书文件本身判断成功与否，而不是看issue的退出码
+    ~/.acme.sh/acme.sh --install-cert -d "$domain" --ecc \
+        --key-file "${work_dir}/private.key" \
+        --fullchain-file "${work_dir}/cert.pem" \
+        --reloadcmd "systemctl restart sing-box > /dev/null 2>&1 || rc-service sing-box restart > /dev/null 2>&1" \
+        > /dev/null 2>&1
+
+    # 恢复刚才临时停掉的服务
+    for svc in "${stopped_services[@]}"; do
+        yellow "正在恢复 ${svc} 服务..."
+        if command_exists systemctl; then systemctl start "$svc" > /dev/null 2>&1
+        elif command_exists rc-service; then rc-service "$svc" start > /dev/null 2>&1; fi
+    done
+
+    if [ -s "${work_dir}/cert.pem" ] && [ -s "${work_dir}/private.key" ] && \
+       openssl x509 -checkend 0 -noout -in "${work_dir}/cert.pem" > /dev/null 2>&1; then
+        fingerprint=""
+        echo "$domain" > "${work_dir}/domain.txt"
+        DOMAIN="$domain"
+        green "证书申请成功: ${work_dir}/cert.pem\n"
+        return 0
+    else
+        red "证书申请失败，请检查域名解析是否正确指向本机IP，将退回自签证书\n"
+        openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
+        openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
+        fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
+        DOMAIN=""
+        return 1
+    fi
+}
+
 # 下载并安装 sing-box,cloudflared
 install_singbox() {
     clear
@@ -241,9 +333,9 @@ install_singbox() {
     # rm -rf "${work_dir}/${server_name}.tar.gz" "${work_dir}/sing-box-${latest_version}-linux-${ARCH}"
     chown root:root ${work_dir} && chmod +x ${work_dir}/${server_name} ${work_dir}/argo ${work_dir}/qrencode
 
-    nginx_port=$(($vless_port + 1))
-    tuic_port=$(($vless_port + 2))
-    hy2_port=$(($vless_port + 3))
+    nginx_port=${NGINX_PORT:-$(($vless_port + 1))}
+    tuic_port=${TUIC_PORT:-$(($vless_port + 2))}
+    hy2_port=${HY2_PORT:-$(($vless_port + 3))}
     uuid=$(cat /proc/sys/kernel/random/uuid)
     password=$(< /dev/urandom tr -dc 'A-Za-z0-9' | head -c 24)
     output=$(/etc/sing-box/sing-box generate reality-keypair)
@@ -252,10 +344,7 @@ install_singbox() {
 
     allow_port $vless_port/tcp $nginx_port/tcp $tuic_port/udp $hy2_port/udp > /dev/null 2>&1
 
-    openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
-    openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
-    
-    fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
+    issue_domain_cert "$DOMAIN"
     
     dns_strategy=$(ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1 && echo "prefer_ipv4" || \
         (ping -c 1 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && echo "prefer_ipv6" || echo "prefer_ipv4"))
@@ -351,7 +440,7 @@ EOF
         }
       ],
       "ignore_client_bandwidth": false,
-      "masquerade": "https://bing.com",
+      "masquerade": "https://${DOMAIN:-bing.com}",
       "tls": {
         "enabled": true,
         "alpn": ["h3"],
@@ -435,7 +524,7 @@ EOF
       {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
       {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
     ],
-    "rules": [{"rule_set": []}],
+    "rules": [{"action": "sniff"}],
     "final": "direct"
   }
 }
@@ -556,14 +645,24 @@ get_info() {
         extra_lines=$(grep -vE '^(vless://|vmess://|hysteria2://|tuic://)' "${client_dir}" || true)
     fi
 
+    if [ -n "$DOMAIN" ]; then
+        tls_sni="$DOMAIN"
+        tls_insecure="0"
+        hy2_pin=""
+    else
+        tls_sni="www.bing.com"
+        tls_insecure="1"
+        hy2_pin="&pinSHA256=${fingerprint}"
+    fi
+
     cat > ${work_dir}/url.txt << EOF
 vless://${uuid}@${server_ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk=${public_key}&type=tcp&headerType=none#${isp}
 
 vmess://$(echo "$VMESS" | base64 -w0)
 
-hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none#${isp}
+hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=${tls_sni}&insecure=${tls_insecure}${hy2_pin}&alpn=h3&obfs=none#${isp}
 
-tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${isp}
+tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=${tls_sni}&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=${tls_insecure}#${isp}
 EOF
 
     if [ -n "$extra_lines" ]; then
@@ -768,7 +867,7 @@ uninstall_singbox() {
 create_shortcut() {
     cat > "$work_dir/sb.sh" << 'EOF'
 #!/usr/bin/env bash
-bash <(curl -Ls https://raw.githubusercontent.com/eooce/sing-box/main/sing-box.sh) $1
+bash <(curl -Ls https://raw.githubusercontent.com/tbjpvn/sb-re/main/sbre) $1
 EOF
     chmod +x "$work_dir/sb.sh"
     ln -sf "$work_dir/sb.sh" /usr/bin/sb
@@ -810,6 +909,25 @@ auto_install() {
     get_info
     add_nginx_conf
     create_shortcut
+
+    # 端口监听自检：确认sing-box真的绑定成功了这几个端口，NAT机常见的"随机端口顺延到未转发端口"问题能第一时间发现
+    yellow "\n正在检测端口监听状态...\n"
+    port_check_failed=0
+    if ! ss -lnt 2>/dev/null | grep -qE ":${vless_port}([[:space:]]|$)"; then
+        red "警告: vless 端口 ${vless_port}/tcp 未检测到监听\n"; port_check_failed=1
+    fi
+    if ! ss -lnu 2>/dev/null | grep -qE ":${hy2_port}([[:space:]]|$)"; then
+        red "警告: hysteria2 端口 ${hy2_port}/udp 未检测到监听\n"; port_check_failed=1
+    fi
+    if ! ss -lnu 2>/dev/null | grep -qE ":${tuic_port}([[:space:]]|$)"; then
+        red "警告: tuic 端口 ${tuic_port}/udp 未检测到监听\n"; port_check_failed=1
+    fi
+    if [ "$port_check_failed" -eq 1 ]; then
+        red "以上端口本机未监听，服务可能没启动成功，请用 'journalctl -u sing-box -n 50' 或 'sing-box run -C /etc/sing-box/conf' 查看具体报错\n"
+    else
+        green "本机端口均监听正常。如果外部仍连不上，请检查该端口是否在你VPS服务商(尤其是NAT机)后台被正确转发/放行\n"
+    fi
+
     green "\nsing-box 安装完成\n"
 }
 
@@ -1007,6 +1125,7 @@ change_config() {
             ;;
         4)
             purple "端口跳跃需确保跳跃区间的端口没有被占用\n"
+            purple "如果是云服务器(阿里云/腾讯云/AWS/搬瓦工等)，还需去控制台的安全组/防火墙里额外放行这段UDP端口区间，否则本机防火墙放行了也连不通\n"
             reading "请输入跳跃起始端口 (回车跳过将使用随机端口): " min_port
             [ -z "$min_port" ] && min_port=$(shuf -i 50000-65000 -n 1)
             yellow "你的起始端口为：$min_port"
@@ -1014,6 +1133,23 @@ change_config() {
             [ -z "$max_port" ] && max_port=$(($min_port + 100))
             yellow "你的结束端口为：$max_port\n"
             listen_port=$(jq -r '.inbounds[] | select(.type == "hysteria2").listen_port' "${conf_dir}/inbounds.json")
+
+            # 先清空之前残留的端口跳跃DNAT规则(每次"添加"都是新增规则、从不清理旧的，
+            # 反复设置几次或hy2端口变过之后会堆积多条失效规则，导致部分跳跃端口连不通)
+            iptables -t nat -F PREROUTING > /dev/null 2>&1
+            command -v ip6tables &> /dev/null && ip6tables -t nat -F PREROUTING > /dev/null 2>&1
+
+            # 显式放行跳跃端口区间（原脚本只加了iptables的DNAT转发规则，
+            # 若系统启用了ufw或firewalld，它们各自维护独立的入站过滤规则，
+            # 不显式放行这个区间的话，多端口跳跃流量会被挡在ufw/firewalld这一层）
+            if command_exists ufw; then
+                ufw allow in ${min_port}:${max_port}/udp > /dev/null 2>&1
+            fi
+            if command_exists firewall-cmd && systemctl is-active firewalld > /dev/null 2>&1; then
+                firewall-cmd --permanent --add-port=${min_port}-${max_port}/udp > /dev/null 2>&1
+                firewall-cmd --reload > /dev/null 2>&1
+            fi
+
             iptables -t nat -A PREROUTING -p udp --dport $min_port:$max_port -j DNAT --to-destination :$listen_port > /dev/null
             command -v ip6tables &> /dev/null && ip6tables -t nat -A PREROUTING -p udp --dport $min_port:$max_port -j DNAT --to-destination :$listen_port > /dev/null
             if command_exists rc-service 2>/dev/null; then
@@ -1039,13 +1175,18 @@ IEOF
             fi
             restart_singbox
             ip=$(get_realip)
-            fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
             uuid=$(sed -n 's/.*hysteria2:\/\/\([^@]*\)@.*/\1/p' $client_dir)
             line_number=$(grep -n 'hysteria2://' $client_dir | cut -d':' -f1)
             isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | \
                 awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | sed 's/ /_/g' || echo "$hostname")
+            if [ -n "$DOMAIN" ]; then
+                hop_sni="$DOMAIN"; hop_insecure="0"; hop_pin=""
+            else
+                fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
+                hop_sni="www.bing.com"; hop_insecure="1"; hop_pin="&pinSHA256=${fingerprint}"
+            fi
             sed -i.bak "/hysteria2:/d" $client_dir
-            sed -i "${line_number}i hysteria2://$uuid@$ip:$listen_port?peer=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none&mport=$listen_port,$min_port-$max_port#$isp" $client_dir
+            sed -i "${line_number}i hysteria2://$uuid@$ip:$listen_port?peer=${hop_sni}&insecure=${hop_insecure}${hop_pin}&alpn=h3&obfs=none&mport=$listen_port,$min_port-$max_port#$isp" $client_dir
             base64 -w0 $client_dir > /etc/sing-box/sub.txt
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
             green "\nhysteria2端口跳跃已开启：${purple}$min_port-$max_port${re}\n"
@@ -1429,8 +1570,93 @@ change_cfip() {
     purple "$new_vmess_url\n"
 }
 
+# 确保路由在所有规则之前执行协议/域名嗅探。
+# 现代 sing-box 推荐使用 route.rules 的 action: sniff，
+# 而不是旧版 inbound.sniff / sniff_override_destination。
+ensure_sniff_rule() {
+    local file="${conf_dir}/route.json"
+    [ -f "$file" ] || return 0
+
+    jq '
+      .route.rules = ([.route.rules[]? | select(
+        (.action? == "sniff") or
+        (.rule_set? != null and (.rule_set | length) > 0) or
+        (.domain_suffix? != null) or
+        (.domain? != null) or
+        (.ip_cidr? != null) or
+        (.ip_is_private? != null) or
+        (.protocol? != null) or
+        (.network? != null) or
+        (.inbound? != null)
+      )]) |
+      if any(.route.rules[]?; .action? == "sniff")
+      then .
+      else .route.rules = [{"action":"sniff"}] + .route.rules
+      end
+    ' "$file" > "${file}.tmp" 2>/dev/null && mv "${file}.tmp" "$file"
+}
+
+
+# 迁移/规范化旧版 route 规则：
+# sing-box 1.11+ 已将规则的 outbound 放入 action 中。
+# 老王脚本历史上使用：
+#   {"rule_set":["gemini"],"outbound":"relay"}
+# 现代写法应为：
+#   {"rule_set":["gemini"],"action":"route","outbound":"relay"}
+normalize_route_rules() {
+    local file="${conf_dir}/route.json"
+    [ -f "$file" ] || return 0
+
+    jq '
+      .route.rules = [
+        .route.rules[]? |
+        if (.action? == "sniff") then
+          .
+        elif (.outbound? != null and .action? == null) then
+          .action = "route"
+        else
+          .
+        end
+      ]
+    ' "$file" > "${file}.tmp" 2>/dev/null && mv "${file}.tmp" "$file"
+}
+
+# 检查并应用 route.json；失败时恢复备份，避免 sing-box 整体掉线。
+apply_route_with_rollback() {
+    local backup="$1"
+    local check_output restart_rc=0
+
+    check_output=$("${work_dir}/${server_name}" check -C "$conf_dir" 2>&1)
+    if [ $? -ne 0 ]; then
+        red "sing-box 路由配置检查失败："
+        echo "$check_output"
+        cp -f "$backup" "${conf_dir}/route.json"
+        red "已恢复修改前的 route.json，未重启 sing-box。"
+        return 1
+    fi
+
+    restart_singbox >/dev/null 2>&1
+    if command_exists systemctl; then
+        systemctl is-active --quiet sing-box || restart_rc=1
+    elif command_exists rc-service; then
+        rc-service sing-box status >/dev/null 2>&1 || restart_rc=1
+    fi
+
+    if [ "$restart_rc" -ne 0 ]; then
+        red "sing-box 重启后未正常运行，正在恢复修改前的 route.json..."
+        cp -f "$backup" "${conf_dir}/route.json"
+        restart_singbox >/dev/null 2>&1 || true
+        red "已回滚，现有节点配置未被破坏。"
+        return 1
+    fi
+
+    return 0
+}
+
 # WARP 分流管理
 warp_manage() {
+    ensure_sniff_rule
+
     check_singbox &>/dev/null
     if [ $? -eq 2 ]; then
         yellow "sing-box 尚未安装！"; sleep 1; menu; return
@@ -1444,23 +1670,24 @@ warp_manage() {
     green "=== WARP 分流管理 ===\n"
     green "当前已启用的分流规则集:"
     jq -r '.route.rules[] | select(.rule_set != null) | .rule_set[]?' "$route_file" 2>/dev/null | sort -u | while read tag; do
-        echo -e " - ${skyblue}$tag${re}"
+        extra=$(extra_ai_domains "$tag")
+        if [ -n "$extra" ]; then
+            echo -e " - ${skyblue}$tag${re} ${yellow}(已叠加API域名补充规则)${re}"
+        else
+            echo -e " - ${skyblue}$tag${re}"
+        fi
     done || echo "  无"
-    green "\n已添加的socks/http代理出站:"
+    green "\n已添加的代理出站(socks/http/ss):"
     jq -r '.outbounds[] | select(.tag != "direct") | " - \(.tag) [\(.type)]"' "$outbound_file" 2>/dev/null || echo "  无"
 
     echo ""
-    green "1. 设置分流服务 (未添加socks/http直接设置则使用WARP)"
+    green "1. 设置分流服务 (未添加代理出站直接设置则使用WARP)"
     skyblue "----------------------"
     red "2. 删除分流服务"
     skyblue "--------------"
-    green "3. 添加 Socks5/HTTP 出站"
+    green "3. 添加代理出站 (支持 socks5/http/ss2022)"
     skyblue "----------------------"
-    red "4. 删除 Socks5/HTTP 出站"
-    skyblue "----------------------"
-    green "5. 添加 Shadowsocks-2022 出站"
-    skyblue "----------------------"
-    red "6. 删除 Shadowsocks-2022 出站"
+    red "4. 删除代理出站"
     skyblue "----------------------"
     purple "0. 返回主菜单"
     skyblue "------------"
@@ -1472,11 +1699,29 @@ warp_manage() {
         2)  delete_rule_menu ;;
         3)  add_socks5_proxy ;;
         4)  delete_socks5_proxy ;;
-        5)  add_ss2022_outbound ;;
-        6)  delete_ss2022_outbound ;;
         0)  menu ;;
         00) exit 0 ;;
         *)  red "无效选项"; sleep 1; warp_manage ;;
+    esac
+}
+
+# AI服务的补充域名(API端点)，跟rule_set规则集配合使用而非替代它
+# 原因：公共geosite规则集(包括gemini.srs等)大多只收录消费级网站域名(如gemini.google.com)，
+# 不包含程序化访问用的API端点(如generativelanguage.googleapis.com)，导致API调用无法被正确分流
+extra_ai_domains() {
+    case "$1" in
+        gemini)
+            echo '["gemini.google.com","generativelanguage.googleapis.com","proactivebackend-pa.googleapis.com","alkalimakersuite-pa.clients6.google.com","aistudio.google.com","makersuite.google.com","aitestkitchen.withgoogle.com"]'
+            ;;
+        openai)
+            echo '["openai.com","chatgpt.com","chat.openai.com","oaistatic.com","oaiusercontent.com","ai.com"]'
+            ;;
+        claude)
+            echo '["claude.ai","anthropic.com","claude.com"]'
+            ;;
+        *)
+            echo ''
+            ;;
     esac
 }
 
@@ -1499,6 +1744,7 @@ add_rule_menu() {
     purple "0.  返回上级菜单"
     skyblue "-----------------------------"
     reading "请输入选择: " add_choice
+
     case "$add_choice" in
         1)  rule_tag="openai"   ;;
         2)  rule_tag="claude"   ;;
@@ -1515,18 +1761,48 @@ add_rule_menu() {
         *)  red "无效选项"; sleep 1; add_rule_menu; return ;;
     esac
 
+    normalize_route_rules
+    ensure_sniff_rule
+
     if jq -e --arg tag "$rule_tag" \
-        '.route.rules[] | select(.rule_set != null) | .rule_set[]? | select(. == $tag)' \
+        '.route.rules[]? | select(.rule_set != null) | .rule_set[]? | select(. == $tag)' \
         "$route_file" > /dev/null 2>&1; then
-        yellow "规则集 '${rule_tag}' 已启用。"; sleep 1; warp_manage; return
+        yellow "规则集 '${rule_tag}' 已启用。"
+        sleep 1
+        warp_manage
+        return
     fi
 
-    jq 'if (.route.rules | length) == 1 and (.route.rules[0].rule_set | length) == 0
-        then .route.rules = []
-        else . end' \
-        "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    jq '
+      .route.rules = [
+        .route.rules[]? |
+        select(
+          .action == "sniff" or
+          (.rule_set != null and (.rule_set | length) > 0) or
+          .domain_suffix != null or
+          .domain != null or
+          .ip_cidr != null or
+          .ip_is_private != null or
+          .protocol != null or
+          .network != null or
+          .inbound != null
+        )
+      ]
+    ' "$route_file" > "${route_file}.tmp" &&
+        mv "${route_file}.tmp" "$route_file" || {
+            red "清理 route.json 失败。"
+            sleep 2
+            warp_manage
+            return
+        }
 
-    local out_tags=($(jq -r '.outbounds[] | select(.tag != "direct") | .tag' "$outbound_file" 2>/dev/null))
+    local out_tags=()
+    mapfile -t out_tags < <(
+        jq -r '.outbounds[]? | select(.tag != "direct") | .tag' \
+        "$outbound_file" 2>/dev/null
+    )
+
+    local selected_out=""
     if [ ${#out_tags[@]} -eq 0 ]; then
         selected_out="wireguard-out"
         yellow "未找到其他出站，将自动使用 wireguard-out。"
@@ -1536,31 +1812,92 @@ add_rule_menu() {
         for i in "${!out_tags[@]}"; do
             echo -e "  ${green}$((i+1)). ${skyblue}${out_tags[$i]}${re}"
         done
+
         reading "请输入编号: " out_choice
-        if [[ ! "$out_choice" =~ ^[0-9]+$ ]] || \
-           [ "$out_choice" -lt 1 ] || \
+        if [[ ! "$out_choice" =~ ^[0-9]+$ ]] ||
+           [ "$out_choice" -lt 1 ] ||
            [ "$out_choice" -gt "${#out_tags[@]}" ]; then
-            red "无效选择"; sleep 1; warp_manage; return
+            red "无效选择"
+            sleep 1
+            warp_manage
+            return
         fi
         selected_out="${out_tags[$((out_choice-1))]}"
     fi
 
-    jq --arg tag "$rule_tag" --arg out "$selected_out" '
-        if (.route.rules | length) == 0 then
-            .route.rules = [{"rule_set": [$tag], "outbound": $out}]
-        else
-            (first(.route.rules[] | select(.outbound == $out)) | .rule_set) as $existing
-            | if $existing then
-                .route.rules = [.route.rules[] | select(.outbound == $out).rule_set += [$tag]]
-              else
-                .route.rules += [{"rule_set": [$tag], "outbound": $out}]
-              end
-        end
-    ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    if ! jq -e --arg out "$selected_out" \
+        '.outbounds[]? | select(.tag == $out)' "$outbound_file" >/dev/null 2>&1; then
+        red "出站 '${selected_out}' 不存在，已取消。"
+        sleep 2
+        warp_manage
+        return
+    fi
 
-    restart_singbox
-    green "'${rule_tag}' 已分流至出站 '${selected_out}'"
-    sleep 1; warp_manage
+    local route_backup
+    route_backup="$(mktemp)"
+    cp -f "$route_file" "$route_backup" || {
+        red "无法备份 route.json，已取消。"
+        rm -f "$route_backup"
+        sleep 2
+        warp_manage
+        return
+    }
+
+    # 使用现代 sing-box 规则格式：
+    # sniff 是非最终 action；真正分流使用 action=route + outbound。
+    if ! jq --arg tag "$rule_tag" --arg out "$selected_out" '
+        .route.rules += [{
+            "rule_set": [$tag],
+            "action": "route",
+            "outbound": $out
+        }]
+    ' "$route_file" > "${route_file}.tmp"; then
+        red "写入分流规则失败。"
+        rm -f "$route_backup" "${route_file}.tmp"
+        sleep 2
+        warp_manage
+        return
+    fi
+    mv "${route_file}.tmp" "$route_file"
+
+    extra_domains_json=$(extra_ai_domains "$rule_tag")
+    if [ -n "$extra_domains_json" ]; then
+        if ! jq -e --argjson d "$extra_domains_json" --arg out "$selected_out" \
+            '.route.rules[]? |
+             select(.domain_suffix != null and .outbound == $out and (.domain_suffix == $d))' \
+            "$route_file" >/dev/null 2>&1; then
+
+            if ! jq --argjson d "$extra_domains_json" --arg out "$selected_out" \
+                '.route.rules += [{
+                    "domain_suffix": $d,
+                    "action": "route",
+                    "outbound": $out
+                }]' "$route_file" > "${route_file}.tmp"; then
+                red "写入 AI 补充域名规则失败，正在回滚。"
+                cp -f "$route_backup" "$route_file"
+                rm -f "$route_backup" "${route_file}.tmp"
+                sleep 2
+                warp_manage
+                return
+            fi
+            mv "${route_file}.tmp" "$route_file"
+        fi
+    fi
+
+    ensure_sniff_rule
+    normalize_route_rules
+
+    if apply_route_with_rollback "$route_backup"; then
+        rm -f "$route_backup"
+        green "'${rule_tag}' 已分流至出站 '${selected_out}'"
+        green "当前 route.json 使用现代 action=route + outbound 格式。"
+        sleep 2
+        warp_manage
+    else
+        rm -f "$route_backup"
+        sleep 1
+        warp_manage
+    fi
 }
 
 # 设置全局代理出站
@@ -1625,11 +1962,13 @@ restore_direct_outbound() {
       {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
       {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
     ],
-    "rules": [{"rule_set": []}],
+    "rules": [{"action": "sniff"}],
     "final": "direct"
   }
 }
 EOF
+
+    ensure_sniff_rule
 
     # 恢复默认 endpoints.json
     cat > "${conf_dir}/endpoints.json" << EOF
@@ -1677,14 +2016,25 @@ delete_rule_menu() {
     fi
     jq --arg tag "$tag" \
        'del(.route.rules[] | select(.rule_set != null) | .rule_set[] | select(. == $tag)) |
-        .route.rules = [.route.rules[] | select(.rule_set != null and (.rule_set | length) > 0)]' \
+        .route.rules = [.route.rules[] | select(.action == "sniff" or (.rule_set != null and (.rule_set | length) > 0) or .domain_suffix != null or .domain != null or .ip_cidr != null or .ip_is_private != null or .protocol != null or .network != null or .inbound != null)] |
+        if any(.route.rules[]?; .action == "sniff") then . else .route.rules = [{"action":"sniff"}] + .route.rules end' \
        "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+
+    # 同步删除该服务的domain_suffix补充规则(如果有)
+    extra_domains_json=$(extra_ai_domains "$tag")
+    if [ -n "$extra_domains_json" ]; then
+        jq --argjson d "$extra_domains_json" \
+           '.route.rules = [.route.rules[] | select(.domain_suffix == null or (.domain_suffix != $d))]' \
+           "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    fi
+
     restart_singbox
     green "规则集 '${tag}' 已禁用。"
     sleep 1; warp_manage
 }
 
-add_ss2022_outbound() {
+# 解析 ss:// (含ss2022) 链接，添加为 shadowsocks 出站，用于把指定域名流量转发给另一台机子的ss2022节点
+add_ss_outbound() {
     local proxy_url="$1"
     local after_proto tag_from_url userinfo host_port server port method password
     local decoded_file raw_key_file raw_userinfo expected_len actual_len normalized_method
@@ -2000,37 +2350,19 @@ add_ss2022_outbound() {
     green "不会自动修改现有分流规则，请在“设置分流服务”中选择需要走 ${tag} 的规则集。\n"
     sleep 2; warp_manage
 }
-
-delete_ss2022_outbound() {
-    clear
-    green "当前 Shadowsocks-2022 出站列表:"
-    local out_list
-    out_list=$(jq -r '[.outbounds[] | select(.type == "shadowsocks" and (.method | startswith("2022-")))] | to_entries | .[] | "\(.key+1). \(.value.tag) [\(.value.method)]"' "$outbound_file" 2>/dev/null)
-    [ -z "$out_list" ] && { yellow "没有可删除的 Shadowsocks-2022 出站。"; sleep 2; warp_manage; return; }
-    echo "$out_list"
-    reading "输入要删除的编号或标签: " del_input
-    local tag
-    if [[ "$del_input" =~ ^[0-9]+$ ]]; then
-        tag=$(jq -r --arg idx "$del_input" '[.outbounds[] | select(.type == "shadowsocks" and (.method | startswith("2022-")))] | .[($idx|tonumber)-1].tag // empty' "$outbound_file")
-    else
-        tag="$del_input"
-    fi
-    [ -z "$tag" ] || ! jq -e --arg tag "$tag" '.outbounds[] | select(.tag == $tag and .type == "shadowsocks" and (.method | startswith("2022-")))' "$outbound_file" >/dev/null 2>&1 && { red "编号或标签无效！"; sleep 2; warp_manage; return; }
-    jq --arg tag "$tag" 'del(.outbounds[] | select(.tag == $tag))' "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
-    # 删除引用该出站的分流规则，避免留下无效 outbound
-    jq --arg tag "$tag" '.route.rules = [.route.rules[] | select(.outbound != $tag)]' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
-    restart_singbox
-    green "${tag} Shadowsocks-2022 出站已删除。"
-    sleep 1; warp_manage
-}
-
 add_socks5_proxy() {
     clear
-    reading "请输入代理URL (支持socks://,socks5://,http:// 支持v2rayN导出的节点链接): " proxy_url
+    reading "请输入代理URL (支持socks://,socks5://,http://,ss:// 支持v2rayN导出的节点链接): " proxy_url
     [ -z "$proxy_url" ] && { red "输入为空！"; sleep 1; return; }
 
     proto=$(echo "$proxy_url" | grep -oP '^[a-zA-Z0-9]+(?=://)')
-    [[ ! "$proto" =~ ^(socks5|socks|http)$ ]] && { red "不支持的协议"; sleep 2; return; }
+    [[ ! "$proto" =~ ^(socks5|socks|http|ss)$ ]] && { red "不支持的协议"; sleep 2; return; }
+
+    if [[ "$proto" == "ss" ]]; then
+        add_ss_outbound "$proxy_url"
+        return
+    fi
+
     case "$proto" in
         socks|socks5) outbound_type="socks" ;;
         http)         outbound_type="http" ;;
@@ -2061,10 +2393,18 @@ add_socks5_proxy() {
         fi
     fi
 
-    server="${host_port%%:*}"; port="${host_port##*:}"
+    if [[ "$host_port" =~ ^\[([0-9a-fA-F:]+)\]:([0-9]+)$ ]]; then
+        server="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+    else
+        server="${host_port%%:*}"; port="${host_port##*:}"
+    fi
     [ -z "$server" ] || [ -z "$port" ] && { red "格式错误：缺少ip或端口"; sleep 2; return; }
 
     [[ "$proto" == "socks" || "$proto" == "socks5" ]] && check_proto="socks5" || check_proto="$proto"
+
+    # 拼URL用的地址：IPv6需要重新套上方括号，纯IPv4/域名不用
+    local url_server="$server"
+    [[ "$server" == *:* ]] && url_server="[${server}]"
 
     # 判断是否为本地地址，本地地址跳过外部 API 检测，直接用 curl 测试
     local is_local=false
@@ -2078,8 +2418,8 @@ add_socks5_proxy() {
 
     if [ "$is_local" = true ]; then
         # 本地代理：直接用 curl 通过代理访问外网测试连通性
-        yellow "检测到本地代理 ${check_proto}://${server}:${port}，跳过外部API检测，正在用curl测试连通性..."
-        local curl_proxy_url="${check_proto}://${proxy_auth}${server}:${port}"
+        yellow "检测到本地代理 ${check_proto}://${url_server}:${port}，跳过外部API检测，正在用curl测试连通性..."
+        local curl_proxy_url="${check_proto}://${proxy_auth}${url_server}:${port}"
         local test_result
         test_result=$(curl -s --max-time 8 --proxy "$curl_proxy_url" "https://api.ip.sb/ip" 2>/dev/null)
         if [ -z "$test_result" ]; then
@@ -2091,10 +2431,10 @@ add_socks5_proxy() {
         fi
     else
         # 远程代理：调用外部 API 检测
-        yellow "正在测试代理 ${check_proto}://${server}:${port} ..."
+        yellow "正在测试代理 ${check_proto}://${url_server}:${port} ..."
         local api_response
         api_response=$(curl -s --max-time 8 -G \
-            --data-urlencode "proxy=${check_proto}://${proxy_auth}${server}:${port}" \
+            --data-urlencode "proxy=${check_proto}://${proxy_auth}${url_server}:${port}" \
             "https://check.socks5.cmliussss.net/check" 2>/dev/null)
         [ -z "$api_response" ] && { red "API 请求失败"; sleep 2; return; }
 
@@ -2126,14 +2466,20 @@ add_socks5_proxy() {
            "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
     fi
 
-    if jq -e '.route.rules | length > 0' "$route_file" >/dev/null 2>&1; then
-        jq --arg tag "$tag" '.route.rules[].outbound = $tag' "$route_file" > "${route_file}.tmp" \
-            && mv "${route_file}.tmp" "$route_file"
-        yellow "已将现有分流规则出站切换为 '${tag}'。"
+    # 添加 Socks/HTTP 出站时也不覆盖已有分流规则。
+    # 需要使用它时，请在“设置分流服务”中单独选择对应出站。
+    ensure_sniff_rule
+
+    check_output=$(${work_dir}/${server_name} check -C "$conf_dir" 2>&1)
+    if [ $? -ne 0 ]; then
+        red "代理配置检查失败，已保留原有分流配置。"
+        echo "$check_output"
+        sleep 2
+        return
     fi
 
     restart_singbox
-    green "\n${tag} 代理出站已添加\n"
+    green "\n${tag} 代理出站已添加，不会自动修改现有分流规则。\n"
     sleep 2; warp_manage
 }
 
@@ -2155,7 +2501,12 @@ delete_socks5_proxy() {
     [ "$tag" == "wireguard-out" ] && { red "wireguard-out 为系统内置，不可删除！"; sleep 2; return; }
 
     jq --arg tag "$tag" 'del(.outbounds[] | select(.tag == $tag))' "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
-    jq --arg tag "$tag" '.route.rules = [.route.rules[] | select(.outbound != $tag)]' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    jq --arg tag "$tag" '
+        .route.rules = [.route.rules[]? | select(.outbound != $tag)] |
+        if any(.route.rules[]?; .action == "sniff") then . else .route.rules = [{"action":"sniff"}] + .route.rules end
+    ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    ensure_sniff_rule
+    normalize_route_rules
 
     restart_singbox
     green "${tag} 代理出站已删除。"
@@ -2533,6 +2884,75 @@ show_extra_proto_status() {
     echo ""
 }
 
+# 域名证书管理：交互式设置/更换/恢复 hy2+tuic 使用的证书
+manage_domain_cert() {
+    check_singbox &>/dev/null
+    if [ $? -eq 2 ]; then
+        yellow "sing-box 尚未安装！"; sleep 1; return
+    fi
+
+    clear
+    green "=== 域名证书管理 ===\n"
+    if [ -f "${work_dir}/domain.txt" ] && [ -s "${work_dir}/domain.txt" ]; then
+        green "当前证书域名: ${purple}$(cat "${work_dir}/domain.txt")${re}"
+        green "证书颁发者: ${purple}$(openssl x509 -in "${work_dir}/cert.pem" -noout -issuer 2>/dev/null | sed 's/issuer=//')${re}\n"
+    else
+        yellow "当前使用自签证书 (bing.com)，未绑定真实域名\n"
+    fi
+
+    green "1. 设置/更换域名证书 (申请Let's Encrypt真实证书)"
+    red   "2. 恢复自签证书"
+    purple "0. 返回主菜单"
+    skyblue "------------"
+    reading "请输入选择: " dc_choice
+
+    case "$dc_choice" in
+        1)
+            reading "请输入你的域名 (需已提前解析到本机公网IP): " new_domain
+            [ -z "$new_domain" ] && { red "域名不能为空"; sleep 1; return; }
+
+            issue_domain_cert "$new_domain"
+
+            if [ -f "${work_dir}/domain.txt" ] && [ "$(cat "${work_dir}/domain.txt")" == "$new_domain" ]; then
+                jq --arg d "$new_domain" \
+                   '(.inbounds[] | select(.type=="hysteria2") | .masquerade) = ("https://" + $d)' \
+                   "${conf_dir}/inbounds.json" > "${conf_dir}/inbounds.json.tmp" \
+                   && mv "${conf_dir}/inbounds.json.tmp" "${conf_dir}/inbounds.json"
+
+                sed -i -E "/^hysteria2:\/\// s/sni=[^&]*/sni=${new_domain}/" "${client_dir}"
+                sed -i -E "/^hysteria2:\/\// s/insecure=[01]/insecure=0/" "${client_dir}"
+                sed -i -E "/^hysteria2:\/\// s/\&pinSHA256=[^&]*//" "${client_dir}"
+                sed -i -E "/^tuic:\/\// s/sni=[^&]*/sni=${new_domain}/" "${client_dir}"
+                sed -i -E "/^tuic:\/\// s/allow_insecure=[01]/allow_insecure=0/" "${client_dir}"
+
+                restart_singbox
+                green "\n域名证书已切换为 ${new_domain}，节点信息已同步更新，请重新导入订阅\n"
+            fi
+            ;;
+        2)
+            issue_domain_cert ""
+            new_fp=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
+
+            jq '(.inbounds[] | select(.type=="hysteria2") | .masquerade) = "https://bing.com"' \
+                "${conf_dir}/inbounds.json" > "${conf_dir}/inbounds.json.tmp" \
+                && mv "${conf_dir}/inbounds.json.tmp" "${conf_dir}/inbounds.json"
+
+            sed -i -E "/^hysteria2:\/\// s/sni=[^&]*/sni=www.bing.com/" "${client_dir}"
+            sed -i -E "/^hysteria2:\/\// s/insecure=[01]/insecure=1/" "${client_dir}"
+            sed -i -E "/^hysteria2:\/\// s/\&pinSHA256=[^&]*//" "${client_dir}"
+            sed -i -E "/^hysteria2:\/\// s/insecure=1/insecure=1\&pinSHA256=${new_fp}/" "${client_dir}"
+            sed -i -E "/^tuic:\/\// s/sni=[^&]*/sni=www.bing.com/" "${client_dir}"
+            sed -i -E "/^tuic:\/\// s/allow_insecure=[01]/allow_insecure=1/" "${client_dir}"
+
+            restart_singbox
+            green "\n已恢复自签证书，请重新导入订阅\n"
+            ;;
+        0) return ;;
+        *) red "无效选项" ;;
+    esac
+    sleep 2
+}
+
 # 协议管理主菜单
 manage_protocols() {
     check_singbox &>/dev/null
@@ -2583,7 +3003,7 @@ menu() {
     clear; echo ""
     green "Telegram群组: ${purple}https://t.me/eooceu${re}"
     green "YouTube频道: ${purple}https://youtube.com/@eooce${re}"
-    green "Github地址: ${purple}https://github.com/eooce/sing-box${re}\n"
+    green "Github地址: ${purple}https://github.com/tbjpvn/sb-re${re}\n"
     purple "=== 老王sing-box四合一安装脚本 ===\n"
     purple "---Argo 状态: ${argo_status}"
     purple "--Nginx 状态: ${nginx_status}"
@@ -2600,6 +3020,8 @@ menu() {
     green "8. WARP分流管理"
     echo "==============="
     green "9. 增加/删除协议"
+    echo "==============="
+    green "11. 域名证书管理"
     echo "==============="
     purple "10. ssh综合工具箱"
     echo "==============="
@@ -2648,7 +3070,7 @@ case "$1" in
         # 无参数：进入交互式主菜单
         while true; do
             menu
-            reading "请输入选择(0-10): " choice 
+            reading "请输入选择(0-11): " choice 
             echo ""
             need_pause=true  
             case "${choice}" in
@@ -2688,9 +3110,10 @@ case "$1" in
                     bash <(curl -Ls ssh_tool.eooce.com)
                     need_pause=false
                     ;;
+                11) manage_domain_cert; need_pause=false ;;
                 0)  exit 0 ;;       
                 *)
-                    red "无效的选项，请输入 0-10"
+                    red "无效的选项，请输入 0-11"
                     need_pause=true
                     ;;
             esac
