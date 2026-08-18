@@ -371,7 +371,7 @@ EOF
 }
 EOF
 
-cat > "${conf_dir}/dns.json" << EOF
+    cat > "${conf_dir}/dns.json" << EOF
 {
   "dns": {
     "servers": [
@@ -380,7 +380,7 @@ cat > "${conf_dir}/dns.json" << EOF
         "type": "local"
       }
     ],
-    "strategy": "prefer_ipv4"
+    "strategy": "$dns_strategy"
   }
 }
 EOF
@@ -510,7 +510,7 @@ EOF
 }
 EOF
 
-cat > "${conf_dir}/route.json" << EOF
+    cat > "${conf_dir}/route.json" << EOF
 {
   "route": {
     "rule_set": [
@@ -524,21 +524,7 @@ cat > "${conf_dir}/route.json" << EOF
       {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
       {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
     ],
-    "rules": [
-      {
-        "action": "sniff"
-      },
-      {
-        "rule_set": ["gemini"],
-        "domain_suffix": [
-          "robinfrontend-pa.googleapis.com",
-          "optimizationguide-pa.googleapis.com",
-          "bard.google.com",
-          "gemini.google.com"
-        ],
-        "outbound": "direct"
-      }
-    ],
+    "rules": [{"action": "sniff"}],
     "final": "direct"
   }
 }
@@ -1719,7 +1705,7 @@ warp_manage() {
     esac
 }
 
-# AI服务的补充域名(API端点)，跟rule_set规则集配合使用而非替代它
+# AI服务的补充域名(API/Android端点)，跟rule_set规则集配合使用而非替代它
 # 原因：公共geosite规则集(包括gemini.srs等)大多只收录消费级网站域名(如gemini.google.com)，
 # 不包含程序化访问用的API端点(如generativelanguage.googleapis.com)，导致API调用无法被正确分流
 extra_ai_domains() {
