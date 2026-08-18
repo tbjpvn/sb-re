@@ -1596,63 +1596,6 @@ ensure_sniff_rule() {
     ' "$file" > "${file}.tmp" 2>/dev/null && mv "${file}.tmp" "$file"
 }
 
-
-# 迁移/规范化旧版 route 规则：
-# sing-box 1.11+ 已将规则的 outbound 放入 action 中。
-# 老王脚本历史上使用：
-#   {"rule_set":["gemini"],"outbound":"relay"}
-# 现代写法应为：
-#   {"rule_set":["gemini"],"action":"route","outbound":"relay"}
-normalize_route_rules() {
-    local file="${conf_dir}/route.json"
-    [ -f "$file" ] || return 0
-
-    jq '
-      .route.rules = [
-        .route.rules[]? |
-        if (.action? == "sniff") then
-          .
-        elif (.outbound? != null and .action? == null) then
-          .action = "route"
-        else
-          .
-        end
-      ]
-    ' "$file" > "${file}.tmp" 2>/dev/null && mv "${file}.tmp" "$file"
-}
-
-# 检查并应用 route.json；失败时恢复备份，避免 sing-box 整体掉线。
-apply_route_with_rollback() {
-    local backup="$1"
-    local check_output restart_rc=0
-
-    check_output=$("${work_dir}/${server_name}" check -C "$conf_dir" 2>&1)
-    if [ $? -ne 0 ]; then
-        red "sing-box 路由配置检查失败："
-        echo "$check_output"
-        cp -f "$backup" "${conf_dir}/route.json"
-        red "已恢复修改前的 route.json，未重启 sing-box。"
-        return 1
-    fi
-
-    restart_singbox >/dev/null 2>&1
-    if command_exists systemctl; then
-        systemctl is-active --quiet sing-box || restart_rc=1
-    elif command_exists rc-service; then
-        rc-service sing-box status >/dev/null 2>&1 || restart_rc=1
-    fi
-
-    if [ "$restart_rc" -ne 0 ]; then
-        red "sing-box 重启后未正常运行，正在恢复修改前的 route.json..."
-        cp -f "$backup" "${conf_dir}/route.json"
-        restart_singbox >/dev/null 2>&1 || true
-        red "已回滚，现有节点配置未被破坏。"
-        return 1
-    fi
-
-    return 0
-}
-
 # WARP 分流管理
 warp_manage() {
     ensure_sniff_rule
@@ -1744,7 +1687,6 @@ add_rule_menu() {
     purple "0.  返回上级菜单"
     skyblue "-----------------------------"
     reading "请输入选择: " add_choice
-
     case "$add_choice" in
         1)  rule_tag="openai"   ;;
         2)  rule_tag="claude"   ;;
@@ -1761,48 +1703,19 @@ add_rule_menu() {
         *)  red "无效选项"; sleep 1; add_rule_menu; return ;;
     esac
 
-    normalize_route_rules
-    ensure_sniff_rule
-
     if jq -e --arg tag "$rule_tag" \
-        '.route.rules[]? | select(.rule_set != null) | .rule_set[]? | select(. == $tag)' \
+        '.route.rules[] | select(.rule_set != null) | .rule_set[]? | select(. == $tag)' \
         "$route_file" > /dev/null 2>&1; then
-        yellow "规则集 '${rule_tag}' 已启用。"
-        sleep 1
-        warp_manage
-        return
+        yellow "规则集 '${rule_tag}' 已启用。"; sleep 1; warp_manage; return
     fi
 
-    jq '
-      .route.rules = [
-        .route.rules[]? |
-        select(
-          .action == "sniff" or
-          (.rule_set != null and (.rule_set | length) > 0) or
-          .domain_suffix != null or
-          .domain != null or
-          .ip_cidr != null or
-          .ip_is_private != null or
-          .protocol != null or
-          .network != null or
-          .inbound != null
-        )
-      ]
-    ' "$route_file" > "${route_file}.tmp" &&
-        mv "${route_file}.tmp" "$route_file" || {
-            red "清理 route.json 失败。"
-            sleep 2
-            warp_manage
-            return
-        }
+    # 确保 sniff 始终位于所有分流规则之前。
+    ensure_sniff_rule
+    # 清理旧版本脚本留下的空 rule_set 占位规则，但保留 sniff 和已有有效规则。
+    jq '.route.rules = [.route.rules[] | select(.action == "sniff" or (.rule_set != null and (.rule_set | length) > 0) or .domain_suffix != null or .domain != null or .ip_cidr != null or .ip_is_private != null or .protocol != null or .network != null or .inbound != null)]' \
+        "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
 
-    local out_tags=()
-    mapfile -t out_tags < <(
-        jq -r '.outbounds[]? | select(.tag != "direct") | .tag' \
-        "$outbound_file" 2>/dev/null
-    )
-
-    local selected_out=""
+    local out_tags=($(jq -r '.outbounds[] | select(.tag != "direct") | .tag' "$outbound_file" 2>/dev/null))
     if [ ${#out_tags[@]} -eq 0 ]; then
         selected_out="wireguard-out"
         yellow "未找到其他出站，将自动使用 wireguard-out。"
@@ -1812,92 +1725,43 @@ add_rule_menu() {
         for i in "${!out_tags[@]}"; do
             echo -e "  ${green}$((i+1)). ${skyblue}${out_tags[$i]}${re}"
         done
-
         reading "请输入编号: " out_choice
-        if [[ ! "$out_choice" =~ ^[0-9]+$ ]] ||
-           [ "$out_choice" -lt 1 ] ||
+        if [[ ! "$out_choice" =~ ^[0-9]+$ ]] || \
+           [ "$out_choice" -lt 1 ] || \
            [ "$out_choice" -gt "${#out_tags[@]}" ]; then
-            red "无效选择"
-            sleep 1
-            warp_manage
-            return
+            red "无效选择"; sleep 1; warp_manage; return
         fi
         selected_out="${out_tags[$((out_choice-1))]}"
     fi
 
-    if ! jq -e --arg out "$selected_out" \
-        '.outbounds[]? | select(.tag == $out)' "$outbound_file" >/dev/null 2>&1; then
-        red "出站 '${selected_out}' 不存在，已取消。"
-        sleep 2
-        warp_manage
-        return
-    fi
+    jq --arg tag "$rule_tag" --arg out "$selected_out" '
+        if (.route.rules | length) == 0 then
+            .route.rules = [{"rule_set": [$tag], "outbound": $out}]
+        else
+            (first(.route.rules[] | select(.outbound == $out)) | .rule_set) as $existing
+            | if $existing then
+                .route.rules = [.route.rules[] | select(.outbound == $out).rule_set += [$tag]]
+              else
+                .route.rules += [{"rule_set": [$tag], "outbound": $out}]
+              end
+        end
+    ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
 
-    local route_backup
-    route_backup="$(mktemp)"
-    cp -f "$route_file" "$route_backup" || {
-        red "无法备份 route.json，已取消。"
-        rm -f "$route_backup"
-        sleep 2
-        warp_manage
-        return
-    }
-
-    # 使用现代 sing-box 规则格式：
-    # sniff 是非最终 action；真正分流使用 action=route + outbound。
-    if ! jq --arg tag "$rule_tag" --arg out "$selected_out" '
-        .route.rules += [{
-            "rule_set": [$tag],
-            "action": "route",
-            "outbound": $out
-        }]
-    ' "$route_file" > "${route_file}.tmp"; then
-        red "写入分流规则失败。"
-        rm -f "$route_backup" "${route_file}.tmp"
-        sleep 2
-        warp_manage
-        return
-    fi
-    mv "${route_file}.tmp" "$route_file"
-
+    # AI服务额外叠加domain_suffix补充规则(见 extra_ai_domains 说明)，跟rule_set是两条独立规则、互不影响
     extra_domains_json=$(extra_ai_domains "$rule_tag")
     if [ -n "$extra_domains_json" ]; then
         if ! jq -e --argjson d "$extra_domains_json" --arg out "$selected_out" \
-            '.route.rules[]? |
-             select(.domain_suffix != null and .outbound == $out and (.domain_suffix == $d))' \
-            "$route_file" >/dev/null 2>&1; then
-
-            if ! jq --argjson d "$extra_domains_json" --arg out "$selected_out" \
-                '.route.rules += [{
-                    "domain_suffix": $d,
-                    "action": "route",
-                    "outbound": $out
-                }]' "$route_file" > "${route_file}.tmp"; then
-                red "写入 AI 补充域名规则失败，正在回滚。"
-                cp -f "$route_backup" "$route_file"
-                rm -f "$route_backup" "${route_file}.tmp"
-                sleep 2
-                warp_manage
-                return
-            fi
-            mv "${route_file}.tmp" "$route_file"
+            '.route.rules[] | select(.domain_suffix != null and .outbound == $out and (.domain_suffix == $d))' \
+            "$route_file" > /dev/null 2>&1; then
+            jq --argjson d "$extra_domains_json" --arg out "$selected_out" \
+                '.route.rules += [{"domain_suffix": $d, "outbound": $out}]' \
+                "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
         fi
     fi
 
-    ensure_sniff_rule
-    normalize_route_rules
-
-    if apply_route_with_rollback "$route_backup"; then
-        rm -f "$route_backup"
-        green "'${rule_tag}' 已分流至出站 '${selected_out}'"
-        green "当前 route.json 使用现代 action=route + outbound 格式。"
-        sleep 2
-        warp_manage
-    else
-        rm -f "$route_backup"
-        sleep 1
-        warp_manage
-    fi
+    restart_singbox
+    green "'${rule_tag}' 已分流至出站 '${selected_out}'"
+    sleep 1; warp_manage
 }
 
 # 设置全局代理出站
@@ -2501,12 +2365,7 @@ delete_socks5_proxy() {
     [ "$tag" == "wireguard-out" ] && { red "wireguard-out 为系统内置，不可删除！"; sleep 2; return; }
 
     jq --arg tag "$tag" 'del(.outbounds[] | select(.tag == $tag))' "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
-    jq --arg tag "$tag" '
-        .route.rules = [.route.rules[]? | select(.outbound != $tag)] |
-        if any(.route.rules[]?; .action == "sniff") then . else .route.rules = [{"action":"sniff"}] + .route.rules end
-    ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
-    ensure_sniff_rule
-    normalize_route_rules
+    jq --arg tag "$tag" '.route.rules = [.route.rules[] | select(.outbound != $tag)]' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
 
     restart_singbox
     green "${tag} 代理出站已删除。"
