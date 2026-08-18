@@ -1804,13 +1804,14 @@ add_ss2022_proxy() {
     reading "请输入 Shadowsocks-2022 节点链接 (ss://...): " ss_url
     [ -z "$ss_url" ] && { red "输入为空！"; sleep 1; return; }
 
-    ss_url=$(printf '%s' "$ss_url" | tr -d '\r\n ')
+    # 只清理首尾空白，绝不改动链接内部字符，避免误伤 Base64 密钥。
+    ss_url=$(printf '%s' "$ss_url" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     [[ "$ss_url" == ss://* ]] || { red "格式错误：必须以 ss:// 开头"; sleep 2; return; }
 
-    local raw fragment tag userinfo host_port decoded method password server port expected_len key_raw key_len
+    local raw fragment tag userinfo host_port decoded method password server port
     raw="${ss_url#ss://}"
 
-    # 去掉节点名称和查询参数；节点名称只用于 tag，不参与连接配置
+    # # 后面是节点名称；? 后面是可选参数。
     fragment=""
     if [[ "$raw" == *"#"* ]]; then
         fragment="${raw#*#}"
@@ -1822,10 +1823,13 @@ add_ss2022_proxy() {
     userinfo="${raw%%@*}"
     host_port="${raw#*@}"
 
-    # 兼容 SIP002 的 Base64 userinfo，也兼容 method:password 明文形式
+    # 兼容两种常见格式：
+    # 1. ss://BASE64(method:password)@host:port
+    # 2. ss://method:password@host:port
     if [[ "$userinfo" == *":"* ]]; then
         decoded="$userinfo"
     else
+        # URL-safe Base64 -> 标准 Base64，并自动补齐 padding。
         userinfo="${userinfo//-/+}"
         userinfo="${userinfo//_/\/}"
         case $((${#userinfo} % 4)) in
@@ -1833,7 +1837,7 @@ add_ss2022_proxy() {
             3) userinfo="${userinfo}=" ;;
             1) red "SS2022 节点链接 Base64 格式错误"; sleep 2; return ;;
         esac
-        decoded=$(printf '%s' "$userinfo" | base64 -d 2>/dev/null)
+        decoded=$(printf '%s' "$userinfo" | base64 --decode 2>/dev/null | tr -d '\r\n')
     fi
 
     [ -n "$decoded" ] && [[ "$decoded" == *":"* ]] || {
@@ -1843,26 +1847,12 @@ add_ss2022_proxy() {
     password="${decoded#*:}"
 
     case "$method" in
-        2022-blake3-aes-128-gcm) expected_len=16 ;;
-        2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) expected_len=32 ;;
+        2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) ;;
         *) red "这不是支持的 Shadowsocks-2022 加密方式：${method}"; sleep 2; return ;;
     esac
+    [ -n "$password" ] || { red "无法解析 SS2022 密钥"; sleep 2; return; }
 
-    # SS2022 密钥本身必须是对应长度的 Base64 编码数据。
-    key_raw="${password//-/+}"
-    key_raw="${key_raw//_/\/}"
-    case $((${#key_raw} % 4)) in
-        2) key_raw="${key_raw}==" ;;
-        3) key_raw="${key_raw}=" ;;
-        1) red "SS2022 密钥 Base64 格式错误"; sleep 2; return ;;
-    esac
-    key_len=$(printf '%s' "$key_raw" | base64 -d 2>/dev/null | wc -c | tr -d ' ')
-    [ "$key_len" = "$expected_len" ] || {
-        red "SS2022 密钥长度错误：${method} 需要 ${expected_len} 字节，当前为 ${key_len} 字节";
-        sleep 3; return;
-    }
-
-    # 支持 IPv4、域名和 [IPv6]:端口
+    # 密钥长度不在脚本里二次错误解析。原样交给 sing-box 校验；配置失败自动回滚。
     if [[ "$host_port" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
         server="${BASH_REMATCH[1]}"
         port="${BASH_REMATCH[2]}"
@@ -1874,41 +1864,52 @@ add_ss2022_proxy() {
         red "格式错误：服务器地址或端口无效"; sleep 2; return;
     }
 
-    # tag 不做 URL 解码，避免特殊字符影响 jq / route；没有名称则自动生成。
+    # 节点名称仅用于显示标签，移除 URL 编码中的 # 之后内容即可。
     tag="${fragment:-ss2022-${server}-${port}}"
     jq -e --arg tag "$tag" '.outbounds[] | select(.tag == $tag)' "$outbound_file" >/dev/null 2>&1 \
         && { red "出站标签 '${tag}' 已存在"; sleep 2; return; }
 
-    # 先备份，再写入；如果 sing-box 无法恢复运行则自动还原，避免所有节点一起掉线。
     local outbound_backup="${outbound_file}.ss2022.bak"
     cp "$outbound_file" "$outbound_backup" || { red "无法备份 outbounds.json"; sleep 2; return; }
 
-    if ! jq --arg tag "$tag" --arg server "$server" --arg password "$password" \
-        --arg method "$method" --arg port "$port" \
-        '.outbounds += [{"type":"shadowsocks","tag":$tag,"server":$server,"server_port":($port|tonumber),"method":$method,"password":$password}]' \
-        "$outbound_file" > "${outbound_file}.tmp"; then
+    jq --arg tag "$tag" --arg server "$server" --arg password "$password" \
+       --arg method "$method" --arg port "$port" \
+       '.outbounds += [{"type":"shadowsocks","tag":$tag,"server":$server,"server_port":($port|tonumber),"method":$method,"password":$password}]' \
+       "$outbound_file" > "${outbound_file}.tmp" || {
         rm -f "${outbound_file}.tmp" "$outbound_backup"
-        red "生成 Shadowsocks-2022 出站配置失败"; sleep 2; return
-    fi
+        red "生成 Shadowsocks-2022 出站配置失败"; sleep 2; return;
+    }
     mv "${outbound_file}.tmp" "$outbound_file"
+
+    # 先做 sing-box 配置检查，再重启。失败立即恢复，避免所有入站节点一起掉线。
+    local check_ok=0
+    if [ -x "${work_dir}/${server_name}" ]; then
+        "${work_dir}/${server_name}" check -C "${conf_dir}" >/dev/null 2>&1
+        check_ok=$?
+    elif command -v sing-box >/dev/null 2>&1; then
+        sing-box check -C "${conf_dir}" >/dev/null 2>&1
+        check_ok=$?
+    fi
+    if [ "$check_ok" -ne 0 ]; then
+        cp "$outbound_backup" "$outbound_file"
+        rm -f "$outbound_backup"
+        red "SS2022 节点配置未通过 sing-box 检查，已自动恢复，原有节点未受影响。"
+        sleep 3; warp_manage; return
+    fi
 
     restart_singbox >/dev/null 2>&1
     sleep 1
+    local service_ok=0
     if command_exists systemctl; then
-        systemctl is-active --quiet sing-box
-        service_ok=$?
+        systemctl is-active --quiet sing-box; service_ok=$?
     elif command_exists rc-service; then
-        rc-service sing-box status >/dev/null 2>&1
-        service_ok=$?
-    else
-        service_ok=0
+        rc-service sing-box status >/dev/null 2>&1; service_ok=$?
     fi
-
     if [ "$service_ok" -ne 0 ]; then
         cp "$outbound_backup" "$outbound_file"
         restart_singbox >/dev/null 2>&1
         rm -f "$outbound_backup"
-        red "SS2022 出站配置导致 sing-box 启动失败，已自动回滚，原有节点已恢复。"
+        red "SS2022 出站导致 sing-box 启动失败，已自动回滚，原有节点已恢复。"
         sleep 3; warp_manage; return
     fi
 
