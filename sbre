@@ -1446,7 +1446,7 @@ warp_manage() {
     jq -r '.route.rules[] | select(.rule_set != null) | .rule_set[]?' "$route_file" 2>/dev/null | sort -u | while read tag; do
         echo -e " - ${skyblue}$tag${re}"
     done || echo "  无"
-    green "\n已添加的代理出站:"
+    green "\n已添加的socks/http代理出站:"
     jq -r '.outbounds[] | select(.tag != "direct") | " - \(.tag) [\(.type)]"' "$outbound_file" 2>/dev/null || echo "  无"
 
     echo ""
@@ -1459,7 +1459,9 @@ warp_manage() {
     red "4. 删除 Socks5/HTTP 出站"
     skyblue "----------------------"
     green "5. 添加 Shadowsocks-2022 出站"
-    skyblue "------------------------------"
+    skyblue "----------------------"
+    red "6. 删除 Shadowsocks-2022 出站"
+    skyblue "----------------------"
     purple "0. 返回主菜单"
     skyblue "------------"
     purple "00. 退出脚本"
@@ -1470,7 +1472,8 @@ warp_manage() {
         2)  delete_rule_menu ;;
         3)  add_socks5_proxy ;;
         4)  delete_socks5_proxy ;;
-        5)  clear; reading "请输入 Shadowsocks-2022 节点链接 (ss://): " ss_url; [ -z "$ss_url" ] && { red "输入为空！"; sleep 1; warp_manage; return; }; add_ss_outbound "$ss_url" ;;
+        5)  add_ss2022_outbound ;;
+        6)  delete_ss2022_outbound ;;
         0)  menu ;;
         00) exit 0 ;;
         *)  red "无效选项"; sleep 1; warp_manage ;;
@@ -1681,7 +1684,7 @@ delete_rule_menu() {
     sleep 1; warp_manage
 }
 
-add_ss_outbound() {
+add_ss2022_outbound() {
     local proxy_url="$1"
     local after_proto tag_from_url userinfo host_port server port method password
     local decoded_file raw_key_file raw_userinfo expected_len actual_len normalized_method
@@ -1935,7 +1938,7 @@ add_ss_outbound() {
     # 重要：添加代理出站不自动修改现有分流规则。
     # 用户应在“设置分流服务”中单独选择哪个 rule_set 使用 relay。
 
-    check_output=$(ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true "${work_dir}/${server_name}" check -C "$conf_dir" 2>&1)
+    check_output=$("${work_dir}/${server_name}" check -C "$conf_dir" 2>&1)
     if [ $? -ne 0 ]; then
         red "SS2022 已添加，但 sing-box 配置检查失败："
         echo "$check_output"
@@ -1996,6 +1999,29 @@ add_ss_outbound() {
     green "\n${tag} (${method}) shadowsocks 代理出站已添加"
     green "不会自动修改现有分流规则，请在“设置分流服务”中选择需要走 ${tag} 的规则集。\n"
     sleep 2; warp_manage
+}
+
+delete_ss2022_outbound() {
+    clear
+    green "当前 Shadowsocks-2022 出站列表:"
+    local out_list
+    out_list=$(jq -r '[.outbounds[] | select(.type == "shadowsocks" and (.method | startswith("2022-")))] | to_entries | .[] | "\(.key+1). \(.value.tag) [\(.value.method)]"' "$outbound_file" 2>/dev/null)
+    [ -z "$out_list" ] && { yellow "没有可删除的 Shadowsocks-2022 出站。"; sleep 2; warp_manage; return; }
+    echo "$out_list"
+    reading "输入要删除的编号或标签: " del_input
+    local tag
+    if [[ "$del_input" =~ ^[0-9]+$ ]]; then
+        tag=$(jq -r --arg idx "$del_input" '[.outbounds[] | select(.type == "shadowsocks" and (.method | startswith("2022-")))] | .[($idx|tonumber)-1].tag // empty' "$outbound_file")
+    else
+        tag="$del_input"
+    fi
+    [ -z "$tag" ] || ! jq -e --arg tag "$tag" '.outbounds[] | select(.tag == $tag and .type == "shadowsocks" and (.method | startswith("2022-")))' "$outbound_file" >/dev/null 2>&1 && { red "编号或标签无效！"; sleep 2; warp_manage; return; }
+    jq --arg tag "$tag" 'del(.outbounds[] | select(.tag == $tag))' "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+    # 删除引用该出站的分流规则，避免留下无效 outbound
+    jq --arg tag "$tag" '.route.rules = [.route.rules[] | select(.outbound != $tag)]' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    restart_singbox
+    green "${tag} Shadowsocks-2022 出站已删除。"
+    sleep 1; warp_manage
 }
 
 add_socks5_proxy() {
