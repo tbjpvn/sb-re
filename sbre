@@ -5,6 +5,8 @@
 # vless-version-reality|vmess-ws-tls(tunnel)|hysteria2|tuic5|[可额外添加Anytls，socks5，ss2022等协议] 
 # 最后更新时间: 2026.6.7[添加hy2证书, 添加ipv4和ipv6切换]
 # 个人修改: 支持DOMAIN变量，用acme.sh申请Let's Encrypt真实域名证书替代自签证书(hy2/tuic)
+# SS2022分流修复版：支持v2rayN导出的SS2022 URI；按实际PSK长度自动校正AES-128/AES-256；
+# 添加SS2022出站时不覆盖现有分流规则，并在写入后执行sing-box配置检查，失败自动回滚。
 # =========================
 
 export LANG=en_US.UTF-8
@@ -522,7 +524,7 @@ EOF
       {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
       {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
     ],
-    "rules": [{"rule_set": []}],
+    "rules": [{"action": "sniff"}],
     "final": "direct"
   }
 }
@@ -1568,8 +1570,93 @@ change_cfip() {
     purple "$new_vmess_url\n"
 }
 
+# 确保路由在所有规则之前执行协议/域名嗅探。
+# 现代 sing-box 推荐使用 route.rules 的 action: sniff，
+# 而不是旧版 inbound.sniff / sniff_override_destination。
+ensure_sniff_rule() {
+    local file="${conf_dir}/route.json"
+    [ -f "$file" ] || return 0
+
+    jq '
+      .route.rules = ([.route.rules[]? | select(
+        (.action? == "sniff") or
+        (.rule_set? != null and (.rule_set | length) > 0) or
+        (.domain_suffix? != null) or
+        (.domain? != null) or
+        (.ip_cidr? != null) or
+        (.ip_is_private? != null) or
+        (.protocol? != null) or
+        (.network? != null) or
+        (.inbound? != null)
+      )]) |
+      if any(.route.rules[]?; .action? == "sniff")
+      then .
+      else .route.rules = [{"action":"sniff"}] + .route.rules
+      end
+    ' "$file" > "${file}.tmp" 2>/dev/null && mv "${file}.tmp" "$file"
+}
+
+
+# 迁移/规范化旧版 route 规则：
+# sing-box 1.11+ 已将规则的 outbound 放入 action 中。
+# 老王脚本历史上使用：
+#   {"rule_set":["gemini"],"outbound":"relay"}
+# 现代写法应为：
+#   {"rule_set":["gemini"],"action":"route","outbound":"relay"}
+normalize_route_rules() {
+    local file="${conf_dir}/route.json"
+    [ -f "$file" ] || return 0
+
+    jq '
+      .route.rules = [
+        .route.rules[]? |
+        if (.action? == "sniff") then
+          .
+        elif (.outbound? != null and .action? == null) then
+          .action = "route"
+        else
+          .
+        end
+      ]
+    ' "$file" > "${file}.tmp" 2>/dev/null && mv "${file}.tmp" "$file"
+}
+
+# 检查并应用 route.json；失败时恢复备份，避免 sing-box 整体掉线。
+apply_route_with_rollback() {
+    local backup="$1"
+    local check_output restart_rc=0
+
+    check_output=$("${work_dir}/${server_name}" check -C "$conf_dir" 2>&1)
+    if [ $? -ne 0 ]; then
+        red "sing-box 路由配置检查失败："
+        echo "$check_output"
+        cp -f "$backup" "${conf_dir}/route.json"
+        red "已恢复修改前的 route.json，未重启 sing-box。"
+        return 1
+    fi
+
+    restart_singbox >/dev/null 2>&1
+    if command_exists systemctl; then
+        systemctl is-active --quiet sing-box || restart_rc=1
+    elif command_exists rc-service; then
+        rc-service sing-box status >/dev/null 2>&1 || restart_rc=1
+    fi
+
+    if [ "$restart_rc" -ne 0 ]; then
+        red "sing-box 重启后未正常运行，正在恢复修改前的 route.json..."
+        cp -f "$backup" "${conf_dir}/route.json"
+        restart_singbox >/dev/null 2>&1 || true
+        red "已回滚，现有节点配置未被破坏。"
+        return 1
+    fi
+
+    return 0
+}
+
 # WARP 分流管理
 warp_manage() {
+    ensure_sniff_rule
+
     check_singbox &>/dev/null
     if [ $? -eq 2 ]; then
         yellow "sing-box 尚未安装！"; sleep 1; menu; return
@@ -1583,7 +1670,12 @@ warp_manage() {
     green "=== WARP 分流管理 ===\n"
     green "当前已启用的分流规则集:"
     jq -r '.route.rules[] | select(.rule_set != null) | .rule_set[]?' "$route_file" 2>/dev/null | sort -u | while read tag; do
-        echo -e " - ${skyblue}$tag${re}"
+        extra=$(extra_ai_domains "$tag")
+        if [ -n "$extra" ]; then
+            echo -e " - ${skyblue}$tag${re} ${yellow}(已叠加API域名补充规则)${re}"
+        else
+            echo -e " - ${skyblue}$tag${re}"
+        fi
     done || echo "  无"
     green "\n已添加的代理出站(socks/http/ss):"
     jq -r '.outbounds[] | select(.tag != "direct") | " - \(.tag) [\(.type)]"' "$outbound_file" 2>/dev/null || echo "  无"
@@ -1613,6 +1705,26 @@ warp_manage() {
     esac
 }
 
+# AI服务的补充域名(API端点)，跟rule_set规则集配合使用而非替代它
+# 原因：公共geosite规则集(包括gemini.srs等)大多只收录消费级网站域名(如gemini.google.com)，
+# 不包含程序化访问用的API端点(如generativelanguage.googleapis.com)，导致API调用无法被正确分流
+extra_ai_domains() {
+    case "$1" in
+        gemini)
+            echo '["gemini.google.com","generativelanguage.googleapis.com","proactivebackend-pa.googleapis.com","alkalimakersuite-pa.clients6.google.com","aistudio.google.com","makersuite.google.com","aitestkitchen.withgoogle.com"]'
+            ;;
+        openai)
+            echo '["openai.com","chatgpt.com","chat.openai.com","oaistatic.com","oaiusercontent.com","ai.com"]'
+            ;;
+        claude)
+            echo '["claude.ai","anthropic.com","claude.com"]'
+            ;;
+        *)
+            echo ''
+            ;;
+    esac
+}
+
 add_rule_menu() {
     clear
     green "选择要分流的服务:\n"
@@ -1632,6 +1744,7 @@ add_rule_menu() {
     purple "0.  返回上级菜单"
     skyblue "-----------------------------"
     reading "请输入选择: " add_choice
+
     case "$add_choice" in
         1)  rule_tag="openai"   ;;
         2)  rule_tag="claude"   ;;
@@ -1648,18 +1761,48 @@ add_rule_menu() {
         *)  red "无效选项"; sleep 1; add_rule_menu; return ;;
     esac
 
+    normalize_route_rules
+    ensure_sniff_rule
+
     if jq -e --arg tag "$rule_tag" \
-        '.route.rules[] | select(.rule_set != null) | .rule_set[]? | select(. == $tag)' \
+        '.route.rules[]? | select(.rule_set != null) | .rule_set[]? | select(. == $tag)' \
         "$route_file" > /dev/null 2>&1; then
-        yellow "规则集 '${rule_tag}' 已启用。"; sleep 1; warp_manage; return
+        yellow "规则集 '${rule_tag}' 已启用。"
+        sleep 1
+        warp_manage
+        return
     fi
 
-    jq 'if (.route.rules | length) == 1 and (.route.rules[0].rule_set | length) == 0
-        then .route.rules = []
-        else . end' \
-        "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    jq '
+      .route.rules = [
+        .route.rules[]? |
+        select(
+          .action == "sniff" or
+          (.rule_set != null and (.rule_set | length) > 0) or
+          .domain_suffix != null or
+          .domain != null or
+          .ip_cidr != null or
+          .ip_is_private != null or
+          .protocol != null or
+          .network != null or
+          .inbound != null
+        )
+      ]
+    ' "$route_file" > "${route_file}.tmp" &&
+        mv "${route_file}.tmp" "$route_file" || {
+            red "清理 route.json 失败。"
+            sleep 2
+            warp_manage
+            return
+        }
 
-    local out_tags=($(jq -r '.outbounds[] | select(.tag != "direct") | .tag' "$outbound_file" 2>/dev/null))
+    local out_tags=()
+    mapfile -t out_tags < <(
+        jq -r '.outbounds[]? | select(.tag != "direct") | .tag' \
+        "$outbound_file" 2>/dev/null
+    )
+
+    local selected_out=""
     if [ ${#out_tags[@]} -eq 0 ]; then
         selected_out="wireguard-out"
         yellow "未找到其他出站，将自动使用 wireguard-out。"
@@ -1669,31 +1812,92 @@ add_rule_menu() {
         for i in "${!out_tags[@]}"; do
             echo -e "  ${green}$((i+1)). ${skyblue}${out_tags[$i]}${re}"
         done
+
         reading "请输入编号: " out_choice
-        if [[ ! "$out_choice" =~ ^[0-9]+$ ]] || \
-           [ "$out_choice" -lt 1 ] || \
+        if [[ ! "$out_choice" =~ ^[0-9]+$ ]] ||
+           [ "$out_choice" -lt 1 ] ||
            [ "$out_choice" -gt "${#out_tags[@]}" ]; then
-            red "无效选择"; sleep 1; warp_manage; return
+            red "无效选择"
+            sleep 1
+            warp_manage
+            return
         fi
         selected_out="${out_tags[$((out_choice-1))]}"
     fi
 
-    jq --arg tag "$rule_tag" --arg out "$selected_out" '
-        if (.route.rules | length) == 0 then
-            .route.rules = [{"rule_set": [$tag], "outbound": $out}]
-        else
-            (first(.route.rules[] | select(.outbound == $out)) | .rule_set) as $existing
-            | if $existing then
-                .route.rules = [.route.rules[] | select(.outbound == $out).rule_set += [$tag]]
-              else
-                .route.rules += [{"rule_set": [$tag], "outbound": $out}]
-              end
-        end
-    ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    if ! jq -e --arg out "$selected_out" \
+        '.outbounds[]? | select(.tag == $out)' "$outbound_file" >/dev/null 2>&1; then
+        red "出站 '${selected_out}' 不存在，已取消。"
+        sleep 2
+        warp_manage
+        return
+    fi
 
-    restart_singbox
-    green "'${rule_tag}' 已分流至出站 '${selected_out}'"
-    sleep 1; warp_manage
+    local route_backup
+    route_backup="$(mktemp)"
+    cp -f "$route_file" "$route_backup" || {
+        red "无法备份 route.json，已取消。"
+        rm -f "$route_backup"
+        sleep 2
+        warp_manage
+        return
+    }
+
+    # 使用现代 sing-box 规则格式：
+    # sniff 是非最终 action；真正分流使用 action=route + outbound。
+    if ! jq --arg tag "$rule_tag" --arg out "$selected_out" '
+        .route.rules += [{
+            "rule_set": [$tag],
+            "action": "route",
+            "outbound": $out
+        }]
+    ' "$route_file" > "${route_file}.tmp"; then
+        red "写入分流规则失败。"
+        rm -f "$route_backup" "${route_file}.tmp"
+        sleep 2
+        warp_manage
+        return
+    fi
+    mv "${route_file}.tmp" "$route_file"
+
+    extra_domains_json=$(extra_ai_domains "$rule_tag")
+    if [ -n "$extra_domains_json" ]; then
+        if ! jq -e --argjson d "$extra_domains_json" --arg out "$selected_out" \
+            '.route.rules[]? |
+             select(.domain_suffix != null and .outbound == $out and (.domain_suffix == $d))' \
+            "$route_file" >/dev/null 2>&1; then
+
+            if ! jq --argjson d "$extra_domains_json" --arg out "$selected_out" \
+                '.route.rules += [{
+                    "domain_suffix": $d,
+                    "action": "route",
+                    "outbound": $out
+                }]' "$route_file" > "${route_file}.tmp"; then
+                red "写入 AI 补充域名规则失败，正在回滚。"
+                cp -f "$route_backup" "$route_file"
+                rm -f "$route_backup" "${route_file}.tmp"
+                sleep 2
+                warp_manage
+                return
+            fi
+            mv "${route_file}.tmp" "$route_file"
+        fi
+    fi
+
+    ensure_sniff_rule
+    normalize_route_rules
+
+    if apply_route_with_rollback "$route_backup"; then
+        rm -f "$route_backup"
+        green "'${rule_tag}' 已分流至出站 '${selected_out}'"
+        green "当前 route.json 使用现代 action=route + outbound 格式。"
+        sleep 2
+        warp_manage
+    else
+        rm -f "$route_backup"
+        sleep 1
+        warp_manage
+    fi
 }
 
 # 设置全局代理出站
@@ -1758,11 +1962,13 @@ restore_direct_outbound() {
       {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
       {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
     ],
-    "rules": [{"rule_set": []}],
+    "rules": [{"action": "sniff"}],
     "final": "direct"
   }
 }
 EOF
+
+    ensure_sniff_rule
 
     # 恢复默认 endpoints.json
     cat > "${conf_dir}/endpoints.json" << EOF
@@ -1810,8 +2016,18 @@ delete_rule_menu() {
     fi
     jq --arg tag "$tag" \
        'del(.route.rules[] | select(.rule_set != null) | .rule_set[] | select(. == $tag)) |
-        .route.rules = [.route.rules[] | select(.rule_set != null and (.rule_set | length) > 0)]' \
+        .route.rules = [.route.rules[] | select(.action == "sniff" or (.rule_set != null and (.rule_set | length) > 0) or .domain_suffix != null or .domain != null or .ip_cidr != null or .ip_is_private != null or .protocol != null or .network != null or .inbound != null)] |
+        if any(.route.rules[]?; .action == "sniff") then . else .route.rules = [{"action":"sniff"}] + .route.rules end' \
        "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+
+    # 同步删除该服务的domain_suffix补充规则(如果有)
+    extra_domains_json=$(extra_ai_domains "$tag")
+    if [ -n "$extra_domains_json" ]; then
+        jq --argjson d "$extra_domains_json" \
+           '.route.rules = [.route.rules[] | select(.domain_suffix == null or (.domain_suffix != $d))]' \
+           "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    fi
+
     restart_singbox
     green "规则集 '${tag}' 已禁用。"
     sleep 1; warp_manage
@@ -1821,43 +2037,213 @@ delete_rule_menu() {
 add_ss_outbound() {
     local proxy_url="$1"
     local after_proto tag_from_url userinfo host_port server port method password
+    local decoded_file raw_key_file raw_userinfo expected_len actual_len normalized_method
+    local backup_outbound backup_route check_output restart_status
 
     after_proto="${proxy_url#ss://}"
 
+    # 处理 URL fragment/tag，并去掉可能存在的插件参数
     if [[ "$after_proto" == *"#"* ]]; then
         tag_from_url="${after_proto##*#}"
         after_proto="${after_proto%%#*}"
     else
         tag_from_url=""
     fi
-
-    # 去掉可能存在的插件参数部分 (?plugin=...)
     after_proto="${after_proto%%\?*}"
 
     if [[ "$after_proto" == *"@"* ]]; then
-        userinfo="${after_proto%%@*}"; host_port="${after_proto##*@}"
+        userinfo="${after_proto%%@*}"
+        host_port="${after_proto##*@}"
     else
-        userinfo=""; host_port="$after_proto"
+        userinfo=""
+        host_port="$after_proto"
     fi
 
+    # 解析服务器地址，兼容 IPv4 / 域名 / [IPv6]:port
     if [[ "$host_port" =~ ^\[([0-9a-fA-F:]+)\]:([0-9]+)$ ]]; then
-        server="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+        server="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
     else
-        server="${host_port%%:*}"; port="${host_port##*:}"
+        server="${host_port%%:*}"
+        port="${host_port##*:}"
     fi
     [ -z "$server" ] || [ -z "$port" ] && { red "格式错误：缺少ip或端口"; sleep 2; return; }
+    [[ "$port" =~ ^[0-9]+$ ]] || { red "格式错误：端口无效"; sleep 2; return; }
 
-    method=""; password=""
+    method=""
+    password=""
+
+    # ============================================================
+    # SS / SS2022 链接解析
+    #
+    # 普通 SS：userinfo 通常是 base64(method:password)
+    # SS2022：userinfo 解码后为：method + ':' + 原始二进制 PSK
+    #
+    # 不能把 SS2022 的二进制 PSK 直接塞进 Bash 变量再交给 jq，
+    # 否则会经过 UTF-8/命令替换破坏二进制数据，导致：
+    #   decode key: illegal base64 data at input byte 0
+    #
+    # sing-box 的 SS2022 password 使用 PSK 的 Base64 表示，因此这里
+    # 始终从临时二进制文件提取 PSK，再重新 Base64 编码。
+    # ============================================================
+    decoded_file="$(mktemp)"
+    raw_key_file="$(mktemp)"
+
     if [[ "$userinfo" == *":"* ]]; then
-        # 部分客户端导出的是明文 method:password，未做base64
-        method="${userinfo%%:*}"; password="${userinfo#*:}"
+        # 明文 method:password 形式，主要兼容部分客户端导出的链接。
+        # 对 SS2022，如果 password 看起来是 Base64，则按 Base64 PSK 尝试；
+        # 如果不是，则按普通字符串处理。
+        method="${userinfo%%:*}"
+        password="${userinfo#*:}"
+
+        if [[ "$method" == 2022-* ]]; then
+            # 明文形式的 SS2022 一般 password 本身就是 Base64 PSK。
+            # 如果无法解码，则拒绝写入，避免产生坏配置。
+            if ! printf '%s' "$password" | base64 -d > "$raw_key_file" 2>/dev/null; then
+                red "SS2022 密钥不是有效的 Base64 格式。"
+                sleep 2
+                rm -f "$decoded_file" "$raw_key_file"
+                return
+            fi
+        fi
     else
-        # SIP002标准格式：base64(method:password)
-        decoded=$(echo "$userinfo" | base64 -d 2>/dev/null)
-        [ -z "$decoded" ] && { red "无法解析ss节点用户信息"; sleep 2; return; }
-        method="${decoded%%:*}"; password="${decoded#*:}"
+        # SIP002：base64(method:password)
+        # 同时兼容 URL-safe Base64 和缺少 '=' padding 的导出格式。
+        raw_userinfo="$userinfo"
+        raw_userinfo="${raw_userinfo//-/+}"
+        raw_userinfo="${raw_userinfo//_/\/}"
+        while (( ${#raw_userinfo} % 4 != 0 )); do
+            raw_userinfo+='='
+        done
+
+        if ! printf '%s' "$raw_userinfo" | base64 -d > "$decoded_file" 2>/dev/null; then
+            red "无法解析 SS 节点用户信息：Base64 格式错误。"
+            sleep 2
+            rm -f "$decoded_file" "$raw_key_file"
+            return
+        fi
+
+        # 二进制安全地提取第一个 ':' 前的 method。
+        # method 只包含 ASCII，因此这里用 awk/sed 不会影响后面的 PSK。
+        method="$(LC_ALL=C awk 'BEGIN{RS=""} {p=index($0,":"); if(p>0) printf "%s", substr($0,1,p-1)}' "$decoded_file")"
+        [ -z "$method" ] && { red "无法解析 SS 节点加密方式。"; sleep 2; return; }
+
+        if [[ "$method" == 2022-* ]]; then
+            # 不通过 Bash 变量保存二进制 PSK。
+            # 直接从 method 后面的原始字节提取密钥。
+            method_len=${#method}
+            # method 为 ASCII，长度可以安全用于字节偏移。
+            dd if="$decoded_file" of="$raw_key_file" bs=1 skip=$((method_len + 1)) status=none 2>/dev/null
+            actual_len=$(wc -c < "$raw_key_file")
+
+            [ "$actual_len" -gt 0 ] || { red "SS2022 节点没有有效的 PSK。"; sleep 2; return; }
+
+            # SS2022 的 PSK 长度决定真正的算法：
+            # AES-128-GCM = 16 bytes
+            # AES-256-GCM = 32 bytes
+            # ChaCha20-Poly1305 = 32 bytes
+            case "$method" in
+                2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm)
+                    if [ "$actual_len" -eq 16 ]; then
+                        normalized_method="2022-blake3-aes-128-gcm"
+                        expected_len=16
+                    elif [ "$actual_len" -eq 32 ]; then
+                        normalized_method="2022-blake3-aes-256-gcm"
+                        expected_len=32
+                    else
+                        red "SS2022 密钥长度错误：${method} 只能使用 16 或 32 字节 PSK，当前为 ${actual_len} 字节。"
+                        red "请检查节点链接或服务端配置。脚本不会写入无效的 sing-box 配置。"
+                        sleep 3
+                        rm -f "$decoded_file" "$raw_key_file"
+                        return
+                    fi
+                    if [ "$normalized_method" != "$method" ]; then
+                        yellow "检测到节点链接中的算法标记与实际 PSK 长度不一致。"
+                        yellow "${method} + ${actual_len} 字节 PSK → 自动修正为 ${normalized_method}。"
+                        method="$normalized_method"
+                    fi
+                    ;;
+                2022-blake3-chacha20-poly1305)
+                    expected_len=32
+                    if [ "$actual_len" -ne "$expected_len" ]; then
+                        red "SS2022 密钥长度错误：${method} 要求 32 字节，当前为 ${actual_len} 字节。"
+                        red "请检查节点链接或服务端配置。脚本不会写入无效的 sing-box 配置。"
+                        sleep 3
+                        rm -f "$decoded_file" "$raw_key_file"
+                        return
+                    fi
+                    ;;
+                *)
+                    # 未知 2022 method 不猜测算法，避免生成不可用配置。
+                    red "不支持的 SS2022 加密方式：${method}"
+                    red "当前支持：2022-blake3-aes-128-gcm、2022-blake3-aes-256-gcm、2022-blake3-chacha20-poly1305"
+                    sleep 3
+                    rm -f "$decoded_file" "$raw_key_file"
+                    return
+                    ;;
+            esac
+
+            # jq 参数必须是 ASCII/Base64 字符串，绝不把原始二进制 PSK
+            # 通过 shell 变量传递。
+            password="$(base64 "$raw_key_file" 2>/dev/null | tr -d '\n')"
+            [ -n "$password" ] || { red "SS2022 PSK Base64 编码失败。"; sleep 2; return; }
+        else
+            # 普通 SS 的 password 是文本，可以安全放入 shell 变量。
+            decoded_text="$(cat "$decoded_file")"
+            [[ "$decoded_text" == *":"* ]] || { red "格式错误：无法解析加密方式或密码。"; sleep 2; return; }
+            method="${decoded_text%%:*}"
+            password="${decoded_text#*:}"
+        fi
     fi
+
     [ -z "$method" ] || [ -z "$password" ] && { red "格式错误：无法解析加密方式或密码"; sleep 2; return; }
+
+    # 对明文 SS2022 形式再次进行长度/算法校正。
+    if [[ "$method" == 2022-* ]]; then
+        if [ ! -s "$raw_key_file" ]; then
+            # 明文形式已经尝试将 password 解码为原始 PSK。
+            printf '%s' "$password" | base64 -d > "$raw_key_file" 2>/dev/null || {
+                red "SS2022 密钥不是有效的 Base64 PSK。"
+                sleep 2
+                rm -f "$decoded_file" "$raw_key_file"
+                return
+            }
+        fi
+        actual_len=$(wc -c < "$raw_key_file")
+        case "$method" in
+            2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm)
+                if [ "$actual_len" -eq 16 ]; then
+                    normalized_method="2022-blake3-aes-128-gcm"
+                elif [ "$actual_len" -eq 32 ]; then
+                    normalized_method="2022-blake3-aes-256-gcm"
+                else
+                    red "SS2022 密钥长度错误：AES-128 要求 16 字节、AES-256 要求 32 字节，当前为 ${actual_len} 字节。"
+                    sleep 3
+                    rm -f "$decoded_file" "$raw_key_file"
+                    return
+                fi
+                if [ "$normalized_method" != "$method" ]; then
+                    yellow "检测到算法标记与实际 PSK 长度不一致：${method} → ${normalized_method}"
+                    method="$normalized_method"
+                fi
+                ;;
+            2022-blake3-chacha20-poly1305)
+                [ "$actual_len" -eq 32 ] || {
+                    red "SS2022 密钥长度错误：${method} 要求 32 字节，当前为 ${actual_len} 字节。"
+                    sleep 3
+                    rm -f "$decoded_file" "$raw_key_file"
+                    return
+                }
+                ;;
+            *)
+                red "不支持的 SS2022 加密方式：${method}"
+                sleep 3
+                rm -f "$decoded_file" "$raw_key_file"
+                return
+                ;;
+        esac
+        password="$(base64 "$raw_key_file" 2>/dev/null | tr -d '\n')"
+    fi
 
     yellow "正在测试 shadowsocks 节点 ${server}:${port} (${method}) 的端口连通性..."
     if timeout 5 bash -c "echo > /dev/tcp/${server}/${port}" 2>/dev/null; then
@@ -1872,22 +2258,98 @@ add_ss_outbound() {
     jq -e --arg tag "$tag" '.outbounds[] | select(.tag == $tag)' "$outbound_file" >/dev/null 2>&1 \
         && { red "出站标签 '${tag}' 已存在"; sleep 2; return; }
 
-    jq --arg tag "$tag" --arg server "$server" --arg port "$port" \
+    # ============================================================
+    # 先备份，写入后立即检查完整配置。
+    # SS2022 配置有问题时绝不直接重启 sing-box，避免所有现有节点一起掉线。
+    # ============================================================
+    backup_outbound="$(mktemp)"
+    backup_route="$(mktemp)"
+    cp -f "$outbound_file" "$backup_outbound" || {
+        red "无法备份 outbounds.json，已取消操作。"
+        rm -f "$backup_outbound" "$backup_route"
+        sleep 2
+        rm -f "$decoded_file" "$raw_key_file"
+        return
+    }
+    cp -f "$route_file" "$backup_route" 2>/dev/null || true
+
+    if ! jq --arg tag "$tag" --arg server "$server" --arg port "$port" \
        --arg method "$method" --arg password "$password" \
        '.outbounds += [{"type":"shadowsocks","tag":$tag,"server":$server,"server_port":($port|tonumber),"method":$method,"password":$password}]' \
-       "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+       "$outbound_file" > "${outbound_file}.tmp"; then
+        red "写入 SS 出站配置失败，未修改现有配置。"
+        rm -f "$backup_outbound" "$backup_route" "${outbound_file}.tmp"
+        sleep 2
+        rm -f "$decoded_file" "$raw_key_file"
+        return
+    fi
+    mv "${outbound_file}.tmp" "$outbound_file"
 
-    if jq -e '.route.rules | length > 0' "$route_file" >/dev/null 2>&1; then
-        jq --arg tag "$tag" '.route.rules[].outbound = $tag' "$route_file" > "${route_file}.tmp" \
-            && mv "${route_file}.tmp" "$route_file"
-        yellow "已将现有分流规则出站切换为 '${tag}'。"
+    # 重要：添加代理出站不自动修改现有分流规则。
+    # 用户应在“设置分流服务”中单独选择哪个 rule_set 使用 relay。
+
+    check_output=$("${work_dir}/${server_name}" check -C "$conf_dir" 2>&1)
+    if [ $? -ne 0 ]; then
+        red "SS2022 已添加，但 sing-box 配置检查失败："
+        echo "$check_output"
+        yellow "正在自动回滚本次修改..."
+        cp -f "$backup_outbound" "$outbound_file"
+        cp -f "$backup_route" "$route_file" 2>/dev/null || true
+        rm -f "$backup_outbound" "$backup_route"
+        red "已回滚，现有节点配置未被破坏。"
+        sleep 3
+        rm -f "$decoded_file" "$raw_key_file"
+        return
     fi
 
+    green "sing-box 配置检查通过。"
     restart_singbox
-    green "\n${tag} (shadowsocks) 代理出站已添加\n"
+    restart_status=$?
+    if [ $restart_status -ne 0 ]; then
+        red "sing-box 重启失败，正在自动回滚本次 SS 出站修改..."
+        cp -f "$backup_outbound" "$outbound_file"
+        cp -f "$backup_route" "$route_file" 2>/dev/null || true
+        rm -f "$backup_outbound" "$backup_route"
+        restart_singbox >/dev/null 2>&1
+        red "已回滚。"
+        sleep 3
+        rm -f "$decoded_file" "$raw_key_file"
+        return
+    fi
+
+    # 再确认一次服务确实处于 active 状态。
+    if command_exists systemctl; then
+        if ! systemctl is-active --quiet sing-box; then
+            red "sing-box 重启后未处于运行状态，正在自动回滚..."
+            cp -f "$backup_outbound" "$outbound_file"
+            cp -f "$backup_route" "$route_file" 2>/dev/null || true
+            rm -f "$backup_outbound" "$backup_route"
+            restart_singbox >/dev/null 2>&1
+            red "已回滚。"
+            sleep 3
+            rm -f "$decoded_file" "$raw_key_file"
+            return
+        fi
+    elif command_exists rc-service; then
+        if ! rc-service sing-box status >/dev/null 2>&1; then
+            red "sing-box 重启后未处于运行状态，正在自动回滚..."
+            cp -f "$backup_outbound" "$outbound_file"
+            cp -f "$backup_route" "$route_file" 2>/dev/null || true
+            rm -f "$backup_outbound" "$backup_route"
+            restart_singbox >/dev/null 2>&1
+            red "已回滚。"
+            sleep 3
+            rm -f "$decoded_file" "$raw_key_file"
+            return
+        fi
+    fi
+
+    rm -f "$backup_outbound" "$backup_route"
+    rm -f "$decoded_file" "$raw_key_file"
+    green "\n${tag} (${method}) shadowsocks 代理出站已添加"
+    green "不会自动修改现有分流规则，请在“设置分流服务”中选择需要走 ${tag} 的规则集。\n"
     sleep 2; warp_manage
 }
-
 add_socks5_proxy() {
     clear
     reading "请输入代理URL (支持socks://,socks5://,http://,ss:// 支持v2rayN导出的节点链接): " proxy_url
@@ -2004,14 +2466,20 @@ add_socks5_proxy() {
            "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
     fi
 
-    if jq -e '.route.rules | length > 0' "$route_file" >/dev/null 2>&1; then
-        jq --arg tag "$tag" '.route.rules[].outbound = $tag' "$route_file" > "${route_file}.tmp" \
-            && mv "${route_file}.tmp" "$route_file"
-        yellow "已将现有分流规则出站切换为 '${tag}'。"
+    # 添加 Socks/HTTP 出站时也不覆盖已有分流规则。
+    # 需要使用它时，请在“设置分流服务”中单独选择对应出站。
+    ensure_sniff_rule
+
+    check_output=$(${work_dir}/${server_name} check -C "$conf_dir" 2>&1)
+    if [ $? -ne 0 ]; then
+        red "代理配置检查失败，已保留原有分流配置。"
+        echo "$check_output"
+        sleep 2
+        return
     fi
 
     restart_singbox
-    green "\n${tag} 代理出站已添加\n"
+    green "\n${tag} 代理出站已添加，不会自动修改现有分流规则。\n"
     sleep 2; warp_manage
 }
 
@@ -2033,7 +2501,12 @@ delete_socks5_proxy() {
     [ "$tag" == "wireguard-out" ] && { red "wireguard-out 为系统内置，不可删除！"; sleep 2; return; }
 
     jq --arg tag "$tag" 'del(.outbounds[] | select(.tag == $tag))' "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
-    jq --arg tag "$tag" '.route.rules = [.route.rules[] | select(.outbound != $tag)]' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    jq --arg tag "$tag" '
+        .route.rules = [.route.rules[]? | select(.outbound != $tag)] |
+        if any(.route.rules[]?; .action == "sniff") then . else .route.rules = [{"action":"sniff"}] + .route.rules end
+    ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    ensure_sniff_rule
+    normalize_route_rules
 
     restart_singbox
     green "${tag} 代理出站已删除。"
