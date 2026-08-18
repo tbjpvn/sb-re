@@ -1881,21 +1881,31 @@ add_ss2022_proxy() {
     }
     mv "${outbound_file}.tmp" "$outbound_file"
 
-    # 先做 sing-box 配置检查，再重启。失败立即恢复，避免所有入站节点一起掉线。
-    local check_ok=0
+    # 先做 sing-box 配置检查，再重启。
+    # 老版本配置可能仍含 legacy domain strategy；服务本身如果已通过
+    # ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true 启动，裸 check 会误判失败。
+    local check_ok=0 check_log="/tmp/sing-box-ss2022-check.$$"
     if [ -x "${work_dir}/${server_name}" ]; then
-        "${work_dir}/${server_name}" check -C "${conf_dir}" >/dev/null 2>&1
+        ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true \
+            "${work_dir}/${server_name}" check -C "${conf_dir}" >"$check_log" 2>&1
         check_ok=$?
     elif command -v sing-box >/dev/null 2>&1; then
-        sing-box check -C "${conf_dir}" >/dev/null 2>&1
+        ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true \
+            sing-box check -C "${conf_dir}" >"$check_log" 2>&1
         check_ok=$?
+    else
+        check_ok=1
+        echo "未找到 sing-box 可执行文件，无法检查配置" >"$check_log"
     fi
     if [ "$check_ok" -ne 0 ]; then
         cp "$outbound_backup" "$outbound_file"
         rm -f "$outbound_backup"
         red "SS2022 节点配置未通过 sing-box 检查，已自动恢复，原有节点未受影响。"
+        [ -s "$check_log" ] && yellow "sing-box 报错：" && sed -n '1,8p' "$check_log"
+        rm -f "$check_log"
         sleep 3; warp_manage; return
     fi
+    rm -f "$check_log"
 
     restart_singbox >/dev/null 2>&1
     sleep 1
