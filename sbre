@@ -524,7 +524,7 @@ EOF
       {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
       {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
     ],
-    "rules": [{"action": "sniff"}],
+    "rules": [{"rule_set": []}],
     "final": "direct"
   }
 }
@@ -1570,36 +1570,8 @@ change_cfip() {
     purple "$new_vmess_url\n"
 }
 
-# 确保路由在所有规则之前执行协议/域名嗅探。
-# 现代 sing-box 推荐使用 route.rules 的 action: sniff，
-# 而不是旧版 inbound.sniff / sniff_override_destination。
-ensure_sniff_rule() {
-    local file="${conf_dir}/route.json"
-    [ -f "$file" ] || return 0
-
-    jq '
-      .route.rules = ([.route.rules[]? | select(
-        (.action? == "sniff") or
-        (.rule_set? != null and (.rule_set | length) > 0) or
-        (.domain_suffix? != null) or
-        (.domain? != null) or
-        (.ip_cidr? != null) or
-        (.ip_is_private? != null) or
-        (.protocol? != null) or
-        (.network? != null) or
-        (.inbound? != null)
-      )]) |
-      if any(.route.rules[]?; .action? == "sniff")
-      then .
-      else .route.rules = [{"action":"sniff"}] + .route.rules
-      end
-    ' "$file" > "${file}.tmp" 2>/dev/null && mv "${file}.tmp" "$file"
-}
-
 # WARP 分流管理
 warp_manage() {
-    ensure_sniff_rule
-
     check_singbox &>/dev/null
     if [ $? -eq 2 ]; then
         yellow "sing-box 尚未安装！"; sleep 1; menu; return
@@ -1709,10 +1681,9 @@ add_rule_menu() {
         yellow "规则集 '${rule_tag}' 已启用。"; sleep 1; warp_manage; return
     fi
 
-    # 确保 sniff 始终位于所有分流规则之前。
-    ensure_sniff_rule
-    # 清理旧版本脚本留下的空 rule_set 占位规则，但保留 sniff 和已有有效规则。
-    jq '.route.rules = [.route.rules[] | select(.action == "sniff" or (.rule_set != null and (.rule_set | length) > 0) or .domain_suffix != null or .domain != null or .ip_cidr != null or .ip_is_private != null or .protocol != null or .network != null or .inbound != null)]' \
+    jq 'if (.route.rules | length) == 1 and (.route.rules[0].rule_set | length) == 0
+        then .route.rules = []
+        else . end' \
         "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
 
     local out_tags=($(jq -r '.outbounds[] | select(.tag != "direct") | .tag' "$outbound_file" 2>/dev/null))
@@ -1826,13 +1797,11 @@ restore_direct_outbound() {
       {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
       {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
     ],
-    "rules": [{"action": "sniff"}],
+    "rules": [{"rule_set": []}],
     "final": "direct"
   }
 }
 EOF
-
-    ensure_sniff_rule
 
     # 恢复默认 endpoints.json
     cat > "${conf_dir}/endpoints.json" << EOF
@@ -1880,8 +1849,7 @@ delete_rule_menu() {
     fi
     jq --arg tag "$tag" \
        'del(.route.rules[] | select(.rule_set != null) | .rule_set[] | select(. == $tag)) |
-        .route.rules = [.route.rules[] | select(.action == "sniff" or (.rule_set != null and (.rule_set | length) > 0) or .domain_suffix != null or .domain != null or .ip_cidr != null or .ip_is_private != null or .protocol != null or .network != null or .inbound != null)] |
-        if any(.route.rules[]?; .action == "sniff") then . else .route.rules = [{"action":"sniff"}] + .route.rules end' \
+        .route.rules = [.route.rules[] | select(.rule_set != null and (.rule_set | length) > 0)]' \
        "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
 
     # 同步删除该服务的domain_suffix补充规则(如果有)
@@ -2330,20 +2298,14 @@ add_socks5_proxy() {
            "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
     fi
 
-    # 添加 Socks/HTTP 出站时也不覆盖已有分流规则。
-    # 需要使用它时，请在“设置分流服务”中单独选择对应出站。
-    ensure_sniff_rule
-
-    check_output=$(${work_dir}/${server_name} check -C "$conf_dir" 2>&1)
-    if [ $? -ne 0 ]; then
-        red "代理配置检查失败，已保留原有分流配置。"
-        echo "$check_output"
-        sleep 2
-        return
+    if jq -e '.route.rules | length > 0' "$route_file" >/dev/null 2>&1; then
+        jq --arg tag "$tag" '.route.rules[].outbound = $tag' "$route_file" > "${route_file}.tmp" \
+            && mv "${route_file}.tmp" "$route_file"
+        yellow "已将现有分流规则出站切换为 '${tag}'。"
     fi
 
     restart_singbox
-    green "\n${tag} 代理出站已添加，不会自动修改现有分流规则。\n"
+    green "\n${tag} 代理出站已添加\n"
     sleep 2; warp_manage
 }
 
