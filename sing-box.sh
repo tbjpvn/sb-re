@@ -1488,84 +1488,53 @@ warp_manage() {
 add_rule_menu() {
     clear
     green "选择要分流的服务:\n"
-    green "1.  OpenAI"
-    green "2.  Claude"
-    green "3.  Gemini"
-    green "4.  Google"
-    green "5.  Tiktok"
-    green "6.  Twitter"
-    green "7.  YouTube"
-    green "8.  Netflix"
-    green "9.  Telegram"
+    green "1.  OpenAI"; green "2.  Claude"; green "3.  Gemini"; green "4.  Google"; green "5.  Tiktok"; green "6.  Twitter"; green "7.  YouTube"; green "8.  Netflix"; green "9.  Telegram"
     skyblue "-----------------------------"
     green "10. 设置全局代理出站 (所有流量走指定代理)"
     green "11. 恢复服务器原IP出站 (所有流量走服务器ip)"
-    skyblue "-----------------------------"
     purple "0.  返回上级菜单"
-    skyblue "-----------------------------"
     reading "请输入选择: " add_choice
     case "$add_choice" in
-        1)  rule_tag="openai"   ;;
-        2)  rule_tag="claude"   ;;
-        3)  rule_tag="gemini"   ;;
-        4)  rule_tag="google"   ;;
-        5)  rule_tag="tiktok"   ;;
-        6)  rule_tag="twitter"  ;;
-        7)  rule_tag="youtube"  ;;
-        8)  rule_tag="netflix"  ;;
-        9)  rule_tag="telegram" ;;
-        10) set_global_outbound; return ;;
-        11) restore_direct_outbound; return ;;
-        0)  warp_manage; return ;;
-        *)  red "无效选项"; sleep 1; add_rule_menu; return ;;
+        1) rule_tag="openai";; 2) rule_tag="claude";; 3) rule_tag="gemini";; 4) rule_tag="google";; 5) rule_tag="tiktok";; 6) rule_tag="twitter";; 7) rule_tag="youtube";; 8) rule_tag="netflix";; 9) rule_tag="telegram";;
+        10) set_global_outbound; return;; 11) restore_direct_outbound; return;; 0) warp_manage; return;; *) red "无效选项"; sleep 1; add_rule_menu; return;;
     esac
-
-    if jq -e --arg tag "$rule_tag" \
-        '.route.rules[] | select(.rule_set != null) | .rule_set[]? | select(. == $tag)' \
-        "$route_file" > /dev/null 2>&1; then
+    if jq -e --arg tag "$rule_tag" '.route.rules[]? | (.rule_set // [])[]? | select(. == $tag)' "$route_file" >/dev/null 2>&1; then
         yellow "规则集 '${rule_tag}' 已启用。"; sleep 1; warp_manage; return
     fi
-
-    jq 'if (.route.rules | length) == 1 and (.route.rules[0].rule_set | length) == 0
-        then .route.rules = []
-        else . end' \
-        "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
-
-    local out_tags=($(jq -r '.outbounds[] | select(.tag != "direct") | .tag' "$outbound_file" 2>/dev/null))
+    ensure_warp_endpoint
+    local out_tags=()
+    while IFS= read -r x; do [ -n "$x" ] && out_tags+=("$x"); done < <(jq -r '.outbounds[]? | select(.tag != "direct") | .tag' "$outbound_file" 2>/dev/null)
+    # 没有普通代理出站时，才默认使用 WARP；有代理时让用户选择。
     if [ ${#out_tags[@]} -eq 0 ]; then
         selected_out="wireguard-out"
-        yellow "未找到其他出站，将自动使用 wireguard-out。"
+        yellow "未找到其他代理出站，将自动使用 wireguard-out。"
     else
-        echo ""
-        green "请选择分流流量要走的出站:"
-        for i in "${!out_tags[@]}"; do
-            echo -e "  ${green}$((i+1)). ${skyblue}${out_tags[$i]}${re}"
-        done
+        echo ""; green "请选择分流流量要走的出站:"
+        for i in "${!out_tags[@]}"; do echo -e "  ${green}$((i+1)). ${skyblue}${out_tags[$i]}${re}"; done
         reading "请输入编号: " out_choice
-        if [[ ! "$out_choice" =~ ^[0-9]+$ ]] || \
-           [ "$out_choice" -lt 1 ] || \
-           [ "$out_choice" -gt "${#out_tags[@]}" ]; then
-            red "无效选择"; sleep 1; warp_manage; return
-        fi
+        if [[ ! "$out_choice" =~ ^[0-9]+$ ]] || [ "$out_choice" -lt 1 ] || [ "$out_choice" -gt "${#out_tags[@]}" ]; then red "无效选择"; sleep 1; warp_manage; return; fi
         selected_out="${out_tags[$((out_choice-1))]}"
     fi
-
     jq --arg tag "$rule_tag" --arg out "$selected_out" '
-        if (.route.rules | length) == 0 then
-            .route.rules = [{"rule_set": [$tag], "outbound": $out}]
-        else
-            (first(.route.rules[] | select(.outbound == $out)) | .rule_set) as $existing
-            | if $existing then
-                .route.rules = [.route.rules[] | select(.outbound == $out).rule_set += [$tag]]
-              else
-                .route.rules += [{"rule_set": [$tag], "outbound": $out}]
-              end
-        end
-    ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
-
+      .route.rules = (.route.rules // []) |
+      if any(.route.rules[]?; .outbound == $out) then
+        .route.rules |= map(if .outbound == $out then .rule_set = ((.rule_set // []) + [$tag] | unique) else . end)
+      else
+        .route.rules += [{"rule_set":[$tag],"outbound":$out}]
+      end
+    ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file" || { red "写入分流规则失败"; return; }
     restart_singbox
     green "'${rule_tag}' 已分流至出站 '${selected_out}'"
     sleep 1; warp_manage
+}
+
+# 确保 WARP endpoint 存在；只补 endpoints.json，绝不重写 outbounds.json 或 route.json。
+ensure_warp_endpoint() {
+    local ep="${conf_dir}/endpoints.json"
+    [ -f "$ep" ] && jq -e '.endpoints[]? | select(.tag == "wireguard-out")' "$ep" >/dev/null 2>&1 && return 0
+    cat > "$ep" <<'EOF'
+{"endpoints":[{"type":"wireguard","tag":"wireguard-out","mtu":1280,"address":["172.16.0.2/32","2606:4700:110:8dfe:d141:69bb:6b80:925/128"],"private_key":"YFYOAdbw1bKTHlNNi+aEjBM3BO7unuFC5rOkMRAz9XY=","peers":[{"address":"engage.cloudflareclient.com","port":2408,"public_key":"bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=","allowed_ips":["0.0.0.0/0","::/0"],"reserved":[78,135,76]}]}]}
+EOF
 }
 
 # 设置全局代理出站
@@ -1598,7 +1567,8 @@ set_global_outbound() {
     # 从 outbounds.json 中删除 direct 出站，防止流量绕过代理
     jq 'del(.outbounds[] | select(.tag == "direct"))' \
         "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
-    rm -rf ${route_file} ${conf_dir}/endpoints.json
+    # 不删除 route/endpoints，避免切换模式时误删已有 SS2022/SOCKS/HTTP 出站和规则。
+    jq --arg out "$selected_out" ' .route.rules = [] | .route.final = $out ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
     restart_singbox
     green "\n已设置全局代理出站：${purple}${selected_out}${re}"
     yellow "所有流量将通过 ${selected_out} 转发，如需恢复请选择「恢复服务器原IP出站」\n"
@@ -1636,32 +1606,7 @@ restore_direct_outbound() {
 }
 EOF
 
-    # 恢复默认 endpoints.json
-    cat > "${conf_dir}/endpoints.json" << EOF
-{
-  "endpoints": [
-    {
-      "type": "wireguard",
-      "tag": "wireguard-out",
-      "mtu": 1280,
-      "address": [
-        "172.16.0.2/32",
-        "2606:4700:110:8dfe:d141:69bb:6b80:925/128"
-      ],
-      "private_key": "YFYOAdbw1bKTHlNNi+aEjBM3BO7unuFC5rOkMRAz9XY=",
-      "peers": [
-        {
-          "address": "engage.cloudflareclient.com",
-          "port": 2408,
-          "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-          "allowed_ips": ["0.0.0.0/0", "::/0"],
-          "reserved": [78, 135, 76]
-        }
-      ]
-    }
-  ]
-}
-EOF
+    # WARP endpoint 已由 ensure_warp_endpoint 保证存在。
     restart_singbox
     green "\n已恢复服务器原IP出站，所有流量走 direct。\n"
     sleep 2; warp_manage
@@ -1755,6 +1700,7 @@ add_ss2022_outbound() {
         decoded=$(printf '%s' "$userinfo" | base64 -d 2>/dev/null)
         [[ "$decoded" == *":"* ]] || decoded="$userinfo"
         method="${decoded%%:*}"; password="${decoded#*:}"
+        tag="${tag//%20/ }"
         if [[ "$hostport" =~ ^\[(.*)\]:([0-9]+)$ ]]; then server="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"; else server="${hostport%:*}"; port="${hostport##*:}"; fi
     else
         echo ""
@@ -1770,6 +1716,12 @@ add_ss2022_outbound() {
     fi
     [[ "$method" =~ ^2022-blake3-(aes-128-gcm|aes-256-gcm|chacha20-poly1305)$ ]] || { red "不是支持的 SS2022 加密方式"; sleep 2; return; }
     [[ -n "$server" && "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 && -n "$password" ]] || { red "服务器、端口或密钥无效"; sleep 2; return; }
+    # SS2022 password 必须是对应长度的 base64 密钥，否则 sing-box 会直接启动失败。
+    key_bytes=$(printf '%s' "$password" | base64 -d 2>/dev/null | wc -c)
+    case "$method" in
+      2022-blake3-aes-128-gcm) [ "$key_bytes" -eq 16 ] || { red "SS2022 密钥长度错误：aes-128-gcm 需要解码后 16 字节"; return; };;
+      *) [ "$key_bytes" -eq 32 ] || { red "SS2022 密钥长度错误：该算法需要解码后 32 字节"; return; };;
+    esac
     [ -n "$tag" ] || tag="ss2022-${server}-${port}"
     jq -e --arg tag "$tag" '.outbounds[] | select(.tag == $tag)' "$outbound_file" >/dev/null 2>&1 && { red "出站标签 '${tag}' 已存在"; sleep 2; return; }
     jq --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg method "$method" --arg password "$password" '.outbounds += [{"type":"shadowsocks","tag":$tag,"server":$server,"server_port":$port,"method":$method,"password":$password}]' "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
