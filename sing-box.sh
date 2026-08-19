@@ -1515,15 +1515,16 @@ add_rule_menu() {
         if [[ ! "$out_choice" =~ ^[0-9]+$ ]] || [ "$out_choice" -lt 1 ] || [ "$out_choice" -gt "${#out_tags[@]}" ]; then red "无效选择"; sleep 1; warp_manage; return; fi
         selected_out="${out_tags[$((out_choice-1))]}"
     fi
+    cp "$route_file" "${route_file}.bak"
     jq --arg tag "$rule_tag" --arg out "$selected_out" '
       .route.rules = (.route.rules // []) |
       if any(.route.rules[]?; .outbound == $out) then
         .route.rules |= map(if .outbound == $out then .rule_set = ((.rule_set // []) + [$tag] | unique) else . end)
-      else
-        .route.rules += [{"rule_set":[$tag],"outbound":$out}]
-      end
+      else .route.rules += [{"rule_set":[$tag],"outbound":$out}] end
     ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file" || { red "写入分流规则失败"; return; }
     restart_singbox
+    if [ "$(check_singbox 2>/dev/null)" != "running" ]; then mv "${route_file}.bak" "$route_file"; restart_singbox; red "分流配置导致服务异常，已自动回滚。"; return; fi
+    rm -f "${route_file}.bak"
     green "'${rule_tag}' 已分流至出站 '${selected_out}'"
     sleep 1; warp_manage
 }
@@ -1615,25 +1616,35 @@ EOF
 delete_rule_menu() {
     clear
     green "当前已启用的分流规则集:"
-    jq -r '.route.rules[] | select(.rule_set != null) | .rule_set[]?' "$route_file" | nl -w2 -s'. '
+    local tags=()
+    while IFS= read -r x; do [ -n "$x" ] && tags+=("$x"); done < <(jq -r '.route.rules[]? | (.rule_set // [])[]?' "$route_file")
+    if [ ${#tags[@]} -eq 0 ]; then yellow "当前没有已启用的分流规则。"; sleep 1; warp_manage; return; fi
+    for i in "${!tags[@]}"; do echo "$((i+1)). ${tags[$i]}"; done
     reading "\n输入要删除的规则名称或序号: " del_input
     if [[ "$del_input" =~ ^[0-9]+$ ]]; then
-        tag=$(jq -r --arg idx "$del_input" '[.route.rules[] | select(.rule_set != null) | .rule_set[]] | .[(($idx | tonumber) - 1)]' "$route_file")
+        tag="${tags[$((del_input-1))]}"
     else
         tag="$del_input"
     fi
-    if [ -z "$tag" ] || [ "$tag" == "null" ]; then
-        red "无效的选择"; sleep 1; warp_manage; return
-    fi
-    jq --arg tag "$tag" \
-       'del(.route.rules[] | select(.rule_set != null) | .rule_set[] | select(. == $tag)) |
-        .route.rules = [.route.rules[] | select(.rule_set != null and (.rule_set | length) > 0)]' \
-       "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    [ -n "$tag" ] || { red "无效的选择"; sleep 1; warp_manage; return; }
+    # 只修改 route.json：从 rule_set 数组移除指定 tag；绝不接触 outbounds.json。
+    cp "$route_file" "${route_file}.bak"
+    jq --arg tag "$tag" '
+      .route.rules = [
+        .route.rules[]?
+        | if has("rule_set") then .rule_set = [(.rule_set // [])[] | select(. != $tag)] else . end
+        | select((.rule_set? // ["__keep__"]) | length > 0)
+      ]
+    ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file" || { mv "${route_file}.bak" "$route_file"; red "删除规则失败"; return; }
     restart_singbox
-    green "规则集 '${tag}' 已禁用。"
+    if [ "$(check_singbox 2>/dev/null)" != "running" ]; then
+        mv "${route_file}.bak" "$route_file"; restart_singbox
+        red "新路由导致启动失败，已自动回滚。"; return
+    fi
+    rm -f "${route_file}.bak"
+    green "规则集 '${tag}' 已禁用；SS2022/SOCKS/HTTP 出站未做任何修改。"
     sleep 1; warp_manage
 }
-
 add_proxy_outbound() {
     clear
     echo ""
@@ -1692,21 +1703,20 @@ add_ss2022_outbound() {
     reading "请输入 SS2022 链接（ss://...），或直接回车手动填写: " ss_url
     method=""; password=""; server=""; port=""; tag=""
     if [ -n "$ss_url" ]; then
-        payload="${ss_url#ss://}"
+        payload="${ss_url#ss://}"; payload="${payload%%\?*}"
         if [[ "$payload" == *"#"* ]]; then tag="${payload##*#}"; payload="${payload%%#*}"; fi
-        # 支持 ss://BASE64(method:password)@host:port 以及明文 method:password@host:port
         [[ "$payload" == *"@"* ]] || { red "SS 链接格式错误"; sleep 2; return; }
         userinfo="${payload%%@*}"; hostport="${payload#*@}"
-        decoded=$(printf '%s' "$userinfo" | base64 -d 2>/dev/null)
+        # URL-safe base64 和普通 base64 都兼容；失败才按明文 method:password 处理。
+        b64="${userinfo//-/+}"; b64="${b64//_/\/}"; while [ $(( ${#b64} % 4 )) -ne 0 ]; do b64+="="; done
+        decoded=$(printf '%s' "$b64" | base64 -d 2>/dev/null)
         [[ "$decoded" == *":"* ]] || decoded="$userinfo"
         method="${decoded%%:*}"; password="${decoded#*:}"
-        tag="${tag//%20/ }"
+        tag=$(printf '%s' "$tag" | sed 's/%20/ /g')
         if [[ "$hostport" =~ ^\[(.*)\]:([0-9]+)$ ]]; then server="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"; else server="${hostport%:*}"; port="${hostport##*:}"; fi
     else
         echo ""
-        green "1. 2022-blake3-aes-128-gcm"
-        green "2. 2022-blake3-aes-256-gcm"
-        green "3. 2022-blake3-chacha20-poly1305"
+        green "1. 2022-blake3-aes-128-gcm"; green "2. 2022-blake3-aes-256-gcm"; green "3. 2022-blake3-chacha20-poly1305"
         reading "请选择加密方式 (默认1): " mchoice
         case "$mchoice" in 2) method="2022-blake3-aes-256-gcm";; 3) method="2022-blake3-chacha20-poly1305";; *) method="2022-blake3-aes-128-gcm";; esac
         reading "服务器地址/IP（IPv6无需[]）: " server
@@ -1714,22 +1724,28 @@ add_ss2022_outbound() {
         reading "SS2022 密钥（base64）: " password
         reading "出站标签（回车自动生成）: " tag
     fi
+    password=$(printf '%s' "$password" | tr -d '\r\n ')
     [[ "$method" =~ ^2022-blake3-(aes-128-gcm|aes-256-gcm|chacha20-poly1305)$ ]] || { red "不是支持的 SS2022 加密方式"; sleep 2; return; }
     [[ -n "$server" && "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 && -n "$password" ]] || { red "服务器、端口或密钥无效"; sleep 2; return; }
-    # SS2022 password 必须是对应长度的 base64 密钥，否则 sing-box 会直接启动失败。
-    key_bytes=$(printf '%s' "$password" | base64 -d 2>/dev/null | wc -c)
+    keycheck="${password//-/+}"; keycheck="${keycheck//_/\/}"; while [ $(( ${#keycheck} % 4 )) -ne 0 ]; do keycheck+="="; done
+    key_bytes=$(printf '%s' "$keycheck" | base64 -d 2>/dev/null | wc -c)
     case "$method" in
-      2022-blake3-aes-128-gcm) [ "$key_bytes" -eq 16 ] || { red "SS2022 密钥长度错误：aes-128-gcm 需要解码后 16 字节"; return; };;
-      *) [ "$key_bytes" -eq 32 ] || { red "SS2022 密钥长度错误：该算法需要解码后 32 字节"; return; };;
+      2022-blake3-aes-128-gcm) [ "$key_bytes" -eq 16 ] || { red "SS2022 密钥长度错误：aes-128-gcm 需要解码后16字节"; return; };;
+      *) [ "$key_bytes" -eq 32 ] || { red "SS2022 密钥长度错误：该算法需要解码后32字节"; return; };;
     esac
     [ -n "$tag" ] || tag="ss2022-${server}-${port}"
-    jq -e --arg tag "$tag" '.outbounds[] | select(.tag == $tag)' "$outbound_file" >/dev/null 2>&1 && { red "出站标签 '${tag}' 已存在"; sleep 2; return; }
-    jq --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg method "$method" --arg password "$password" '.outbounds += [{"type":"shadowsocks","tag":$tag,"server":$server,"server_port":$port,"method":$method,"password":$password}]' "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+    jq -e --arg tag "$tag" '.outbounds[]? | select(.tag == $tag)' "$outbound_file" >/dev/null 2>&1 && { red "出站标签 '${tag}' 已存在"; sleep 2; return; }
+    cp "$outbound_file" "${outbound_file}.bak"
+    jq --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg method "$method" --arg password "$password" '.outbounds += [{"type":"shadowsocks","tag":$tag,"server":$server,"server_port":$port,"method":$method,"password":$password}]' "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file" || { red "写入 SS2022 出站失败"; return; }
     restart_singbox
+    if [ "$(check_singbox 2>/dev/null)" != "running" ]; then
+        mv "${outbound_file}.bak" "$outbound_file"; restart_singbox
+        red "SS2022 配置导致启动失败，已自动回滚。"; return
+    fi
+    rm -f "${outbound_file}.bak"
     green "\nSS2022 分流出站 '${tag}' 已添加\n"
     sleep 1; warp_manage
 }
-
 delete_socks5_proxy() {
     clear
     green "当前可用出站列表:"
