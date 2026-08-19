@@ -4,9 +4,6 @@
 # 老王sing-box四合一安装脚本
 # vless-version-reality|vmess-ws-tls(tunnel)|hysteria2|tuic5|[可额外添加Anytls，socks5，ss2022等协议] 
 # 最后更新时间: 2026.6.7[添加hy2证书, 添加ipv4和ipv6切换]
-# 个人修改: 支持DOMAIN变量，用acme.sh申请Let's Encrypt真实域名证书替代自签证书(hy2/tuic)
-# SS2022分流修复版：支持v2rayN导出的SS2022 URI；按实际PSK长度自动校正AES-128/AES-256；
-# 添加SS2022出站时不覆盖现有分流规则，并在写入后执行sing-box配置检查，失败自动回滚。
 # =========================
 
 export LANG=en_US.UTF-8
@@ -33,9 +30,6 @@ export vless_port=${PORT:-$(shuf -i 1000-65000 -n 1)}
 export CFIP=${CFIP:-'cdns.doon.eu.org'} 
 export ARGO_PORT=${ARGO_PORT:-'8001'} 
 export CFPORT=${CFPORT:-'443'} 
-export DOMAIN=${DOMAIN:-''}
-# 已安装过的机器，若本次运行未显式传DOMAIN，则读取上次安装记录的域名
-[ -z "$DOMAIN" ] && [ -f "${work_dir}/domain.txt" ] && DOMAIN=$(cat "${work_dir}/domain.txt")
 
 # 检查是否为root下运行
 [[ $EUID -ne 0 ]] && red "请在root用户下运行脚本，可输入 sudo -i 回车切换到root用户" && exit 1
@@ -221,92 +215,6 @@ allow_port() {
     fi
 }
 
-# 申请/切换域名证书，可传入域名字符串；传空则恢复自签证书
-# 成功后：写入 ${work_dir}/domain.txt，并设置全局变量 fingerprint(自签时用)
-issue_domain_cert() {
-    local domain="$1"
-
-    if [ -z "$domain" ]; then
-        openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
-        openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
-        fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
-        rm -f "${work_dir}/domain.txt"
-        DOMAIN=""
-        return 0
-    fi
-
-    yellow "\n检测到自定义域名 ${domain}，正在申请Let's Encrypt证书...\n"
-    manage_packages install socat curl
-
-    curl https://get.acme.sh | sh -s email=admin@${domain} > /dev/null 2>&1
-    export PATH="$HOME/.acme.sh:$PATH"
-
-    # 临时释放80端口：先尝试优雅停止常见的web服务，申请完证书后再恢复
-    local stopped_services=()
-    for svc in nginx apache2 httpd caddy lighttpd; do
-        if command_exists systemctl && systemctl is-active "$svc" &>/dev/null; then
-            yellow "检测到 ${svc} 占用80端口，临时停止..."
-            systemctl stop "$svc" > /dev/null 2>&1
-            stopped_services+=("$svc")
-        elif command_exists rc-service && rc-service "$svc" status 2>/dev/null | grep -q started; then
-            yellow "检测到 ${svc} 占用80端口，临时停止..."
-            rc-service "$svc" stop > /dev/null 2>&1
-            stopped_services+=("$svc")
-        fi
-    done
-
-    # 如果还有未知进程占用80端口，强制临时结束（不在已知服务列表里，无法自动恢复，需自行手动重启）
-    if lsof -i:80 -sTCP:LISTEN -t > /dev/null 2>&1; then
-        yellow "仍检测到有进程占用80端口，尝试临时终止..."
-        for pid in $(lsof -i:80 -sTCP:LISTEN -t 2>/dev/null); do
-            kill -9 "$pid" > /dev/null 2>&1
-        done
-        sleep 1
-    fi
-
-    if lsof -i:80 -sTCP:LISTEN -t > /dev/null 2>&1; then
-        red "80端口仍被占用，无法申请证书，将退回自签证书\n"
-        openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
-        openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
-        fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
-        DOMAIN=""
-        return 1
-    fi
-
-    ~/.acme.sh/acme.sh --issue -d "$domain" --standalone -k ec-256 --server letsencrypt
-
-    # 无论--issue命令的返回码是什么(已签发过会跳过续期并返回非0，但本地证书其实是有效的)，
-    # 都统一尝试安装证书，最后用生成的证书文件本身判断成功与否，而不是看issue的退出码
-    ~/.acme.sh/acme.sh --install-cert -d "$domain" --ecc \
-        --key-file "${work_dir}/private.key" \
-        --fullchain-file "${work_dir}/cert.pem" \
-        --reloadcmd "systemctl restart sing-box > /dev/null 2>&1 || rc-service sing-box restart > /dev/null 2>&1" \
-        > /dev/null 2>&1
-
-    # 恢复刚才临时停掉的服务
-    for svc in "${stopped_services[@]}"; do
-        yellow "正在恢复 ${svc} 服务..."
-        if command_exists systemctl; then systemctl start "$svc" > /dev/null 2>&1
-        elif command_exists rc-service; then rc-service "$svc" start > /dev/null 2>&1; fi
-    done
-
-    if [ -s "${work_dir}/cert.pem" ] && [ -s "${work_dir}/private.key" ] && \
-       openssl x509 -checkend 0 -noout -in "${work_dir}/cert.pem" > /dev/null 2>&1; then
-        fingerprint=""
-        echo "$domain" > "${work_dir}/domain.txt"
-        DOMAIN="$domain"
-        green "证书申请成功: ${work_dir}/cert.pem\n"
-        return 0
-    else
-        red "证书申请失败，请检查域名解析是否正确指向本机IP，将退回自签证书\n"
-        openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
-        openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
-        fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
-        DOMAIN=""
-        return 1
-    fi
-}
-
 # 下载并安装 sing-box,cloudflared
 install_singbox() {
     clear
@@ -333,9 +241,9 @@ install_singbox() {
     # rm -rf "${work_dir}/${server_name}.tar.gz" "${work_dir}/sing-box-${latest_version}-linux-${ARCH}"
     chown root:root ${work_dir} && chmod +x ${work_dir}/${server_name} ${work_dir}/argo ${work_dir}/qrencode
 
-    nginx_port=${NGINX_PORT:-$(($vless_port + 1))}
-    tuic_port=${TUIC_PORT:-$(($vless_port + 2))}
-    hy2_port=${HY2_PORT:-$(($vless_port + 3))}
+    nginx_port=$(($vless_port + 1))
+    tuic_port=$(($vless_port + 2))
+    hy2_port=$(($vless_port + 3))
     uuid=$(cat /proc/sys/kernel/random/uuid)
     password=$(< /dev/urandom tr -dc 'A-Za-z0-9' | head -c 24)
     output=$(/etc/sing-box/sing-box generate reality-keypair)
@@ -344,7 +252,10 @@ install_singbox() {
 
     allow_port $vless_port/tcp $nginx_port/tcp $tuic_port/udp $hy2_port/udp > /dev/null 2>&1
 
-    issue_domain_cert "$DOMAIN"
+    openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
+    openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
+    
+    fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
     
     dns_strategy=$(ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1 && echo "prefer_ipv4" || \
         (ping -c 1 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && echo "prefer_ipv6" || echo "prefer_ipv4"))
@@ -391,6 +302,7 @@ EOF
     {
       "type": "vless",
       "tag": "vless-reality",
+      "sniff": true,
       "listen": "::",
       "listen_port": $vless_port,
       "users": [
@@ -416,6 +328,7 @@ EOF
     {
       "type": "vmess",
       "tag": "vmess-ws",
+      "sniff": true,
       "listen": "::",
       "listen_port": ${ARGO_PORT},
       "users": [
@@ -432,6 +345,7 @@ EOF
     {
       "type": "hysteria2",
       "tag": "hysteria2",
+      "sniff": true,
       "listen": "::",
       "listen_port": $hy2_port,
       "users": [
@@ -440,7 +354,7 @@ EOF
         }
       ],
       "ignore_client_bandwidth": false,
-      "masquerade": "https://${DOMAIN:-bing.com}",
+      "masquerade": "https://bing.com",
       "tls": {
         "enabled": true,
         "alpn": ["h3"],
@@ -453,6 +367,7 @@ EOF
     {
       "type": "tuic",
       "tag": "tuic",
+      "sniff": true,
       "listen": "::",
       "listen_port": $tuic_port,
       "users": [
@@ -645,24 +560,14 @@ get_info() {
         extra_lines=$(grep -vE '^(vless://|vmess://|hysteria2://|tuic://)' "${client_dir}" || true)
     fi
 
-    if [ -n "$DOMAIN" ]; then
-        tls_sni="$DOMAIN"
-        tls_insecure="0"
-        hy2_pin=""
-    else
-        tls_sni="www.bing.com"
-        tls_insecure="1"
-        hy2_pin="&pinSHA256=${fingerprint}"
-    fi
-
     cat > ${work_dir}/url.txt << EOF
 vless://${uuid}@${server_ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk=${public_key}&type=tcp&headerType=none#${isp}
 
 vmess://$(echo "$VMESS" | base64 -w0)
 
-hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=${tls_sni}&insecure=${tls_insecure}${hy2_pin}&alpn=h3&obfs=none#${isp}
+hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none#${isp}
 
-tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=${tls_sni}&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=${tls_insecure}#${isp}
+tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${isp}
 EOF
 
     if [ -n "$extra_lines" ]; then
@@ -826,7 +731,14 @@ manage_service() {
 
 start_singbox()  { manage_service "sing-box" "start"; }
 stop_singbox()   { manage_service "sing-box" "stop"; }
-restart_singbox(){ manage_service "sing-box" "restart"; }
+restart_singbox(){
+    # 统一确保所有代理入站启用域名嗅探，供 Gemini/Claude/OpenAI 等 rule_set 使用
+    local _ib="${conf_dir}/inbounds.json"
+    if [ -f "$_ib" ]; then
+        jq '(.inbounds[] | select(.type == "vless" or .type == "vmess" or .type == "hysteria2" or .type == "tuic" or .type == "socks" or .type == "anytls" or .type == "shadowsocks")) |= (. + {"sniff": true})' "$_ib" > "${_ib}.tmp" && mv "${_ib}.tmp" "$_ib"
+    fi
+    manage_service "sing-box" "restart"
+}
 start_argo()     { manage_service "argo" "start"; }
 stop_argo()      { manage_service "argo" "stop"; }
 restart_argo()   { manage_service "argo" "restart"; }
@@ -867,7 +779,7 @@ uninstall_singbox() {
 create_shortcut() {
     cat > "$work_dir/sb.sh" << 'EOF'
 #!/usr/bin/env bash
-bash <(curl -Ls https://raw.githubusercontent.com/tbjpvn/sb-re/main/sbre) $1
+bash <(curl -Ls https://raw.githubusercontent.com/eooce/sing-box/main/sing-box.sh) $1
 EOF
     chmod +x "$work_dir/sb.sh"
     ln -sf "$work_dir/sb.sh" /usr/bin/sb
@@ -909,25 +821,6 @@ auto_install() {
     get_info
     add_nginx_conf
     create_shortcut
-
-    # 端口监听自检：确认sing-box真的绑定成功了这几个端口，NAT机常见的"随机端口顺延到未转发端口"问题能第一时间发现
-    yellow "\n正在检测端口监听状态...\n"
-    port_check_failed=0
-    if ! ss -lnt 2>/dev/null | grep -qE ":${vless_port}([[:space:]]|$)"; then
-        red "警告: vless 端口 ${vless_port}/tcp 未检测到监听\n"; port_check_failed=1
-    fi
-    if ! ss -lnu 2>/dev/null | grep -qE ":${hy2_port}([[:space:]]|$)"; then
-        red "警告: hysteria2 端口 ${hy2_port}/udp 未检测到监听\n"; port_check_failed=1
-    fi
-    if ! ss -lnu 2>/dev/null | grep -qE ":${tuic_port}([[:space:]]|$)"; then
-        red "警告: tuic 端口 ${tuic_port}/udp 未检测到监听\n"; port_check_failed=1
-    fi
-    if [ "$port_check_failed" -eq 1 ]; then
-        red "以上端口本机未监听，服务可能没启动成功，请用 'journalctl -u sing-box -n 50' 或 'sing-box run -C /etc/sing-box/conf' 查看具体报错\n"
-    else
-        green "本机端口均监听正常。如果外部仍连不上，请检查该端口是否在你VPS服务商(尤其是NAT机)后台被正确转发/放行\n"
-    fi
-
     green "\nsing-box 安装完成\n"
 }
 
@@ -1125,7 +1018,6 @@ change_config() {
             ;;
         4)
             purple "端口跳跃需确保跳跃区间的端口没有被占用\n"
-            purple "如果是云服务器(阿里云/腾讯云/AWS/搬瓦工等)，还需去控制台的安全组/防火墙里额外放行这段UDP端口区间，否则本机防火墙放行了也连不通\n"
             reading "请输入跳跃起始端口 (回车跳过将使用随机端口): " min_port
             [ -z "$min_port" ] && min_port=$(shuf -i 50000-65000 -n 1)
             yellow "你的起始端口为：$min_port"
@@ -1133,23 +1025,6 @@ change_config() {
             [ -z "$max_port" ] && max_port=$(($min_port + 100))
             yellow "你的结束端口为：$max_port\n"
             listen_port=$(jq -r '.inbounds[] | select(.type == "hysteria2").listen_port' "${conf_dir}/inbounds.json")
-
-            # 先清空之前残留的端口跳跃DNAT规则(每次"添加"都是新增规则、从不清理旧的，
-            # 反复设置几次或hy2端口变过之后会堆积多条失效规则，导致部分跳跃端口连不通)
-            iptables -t nat -F PREROUTING > /dev/null 2>&1
-            command -v ip6tables &> /dev/null && ip6tables -t nat -F PREROUTING > /dev/null 2>&1
-
-            # 显式放行跳跃端口区间（原脚本只加了iptables的DNAT转发规则，
-            # 若系统启用了ufw或firewalld，它们各自维护独立的入站过滤规则，
-            # 不显式放行这个区间的话，多端口跳跃流量会被挡在ufw/firewalld这一层）
-            if command_exists ufw; then
-                ufw allow in ${min_port}:${max_port}/udp > /dev/null 2>&1
-            fi
-            if command_exists firewall-cmd && systemctl is-active firewalld > /dev/null 2>&1; then
-                firewall-cmd --permanent --add-port=${min_port}-${max_port}/udp > /dev/null 2>&1
-                firewall-cmd --reload > /dev/null 2>&1
-            fi
-
             iptables -t nat -A PREROUTING -p udp --dport $min_port:$max_port -j DNAT --to-destination :$listen_port > /dev/null
             command -v ip6tables &> /dev/null && ip6tables -t nat -A PREROUTING -p udp --dport $min_port:$max_port -j DNAT --to-destination :$listen_port > /dev/null
             if command_exists rc-service 2>/dev/null; then
@@ -1175,18 +1050,13 @@ IEOF
             fi
             restart_singbox
             ip=$(get_realip)
+            fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
             uuid=$(sed -n 's/.*hysteria2:\/\/\([^@]*\)@.*/\1/p' $client_dir)
             line_number=$(grep -n 'hysteria2://' $client_dir | cut -d':' -f1)
             isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | \
                 awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | sed 's/ /_/g' || echo "$hostname")
-            if [ -n "$DOMAIN" ]; then
-                hop_sni="$DOMAIN"; hop_insecure="0"; hop_pin=""
-            else
-                fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
-                hop_sni="www.bing.com"; hop_insecure="1"; hop_pin="&pinSHA256=${fingerprint}"
-            fi
             sed -i.bak "/hysteria2:/d" $client_dir
-            sed -i "${line_number}i hysteria2://$uuid@$ip:$listen_port?peer=${hop_sni}&insecure=${hop_insecure}${hop_pin}&alpn=h3&obfs=none&mport=$listen_port,$min_port-$max_port#$isp" $client_dir
+            sed -i "${line_number}i hysteria2://$uuid@$ip:$listen_port?peer=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none&mport=$listen_port,$min_port-$max_port#$isp" $client_dir
             base64 -w0 $client_dir > /etc/sing-box/sub.txt
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
             green "\nhysteria2端口跳跃已开启：${purple}$min_port-$max_port${re}\n"
@@ -1585,24 +1455,19 @@ warp_manage() {
     green "=== WARP 分流管理 ===\n"
     green "当前已启用的分流规则集:"
     jq -r '.route.rules[] | select(.rule_set != null) | .rule_set[]?' "$route_file" 2>/dev/null | sort -u | while read tag; do
-        extra=$(extra_ai_domains "$tag")
-        if [ -n "$extra" ]; then
-            echo -e " - ${skyblue}$tag${re} ${yellow}(已叠加API域名补充规则)${re}"
-        else
-            echo -e " - ${skyblue}$tag${re}"
-        fi
+        echo -e " - ${skyblue}$tag${re}"
     done || echo "  无"
-    green "\n已添加的代理出站(socks/http/ss):"
+    green "\n已添加的socks/http代理出站:"
     jq -r '.outbounds[] | select(.tag != "direct") | " - \(.tag) [\(.type)]"' "$outbound_file" 2>/dev/null || echo "  无"
 
     echo ""
-    green "1. 设置分流服务 (未添加代理出站直接设置则使用WARP)"
+    green "1. 设置分流服务 (未添加代理出站则使用WARP)"
     skyblue "----------------------"
     red "2. 删除分流服务"
     skyblue "--------------"
-    green "3. 添加代理出站 (支持 socks5/http/ss2022)"
+    green "3. 添加 SOCKS5/HTTP/SS2022 出站"
     skyblue "----------------------"
-    red "4. 删除代理出站"
+    red "4. 删除 SOCKS5/HTTP/SS2022 出站"
     skyblue "----------------------"
     purple "0. 返回主菜单"
     skyblue "------------"
@@ -1612,31 +1477,11 @@ warp_manage() {
     case "${choice}" in
         1)  add_rule_menu ;;
         2)  delete_rule_menu ;;
-        3)  add_socks5_proxy ;;
+        3)  add_proxy_outbound ;;
         4)  delete_socks5_proxy ;;
         0)  menu ;;
         00) exit 0 ;;
         *)  red "无效选项"; sleep 1; warp_manage ;;
-    esac
-}
-
-# AI服务的补充域名(API端点)，跟rule_set规则集配合使用而非替代它
-# 原因：公共geosite规则集(包括gemini.srs等)大多只收录消费级网站域名(如gemini.google.com)，
-# 不包含程序化访问用的API端点(如generativelanguage.googleapis.com)，导致API调用无法被正确分流
-extra_ai_domains() {
-    case "$1" in
-        gemini)
-            echo '["gemini.google.com","generativelanguage.googleapis.com","proactivebackend-pa.googleapis.com","alkalimakersuite-pa.clients6.google.com","aistudio.google.com","makersuite.google.com","aitestkitchen.withgoogle.com"]'
-            ;;
-        openai)
-            echo '["openai.com","chatgpt.com","chat.openai.com","oaistatic.com","oaiusercontent.com","ai.com"]'
-            ;;
-        claude)
-            echo '["claude.ai","anthropic.com","claude.com"]'
-            ;;
-        *)
-            echo ''
-            ;;
     esac
 }
 
@@ -1718,18 +1563,6 @@ add_rule_menu() {
         end
     ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
 
-    # AI服务额外叠加domain_suffix补充规则(见 extra_ai_domains 说明)，跟rule_set是两条独立规则、互不影响
-    extra_domains_json=$(extra_ai_domains "$rule_tag")
-    if [ -n "$extra_domains_json" ]; then
-        if ! jq -e --argjson d "$extra_domains_json" --arg out "$selected_out" \
-            '.route.rules[] | select(.domain_suffix != null and .outbound == $out and (.domain_suffix == $d))' \
-            "$route_file" > /dev/null 2>&1; then
-            jq --argjson d "$extra_domains_json" --arg out "$selected_out" \
-                '.route.rules += [{"domain_suffix": $d, "outbound": $out}]' \
-                "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
-        fi
-    fi
-
     restart_singbox
     green "'${rule_tag}' 已分流至出站 '${selected_out}'"
     sleep 1; warp_manage
@@ -1743,8 +1576,8 @@ set_global_outbound() {
         "$outbound_file" 2>/dev/null))
 
     if [ ${#proxy_tags[@]} -eq 0 ]; then
-        yellow "\n当前没有可用的 socks5/http 代理出站。"
-        yellow "请先返回 → 设置分流服务 → 添加 Socks5/HTTP 出站，再设置全局代理。\n"
+        yellow "\n当前没有可用的代理出站。"
+        yellow "请先返回 → 设置分流服务 → 添加 SOCKS5/HTTP/SS2022 出站，再设置全局代理。\n"
         sleep 3; add_rule_menu; return
     fi
 
@@ -1851,462 +1684,98 @@ delete_rule_menu() {
        'del(.route.rules[] | select(.rule_set != null) | .rule_set[] | select(. == $tag)) |
         .route.rules = [.route.rules[] | select(.rule_set != null and (.rule_set | length) > 0)]' \
        "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
-
-    # 同步删除该服务的domain_suffix补充规则(如果有)
-    extra_domains_json=$(extra_ai_domains "$tag")
-    if [ -n "$extra_domains_json" ]; then
-        jq --argjson d "$extra_domains_json" \
-           '.route.rules = [.route.rules[] | select(.domain_suffix == null or (.domain_suffix != $d))]' \
-           "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
-    fi
-
     restart_singbox
     green "规则集 '${tag}' 已禁用。"
     sleep 1; warp_manage
 }
 
-# 解析 ss:// (含ss2022) 链接，添加为 shadowsocks 出站，用于把指定域名流量转发给另一台机子的ss2022节点
-add_ss_outbound() {
-    local proxy_url="$1"
-    local after_proto tag_from_url userinfo host_port server port method password
-    local decoded_file raw_key_file raw_userinfo expected_len actual_len normalized_method
-    local backup_outbound backup_route check_output restart_status
-
-    after_proto="${proxy_url#ss://}"
-
-    # 处理 URL fragment/tag，并去掉可能存在的插件参数
-    if [[ "$after_proto" == *"#"* ]]; then
-        tag_from_url="${after_proto##*#}"
-        after_proto="${after_proto%%#*}"
-    else
-        tag_from_url=""
-    fi
-    after_proto="${after_proto%%\?*}"
-
-    if [[ "$after_proto" == *"@"* ]]; then
-        userinfo="${after_proto%%@*}"
-        host_port="${after_proto##*@}"
-    else
-        userinfo=""
-        host_port="$after_proto"
-    fi
-
-    # 解析服务器地址，兼容 IPv4 / 域名 / [IPv6]:port
-    if [[ "$host_port" =~ ^\[([0-9a-fA-F:]+)\]:([0-9]+)$ ]]; then
-        server="${BASH_REMATCH[1]}"
-        port="${BASH_REMATCH[2]}"
-    else
-        server="${host_port%%:*}"
-        port="${host_port##*:}"
-    fi
-    [ -z "$server" ] || [ -z "$port" ] && { red "格式错误：缺少ip或端口"; sleep 2; return; }
-    [[ "$port" =~ ^[0-9]+$ ]] || { red "格式错误：端口无效"; sleep 2; return; }
-
-    method=""
-    password=""
-
-    # ============================================================
-    # SS / SS2022 链接解析
-    #
-    # 普通 SS：userinfo 通常是 base64(method:password)
-    # SS2022：userinfo 解码后为：method + ':' + 原始二进制 PSK
-    #
-    # 不能把 SS2022 的二进制 PSK 直接塞进 Bash 变量再交给 jq，
-    # 否则会经过 UTF-8/命令替换破坏二进制数据，导致：
-    #   decode key: illegal base64 data at input byte 0
-    #
-    # sing-box 的 SS2022 password 使用 PSK 的 Base64 表示，因此这里
-    # 始终从临时二进制文件提取 PSK，再重新 Base64 编码。
-    # ============================================================
-    decoded_file="$(mktemp)"
-    raw_key_file="$(mktemp)"
-
-    if [[ "$userinfo" == *":"* ]]; then
-        # 明文 method:password 形式，主要兼容部分客户端导出的链接。
-        # 对 SS2022，如果 password 看起来是 Base64，则按 Base64 PSK 尝试；
-        # 如果不是，则按普通字符串处理。
-        method="${userinfo%%:*}"
-        password="${userinfo#*:}"
-
-        if [[ "$method" == 2022-* ]]; then
-            # 明文形式的 SS2022 一般 password 本身就是 Base64 PSK。
-            # 如果无法解码，则拒绝写入，避免产生坏配置。
-            if ! printf '%s' "$password" | base64 -d > "$raw_key_file" 2>/dev/null; then
-                red "SS2022 密钥不是有效的 Base64 格式。"
-                sleep 2
-                rm -f "$decoded_file" "$raw_key_file"
-                return
-            fi
-        fi
-    else
-        # SIP002：base64(method:password)
-        # 同时兼容 URL-safe Base64 和缺少 '=' padding 的导出格式。
-        raw_userinfo="$userinfo"
-        raw_userinfo="${raw_userinfo//-/+}"
-        raw_userinfo="${raw_userinfo//_/\/}"
-        while (( ${#raw_userinfo} % 4 != 0 )); do
-            raw_userinfo+='='
-        done
-
-        if ! printf '%s' "$raw_userinfo" | base64 -d > "$decoded_file" 2>/dev/null; then
-            red "无法解析 SS 节点用户信息：Base64 格式错误。"
-            sleep 2
-            rm -f "$decoded_file" "$raw_key_file"
-            return
-        fi
-
-        # 二进制安全地提取第一个 ':' 前的 method。
-        # method 只包含 ASCII，因此这里用 awk/sed 不会影响后面的 PSK。
-        method="$(LC_ALL=C awk 'BEGIN{RS=""} {p=index($0,":"); if(p>0) printf "%s", substr($0,1,p-1)}' "$decoded_file")"
-        [ -z "$method" ] && { red "无法解析 SS 节点加密方式。"; sleep 2; return; }
-
-        if [[ "$method" == 2022-* ]]; then
-            # 不通过 Bash 变量保存二进制 PSK。
-            # 直接从 method 后面的原始字节提取密钥。
-            method_len=${#method}
-            # method 为 ASCII，长度可以安全用于字节偏移。
-            dd if="$decoded_file" of="$raw_key_file" bs=1 skip=$((method_len + 1)) status=none 2>/dev/null
-            actual_len=$(wc -c < "$raw_key_file")
-
-            [ "$actual_len" -gt 0 ] || { red "SS2022 节点没有有效的 PSK。"; sleep 2; return; }
-
-            # SS2022 的 PSK 长度决定真正的算法：
-            # AES-128-GCM = 16 bytes
-            # AES-256-GCM = 32 bytes
-            # ChaCha20-Poly1305 = 32 bytes
-            case "$method" in
-                2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm)
-                    if [ "$actual_len" -eq 16 ]; then
-                        normalized_method="2022-blake3-aes-128-gcm"
-                        expected_len=16
-                    elif [ "$actual_len" -eq 32 ]; then
-                        normalized_method="2022-blake3-aes-256-gcm"
-                        expected_len=32
-                    else
-                        red "SS2022 密钥长度错误：${method} 只能使用 16 或 32 字节 PSK，当前为 ${actual_len} 字节。"
-                        red "请检查节点链接或服务端配置。脚本不会写入无效的 sing-box 配置。"
-                        sleep 3
-                        rm -f "$decoded_file" "$raw_key_file"
-                        return
-                    fi
-                    if [ "$normalized_method" != "$method" ]; then
-                        yellow "检测到节点链接中的算法标记与实际 PSK 长度不一致。"
-                        yellow "${method} + ${actual_len} 字节 PSK → 自动修正为 ${normalized_method}。"
-                        method="$normalized_method"
-                    fi
-                    ;;
-                2022-blake3-chacha20-poly1305)
-                    expected_len=32
-                    if [ "$actual_len" -ne "$expected_len" ]; then
-                        red "SS2022 密钥长度错误：${method} 要求 32 字节，当前为 ${actual_len} 字节。"
-                        red "请检查节点链接或服务端配置。脚本不会写入无效的 sing-box 配置。"
-                        sleep 3
-                        rm -f "$decoded_file" "$raw_key_file"
-                        return
-                    fi
-                    ;;
-                *)
-                    # 未知 2022 method 不猜测算法，避免生成不可用配置。
-                    red "不支持的 SS2022 加密方式：${method}"
-                    red "当前支持：2022-blake3-aes-128-gcm、2022-blake3-aes-256-gcm、2022-blake3-chacha20-poly1305"
-                    sleep 3
-                    rm -f "$decoded_file" "$raw_key_file"
-                    return
-                    ;;
-            esac
-
-            # jq 参数必须是 ASCII/Base64 字符串，绝不把原始二进制 PSK
-            # 通过 shell 变量传递。
-            password="$(base64 "$raw_key_file" 2>/dev/null | tr -d '\n')"
-            [ -n "$password" ] || { red "SS2022 PSK Base64 编码失败。"; sleep 2; return; }
-        else
-            # 普通 SS 的 password 是文本，可以安全放入 shell 变量。
-            decoded_text="$(cat "$decoded_file")"
-            [[ "$decoded_text" == *":"* ]] || { red "格式错误：无法解析加密方式或密码。"; sleep 2; return; }
-            method="${decoded_text%%:*}"
-            password="${decoded_text#*:}"
-        fi
-    fi
-
-    [ -z "$method" ] || [ -z "$password" ] && { red "格式错误：无法解析加密方式或密码"; sleep 2; return; }
-
-    # 对明文 SS2022 形式再次进行长度/算法校正。
-    if [[ "$method" == 2022-* ]]; then
-        if [ ! -s "$raw_key_file" ]; then
-            # 明文形式已经尝试将 password 解码为原始 PSK。
-            printf '%s' "$password" | base64 -d > "$raw_key_file" 2>/dev/null || {
-                red "SS2022 密钥不是有效的 Base64 PSK。"
-                sleep 2
-                rm -f "$decoded_file" "$raw_key_file"
-                return
-            }
-        fi
-        actual_len=$(wc -c < "$raw_key_file")
-        case "$method" in
-            2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm)
-                if [ "$actual_len" -eq 16 ]; then
-                    normalized_method="2022-blake3-aes-128-gcm"
-                elif [ "$actual_len" -eq 32 ]; then
-                    normalized_method="2022-blake3-aes-256-gcm"
-                else
-                    red "SS2022 密钥长度错误：AES-128 要求 16 字节、AES-256 要求 32 字节，当前为 ${actual_len} 字节。"
-                    sleep 3
-                    rm -f "$decoded_file" "$raw_key_file"
-                    return
-                fi
-                if [ "$normalized_method" != "$method" ]; then
-                    yellow "检测到算法标记与实际 PSK 长度不一致：${method} → ${normalized_method}"
-                    method="$normalized_method"
-                fi
-                ;;
-            2022-blake3-chacha20-poly1305)
-                [ "$actual_len" -eq 32 ] || {
-                    red "SS2022 密钥长度错误：${method} 要求 32 字节，当前为 ${actual_len} 字节。"
-                    sleep 3
-                    rm -f "$decoded_file" "$raw_key_file"
-                    return
-                }
-                ;;
-            *)
-                red "不支持的 SS2022 加密方式：${method}"
-                sleep 3
-                rm -f "$decoded_file" "$raw_key_file"
-                return
-                ;;
-        esac
-        password="$(base64 "$raw_key_file" 2>/dev/null | tr -d '\n')"
-    fi
-
-    yellow "正在测试 shadowsocks 节点 ${server}:${port} (${method}) 的端口连通性..."
-    if timeout 5 bash -c "echo > /dev/tcp/${server}/${port}" 2>/dev/null; then
-        green "端口可达"
-    else
-        yellow "警告：无法探测到该端口的TCP连通性(部分服务器会屏蔽探测，不代表一定不可用)"
-        reading "是否仍然添加此代理？(y/n): " force_add
-        [[ ! "$force_add" =~ ^[yY]$ ]] && { yellow "已取消"; sleep 1; return; }
-    fi
-
-    [ -n "$tag_from_url" ] && tag="$tag_from_url" || tag="ss-${server}-${port}"
-    jq -e --arg tag "$tag" '.outbounds[] | select(.tag == $tag)' "$outbound_file" >/dev/null 2>&1 \
-        && { red "出站标签 '${tag}' 已存在"; sleep 2; return; }
-
-    # ============================================================
-    # 先备份，写入后立即检查完整配置。
-    # SS2022 配置有问题时绝不直接重启 sing-box，避免所有现有节点一起掉线。
-    # ============================================================
-    backup_outbound="$(mktemp)"
-    backup_route="$(mktemp)"
-    cp -f "$outbound_file" "$backup_outbound" || {
-        red "无法备份 outbounds.json，已取消操作。"
-        rm -f "$backup_outbound" "$backup_route"
-        sleep 2
-        rm -f "$decoded_file" "$raw_key_file"
-        return
-    }
-    cp -f "$route_file" "$backup_route" 2>/dev/null || true
-
-    if ! jq --arg tag "$tag" --arg server "$server" --arg port "$port" \
-       --arg method "$method" --arg password "$password" \
-       '.outbounds += [{"type":"shadowsocks","tag":$tag,"server":$server,"server_port":($port|tonumber),"method":$method,"password":$password}]' \
-       "$outbound_file" > "${outbound_file}.tmp"; then
-        red "写入 SS 出站配置失败，未修改现有配置。"
-        rm -f "$backup_outbound" "$backup_route" "${outbound_file}.tmp"
-        sleep 2
-        rm -f "$decoded_file" "$raw_key_file"
-        return
-    fi
-    mv "${outbound_file}.tmp" "$outbound_file"
-
-    # 重要：添加代理出站不自动修改现有分流规则。
-    # 用户应在“设置分流服务”中单独选择哪个 rule_set 使用 relay。
-
-    check_output=$("${work_dir}/${server_name}" check -C "$conf_dir" 2>&1)
-    if [ $? -ne 0 ]; then
-        red "SS2022 已添加，但 sing-box 配置检查失败："
-        echo "$check_output"
-        yellow "正在自动回滚本次修改..."
-        cp -f "$backup_outbound" "$outbound_file"
-        cp -f "$backup_route" "$route_file" 2>/dev/null || true
-        rm -f "$backup_outbound" "$backup_route"
-        red "已回滚，现有节点配置未被破坏。"
-        sleep 3
-        rm -f "$decoded_file" "$raw_key_file"
-        return
-    fi
-
-    green "sing-box 配置检查通过。"
-    restart_singbox
-    restart_status=$?
-    if [ $restart_status -ne 0 ]; then
-        red "sing-box 重启失败，正在自动回滚本次 SS 出站修改..."
-        cp -f "$backup_outbound" "$outbound_file"
-        cp -f "$backup_route" "$route_file" 2>/dev/null || true
-        rm -f "$backup_outbound" "$backup_route"
-        restart_singbox >/dev/null 2>&1
-        red "已回滚。"
-        sleep 3
-        rm -f "$decoded_file" "$raw_key_file"
-        return
-    fi
-
-    # 再确认一次服务确实处于 active 状态。
-    if command_exists systemctl; then
-        if ! systemctl is-active --quiet sing-box; then
-            red "sing-box 重启后未处于运行状态，正在自动回滚..."
-            cp -f "$backup_outbound" "$outbound_file"
-            cp -f "$backup_route" "$route_file" 2>/dev/null || true
-            rm -f "$backup_outbound" "$backup_route"
-            restart_singbox >/dev/null 2>&1
-            red "已回滚。"
-            sleep 3
-            rm -f "$decoded_file" "$raw_key_file"
-            return
-        fi
-    elif command_exists rc-service; then
-        if ! rc-service sing-box status >/dev/null 2>&1; then
-            red "sing-box 重启后未处于运行状态，正在自动回滚..."
-            cp -f "$backup_outbound" "$outbound_file"
-            cp -f "$backup_route" "$route_file" 2>/dev/null || true
-            rm -f "$backup_outbound" "$backup_route"
-            restart_singbox >/dev/null 2>&1
-            red "已回滚。"
-            sleep 3
-            rm -f "$decoded_file" "$raw_key_file"
-            return
-        fi
-    fi
-
-    rm -f "$backup_outbound" "$backup_route"
-    rm -f "$decoded_file" "$raw_key_file"
-    green "\n${tag} (${method}) shadowsocks 代理出站已添加"
-    green "不会自动修改现有分流规则，请在“设置分流服务”中选择需要走 ${tag} 的规则集。\n"
-    sleep 2; warp_manage
-}
-add_socks5_proxy() {
+add_proxy_outbound() {
     clear
-    reading "请输入代理URL (支持socks://,socks5://,http://,ss:// 支持v2rayN导出的节点链接): " proxy_url
-    [ -z "$proxy_url" ] && { red "输入为空！"; sleep 1; return; }
+    echo ""
+    green "请选择要添加的分流出站类型:"
+    green "1. SOCKS5 / SOCKS"
+    green "2. HTTP"
+    green "3. Shadowsocks-2022 (SS2022)"
+    purple "0. 返回"
+    reading "请输入选择: " proxy_choice
+    [ "$proxy_choice" = "0" ] && { warp_manage; return; }
 
-    proto=$(echo "$proxy_url" | grep -oP '^[a-zA-Z0-9]+(?=://)')
-    [[ ! "$proto" =~ ^(socks5|socks|http|ss)$ ]] && { red "不支持的协议"; sleep 2; return; }
-
-    if [[ "$proto" == "ss" ]]; then
-        add_ss_outbound "$proxy_url"
+    if [ "$proxy_choice" = "3" ]; then
+        add_ss2022_outbound
         return
     fi
 
-    case "$proto" in
-        socks|socks5) outbound_type="socks" ;;
-        http)         outbound_type="http" ;;
+    case "$proxy_choice" in
+        1) allowed='^(socks5|socks)$'; outbound_type="socks" ;;
+        2) allowed='^(http)$'; outbound_type="http" ;;
+        *) red "无效选择"; sleep 1; add_proxy_outbound; return ;;
     esac
 
+    reading "请输入代理URL: " proxy_url
+    [ -z "$proxy_url" ] && { red "输入为空！"; sleep 1; return; }
+    proto=$(echo "$proxy_url" | grep -oP '^[a-zA-Z0-9]+(?=://)')
+    [[ "$proto" =~ $allowed ]] || { red "协议与所选类型不匹配"; sleep 2; return; }
+
     after_proto="${proxy_url#*://}"
-    if [[ "$after_proto" == *"#"* ]]; then
-        tag_from_url="${after_proto##*#}"; after_proto="${after_proto%%#*}"
-    else
-        tag_from_url=""
-    fi
-
-    if [[ "$after_proto" == *"@"* ]]; then
-        user_pass="${after_proto%%@*}"; host_port="${after_proto##*@}"
-    else
-        user_pass=""; host_port="$after_proto"
-    fi
-
+    if [[ "$after_proto" == *"#"* ]]; then tag_from_url="${after_proto##*#}"; after_proto="${after_proto%%#*}"; else tag_from_url=""; fi
+    if [[ "$after_proto" == *"@"* ]]; then user_pass="${after_proto%%@*}"; host_port="${after_proto##*@}"; else user_pass=""; host_port="$after_proto"; fi
     user=""; password=""
     if [ -n "$user_pass" ]; then
-        decoded=$(echo "$user_pass" | base64 -d 2>/dev/null)
-        if [ -n "$decoded" ] && [[ "$decoded" != "$user_pass" ]] && [[ "$decoded" == *":"* ]]; then
-            user="${decoded%%:*}"; password="${decoded#*:}"
-        elif [[ "$user_pass" == *":"* ]]; then
-            user="${user_pass%%:*}"; password="${user_pass#*:}"
-        else
-            user="$user_pass"
-        fi
+        decoded=$(printf '%s' "$user_pass" | base64 -d 2>/dev/null)
+        if [ -n "$decoded" ] && [[ "$decoded" == *":"* ]]; then user="${decoded%%:*}"; password="${decoded#*:}"
+        elif [[ "$user_pass" == *":"* ]]; then user="${user_pass%%:*}"; password="${user_pass#*:}"
+        else user="$user_pass"; fi
     fi
-
-    if [[ "$host_port" =~ ^\[([0-9a-fA-F:]+)\]:([0-9]+)$ ]]; then
-        server="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
-    else
-        server="${host_port%%:*}"; port="${host_port##*:}"
-    fi
-    [ -z "$server" ] || [ -z "$port" ] && { red "格式错误：缺少ip或端口"; sleep 2; return; }
-
-    [[ "$proto" == "socks" || "$proto" == "socks5" ]] && check_proto="socks5" || check_proto="$proto"
-
-    # 拼URL用的地址：IPv6需要重新套上方括号，纯IPv4/域名不用
-    local url_server="$server"
-    [[ "$server" == *:* ]] && url_server="[${server}]"
-
-    # 判断是否为本地地址，本地地址跳过外部 API 检测，直接用 curl 测试
-    local is_local=false
-    if [[ "$server" == "127.0.0.1" || "$server" == "::1" || "$server" == "localhost" ]]; then
-        is_local=true
-    fi
-
-    local proxy_auth=""
-    [ -n "$user" ] && [ -n "$password" ] && proxy_auth="${user}:${password}@" || \
-        { [ -n "$user" ] && proxy_auth="${user}@"; }
-
-    if [ "$is_local" = true ]; then
-        # 本地代理：直接用 curl 通过代理访问外网测试连通性
-        yellow "检测到本地代理 ${check_proto}://${url_server}:${port}，跳过外部API检测，正在用curl测试连通性..."
-        local curl_proxy_url="${check_proto}://${proxy_auth}${url_server}:${port}"
-        local test_result
-        test_result=$(curl -s --max-time 8 --proxy "$curl_proxy_url" "https://api.ip.sb/ip" 2>/dev/null)
-        if [ -z "$test_result" ]; then
-            yellow "警告：通过本地代理访问外网失败，请确认代理服务正在运行。"
-            reading "是否仍然添加此代理？(y/n): " force_add
-            [[ ! "$force_add" =~ ^[yY]$ ]] && { yellow "已取消"; sleep 1; return; }
-        else
-            green "本地代理可用，出口IP: $test_result"
-        fi
-    else
-        # 远程代理：调用外部 API 检测
-        yellow "正在测试代理 ${check_proto}://${url_server}:${port} ..."
-        local api_response
-        api_response=$(curl -s --max-time 8 -G \
-            --data-urlencode "proxy=${check_proto}://${proxy_auth}${url_server}:${port}" \
-            "https://check.socks5.cmliussss.net/check" 2>/dev/null)
-        [ -z "$api_response" ] && { red "API 请求失败"; sleep 2; return; }
-
-        success=$(echo "$api_response" | jq -r '.success')
-        if [ "$success" != "true" ]; then
-            error_msg=$(echo "$api_response" | jq -r '.error // "未知错误"')
-            red "代理不可用: $error_msg"; sleep 2; return
-        fi
-        exit_ip=$(echo "$api_response" | jq -r '.exit.ip // empty')
-        green "代理可用"
-        [ -n "$exit_ip" ] && green "出口 IP: $exit_ip"
-    fi
-
+    if [[ "$host_port" =~ ^\[(.*)\]:([0-9]+)$ ]]; then server="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+    else server="${host_port%:*}"; port="${host_port##*:}"; fi
+    [[ -n "$server" && "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 ]] || { red "格式错误：服务器或端口无效"; sleep 2; return; }
     [ -n "$tag_from_url" ] && tag="$tag_from_url" || tag="${outbound_type}-${server}-${port}"
-    jq -e --arg tag "$tag" '.outbounds[] | select(.tag == $tag)' "$outbound_file" >/dev/null 2>&1 \
-        && { red "出站标签 '${tag}' 已存在"; sleep 2; return; }
-
-    # 根据是否有账号密码，决定写入字段，避免空字符串导致 sing-box 报错
+    jq -e --arg tag "$tag" '.outbounds[] | select(.tag == $tag)' "$outbound_file" >/dev/null 2>&1 && { red "出站标签 '${tag}' 已存在"; sleep 2; return; }
     if [ -n "$user" ] && [ -n "$password" ]; then
-        jq --arg type "$outbound_type" --arg tag "$tag" --arg server "$server" \
-           --arg port "$port" --arg user "$user" --arg password "$password" \
-           '.outbounds += [{"type":$type,"tag":$tag,"server":$server,"server_port":($port|tonumber),"username":$user,"password":$password}]' \
-           "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+      jq --arg type "$outbound_type" --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg user "$user" --arg password "$password" '.outbounds += [{"type":$type,"tag":$tag,"server":$server,"server_port":$port,"username":$user,"password":$password}]' "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
     else
-        # 无账号密码：不写 username/password 字段
-        jq --arg type "$outbound_type" --arg tag "$tag" --arg server "$server" \
-           --arg port "$port" \
-           '.outbounds += [{"type":$type,"tag":$tag,"server":$server,"server_port":($port|tonumber)}]' \
-           "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+      jq --arg type "$outbound_type" --arg tag "$tag" --arg server "$server" --argjson port "$port" '.outbounds += [{"type":$type,"tag":$tag,"server":$server,"server_port":$port}]' "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
     fi
-
-    if jq -e '.route.rules | length > 0' "$route_file" >/dev/null 2>&1; then
-        jq --arg tag "$tag" '.route.rules[].outbound = $tag' "$route_file" > "${route_file}.tmp" \
-            && mv "${route_file}.tmp" "$route_file"
-        yellow "已将现有分流规则出站切换为 '${tag}'。"
-    fi
-
     restart_singbox
     green "\n${tag} 代理出站已添加\n"
-    sleep 2; warp_manage
+    sleep 1; warp_manage
+}
+
+add_ss2022_outbound() {
+    clear
+    green "=== 添加 Shadowsocks-2022 分流出站 ==="
+    reading "请输入 SS2022 链接（ss://...），或直接回车手动填写: " ss_url
+    method=""; password=""; server=""; port=""; tag=""
+    if [ -n "$ss_url" ]; then
+        payload="${ss_url#ss://}"
+        if [[ "$payload" == *"#"* ]]; then tag="${payload##*#}"; payload="${payload%%#*}"; fi
+        # 支持 ss://BASE64(method:password)@host:port 以及明文 method:password@host:port
+        [[ "$payload" == *"@"* ]] || { red "SS 链接格式错误"; sleep 2; return; }
+        userinfo="${payload%%@*}"; hostport="${payload#*@}"
+        decoded=$(printf '%s' "$userinfo" | base64 -d 2>/dev/null)
+        [[ "$decoded" == *":"* ]] || decoded="$userinfo"
+        method="${decoded%%:*}"; password="${decoded#*:}"
+        if [[ "$hostport" =~ ^\[(.*)\]:([0-9]+)$ ]]; then server="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"; else server="${hostport%:*}"; port="${hostport##*:}"; fi
+    else
+        echo ""
+        green "1. 2022-blake3-aes-128-gcm"
+        green "2. 2022-blake3-aes-256-gcm"
+        green "3. 2022-blake3-chacha20-poly1305"
+        reading "请选择加密方式 (默认1): " mchoice
+        case "$mchoice" in 2) method="2022-blake3-aes-256-gcm";; 3) method="2022-blake3-chacha20-poly1305";; *) method="2022-blake3-aes-128-gcm";; esac
+        reading "服务器地址/IP（IPv6无需[]）: " server
+        reading "服务器端口: " port
+        reading "SS2022 密钥（base64）: " password
+        reading "出站标签（回车自动生成）: " tag
+    fi
+    [[ "$method" =~ ^2022-blake3-(aes-128-gcm|aes-256-gcm|chacha20-poly1305)$ ]] || { red "不是支持的 SS2022 加密方式"; sleep 2; return; }
+    [[ -n "$server" && "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 && -n "$password" ]] || { red "服务器、端口或密钥无效"; sleep 2; return; }
+    [ -n "$tag" ] || tag="ss2022-${server}-${port}"
+    jq -e --arg tag "$tag" '.outbounds[] | select(.tag == $tag)' "$outbound_file" >/dev/null 2>&1 && { red "出站标签 '${tag}' 已存在"; sleep 2; return; }
+    jq --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg method "$method" --arg password "$password" '.outbounds += [{"type":"shadowsocks","tag":$tag,"server":$server,"server_port":$port,"method":$method,"password":$password}]' "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+    restart_singbox
+    green "\nSS2022 分流出站 '${tag}' 已添加\n"
+    sleep 1; warp_manage
 }
 
 delete_socks5_proxy() {
@@ -2705,75 +2174,6 @@ show_extra_proto_status() {
     echo ""
 }
 
-# 域名证书管理：交互式设置/更换/恢复 hy2+tuic 使用的证书
-manage_domain_cert() {
-    check_singbox &>/dev/null
-    if [ $? -eq 2 ]; then
-        yellow "sing-box 尚未安装！"; sleep 1; return
-    fi
-
-    clear
-    green "=== 域名证书管理 ===\n"
-    if [ -f "${work_dir}/domain.txt" ] && [ -s "${work_dir}/domain.txt" ]; then
-        green "当前证书域名: ${purple}$(cat "${work_dir}/domain.txt")${re}"
-        green "证书颁发者: ${purple}$(openssl x509 -in "${work_dir}/cert.pem" -noout -issuer 2>/dev/null | sed 's/issuer=//')${re}\n"
-    else
-        yellow "当前使用自签证书 (bing.com)，未绑定真实域名\n"
-    fi
-
-    green "1. 设置/更换域名证书 (申请Let's Encrypt真实证书)"
-    red   "2. 恢复自签证书"
-    purple "0. 返回主菜单"
-    skyblue "------------"
-    reading "请输入选择: " dc_choice
-
-    case "$dc_choice" in
-        1)
-            reading "请输入你的域名 (需已提前解析到本机公网IP): " new_domain
-            [ -z "$new_domain" ] && { red "域名不能为空"; sleep 1; return; }
-
-            issue_domain_cert "$new_domain"
-
-            if [ -f "${work_dir}/domain.txt" ] && [ "$(cat "${work_dir}/domain.txt")" == "$new_domain" ]; then
-                jq --arg d "$new_domain" \
-                   '(.inbounds[] | select(.type=="hysteria2") | .masquerade) = ("https://" + $d)' \
-                   "${conf_dir}/inbounds.json" > "${conf_dir}/inbounds.json.tmp" \
-                   && mv "${conf_dir}/inbounds.json.tmp" "${conf_dir}/inbounds.json"
-
-                sed -i -E "/^hysteria2:\/\// s/sni=[^&]*/sni=${new_domain}/" "${client_dir}"
-                sed -i -E "/^hysteria2:\/\// s/insecure=[01]/insecure=0/" "${client_dir}"
-                sed -i -E "/^hysteria2:\/\// s/\&pinSHA256=[^&]*//" "${client_dir}"
-                sed -i -E "/^tuic:\/\// s/sni=[^&]*/sni=${new_domain}/" "${client_dir}"
-                sed -i -E "/^tuic:\/\// s/allow_insecure=[01]/allow_insecure=0/" "${client_dir}"
-
-                restart_singbox
-                green "\n域名证书已切换为 ${new_domain}，节点信息已同步更新，请重新导入订阅\n"
-            fi
-            ;;
-        2)
-            issue_domain_cert ""
-            new_fp=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
-
-            jq '(.inbounds[] | select(.type=="hysteria2") | .masquerade) = "https://bing.com"' \
-                "${conf_dir}/inbounds.json" > "${conf_dir}/inbounds.json.tmp" \
-                && mv "${conf_dir}/inbounds.json.tmp" "${conf_dir}/inbounds.json"
-
-            sed -i -E "/^hysteria2:\/\// s/sni=[^&]*/sni=www.bing.com/" "${client_dir}"
-            sed -i -E "/^hysteria2:\/\// s/insecure=[01]/insecure=1/" "${client_dir}"
-            sed -i -E "/^hysteria2:\/\// s/\&pinSHA256=[^&]*//" "${client_dir}"
-            sed -i -E "/^hysteria2:\/\// s/insecure=1/insecure=1\&pinSHA256=${new_fp}/" "${client_dir}"
-            sed -i -E "/^tuic:\/\// s/sni=[^&]*/sni=www.bing.com/" "${client_dir}"
-            sed -i -E "/^tuic:\/\// s/allow_insecure=[01]/allow_insecure=1/" "${client_dir}"
-
-            restart_singbox
-            green "\n已恢复自签证书，请重新导入订阅\n"
-            ;;
-        0) return ;;
-        *) red "无效选项" ;;
-    esac
-    sleep 2
-}
-
 # 协议管理主菜单
 manage_protocols() {
     check_singbox &>/dev/null
@@ -2824,7 +2224,7 @@ menu() {
     clear; echo ""
     green "Telegram群组: ${purple}https://t.me/eooceu${re}"
     green "YouTube频道: ${purple}https://youtube.com/@eooce${re}"
-    green "Github地址: ${purple}https://github.com/tbjpvn/sb-re${re}\n"
+    green "Github地址: ${purple}https://github.com/eooce/sing-box${re}\n"
     purple "=== 老王sing-box四合一安装脚本 ===\n"
     purple "---Argo 状态: ${argo_status}"
     purple "--Nginx 状态: ${nginx_status}"
@@ -2841,8 +2241,6 @@ menu() {
     green "8. WARP分流管理"
     echo "==============="
     green "9. 增加/删除协议"
-    echo "==============="
-    green "11. 域名证书管理"
     echo "==============="
     purple "10. ssh综合工具箱"
     echo "==============="
@@ -2891,7 +2289,7 @@ case "$1" in
         # 无参数：进入交互式主菜单
         while true; do
             menu
-            reading "请输入选择(0-11): " choice 
+            reading "请输入选择(0-10): " choice 
             echo ""
             need_pause=true  
             case "${choice}" in
@@ -2931,10 +2329,9 @@ case "$1" in
                     bash <(curl -Ls ssh_tool.eooce.com)
                     need_pause=false
                     ;;
-                11) manage_domain_cert; need_pause=false ;;
                 0)  exit 0 ;;       
                 *)
-                    red "无效的选项，请输入 0-11"
+                    red "无效的选项，请输入 0-10"
                     need_pause=true
                     ;;
             esac
