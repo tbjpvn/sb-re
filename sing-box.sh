@@ -1702,7 +1702,7 @@ add_socks5_outbound() {
     [[ ! "$proto" =~ ^(socks5|socks)$ ]] && { red "仅支持 socks:// 或 socks5://"; sleep 2; return; }
 
     after_proto="${proxy_url#*://}"
-    if [[ "$after_proto" == *"#"* ]]; then tag_from_url="${after_proto##*#}"; after_proto="${after_proto%%#*}"; else tag_from_url=""; fi
+    if [[ "$after_proto" == *"#"* ]]; then tag_from_url="${after_proto##*#}"; tag_from_url="${tag_from_url//%20/ }"; after_proto="${after_proto%%#*}"; else tag_from_url=""; fi
     if [[ "$after_proto" == *"@"* ]]; then user_pass="${after_proto%%@*}"; host_port="${after_proto##*@}"; else user_pass=""; host_port="$after_proto"; fi
     user=""; password=""
     if [ -n "$user_pass" ]; then
@@ -1745,11 +1745,15 @@ add_ss2022_outbound() {
     [[ "$proxy_url" =~ ^ss:// ]] || { red "仅支持 ss:// SS2022 节点链接"; sleep 2; return; }
 
     after_proto="${proxy_url#ss://}"
-    if [[ "$after_proto" == *"#"* ]]; then tag_from_url="${after_proto##*#}"; after_proto="${after_proto%%#*}"; else tag_from_url=""; fi
+    if [[ "$after_proto" == *"#"* ]]; then tag_from_url="${after_proto##*#}"; tag_from_url="${tag_from_url//%20/ }"; after_proto="${after_proto%%#*}"; else tag_from_url=""; fi
     [[ "$after_proto" == *"@"* ]] || { red "SS2022 链接格式错误：缺少 @"; sleep 2; return; }
     userinfo="${after_proto%%@*}"; host_port="${after_proto##*@}"
-    decoded=$(printf '%s' "$userinfo" | base64 -d 2>/dev/null)
-    [ -z "$decoded" ] && decoded=$(printf '%s' "$userinfo" | base64 -d -i 2>/dev/null)
+    # SS/SS2022 URI userinfo 使用 Base64；兼容标准/URL-safe Base64 和缺失 padding
+    userinfo_norm="${userinfo//-/+}"
+    userinfo_norm="${userinfo_norm//_/\/}"
+    pad=$(( (4 - ${#userinfo_norm} % 4) % 4 ))
+    [ "$pad" -gt 0 ] && userinfo_norm="${userinfo_norm}$(printf '=%.0s' $(seq 1 "$pad"))"
+    decoded=$(printf '%s' "$userinfo_norm" | base64 -d 2>/dev/null)
     [ -z "$decoded" ] || [[ "$decoded" != *":"* ]] && { red "无法解析 SS2022 method/password"; sleep 2; return; }
     ss_method="${decoded%%:*}"; ss_password="${decoded#*:}"
     case "$ss_method" in 2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) ;; *) red "不是支持的 SS2022 加密方式: ${ss_method}"; sleep 2; return ;; esac
@@ -1758,7 +1762,12 @@ add_ss2022_outbound() {
     [ -z "$server" ] || [ -z "$port" ] && { red "格式错误：缺少IP/域名或端口"; sleep 2; return; }
     [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || { red "端口无效"; sleep 2; return; }
 
-    key_len=$(printf '%s' "$ss_password" | base64 -d 2>/dev/null | wc -c | tr -d ' ')
+    # SS2022 password 本身也是 Base64；兼容标准/URL-safe Base64 和缺失 padding
+    ss_password_norm="${ss_password//-/+}"
+    ss_password_norm="${ss_password_norm//_/\/}"
+    pad=$(( (4 - ${#ss_password_norm} % 4) % 4 ))
+    [ "$pad" -gt 0 ] && ss_password_norm="${ss_password_norm}$(printf '=%.0s' $(seq 1 "$pad"))"
+    key_len=$(printf '%s' "$ss_password_norm" | base64 -d 2>/dev/null | wc -c | tr -d ' ')
     case "$ss_method" in 2022-blake3-aes-128-gcm) expected_len=16 ;; *) expected_len=32 ;; esac
     [ "$key_len" = "$expected_len" ] || { red "SS2022 密钥长度错误：${ss_method} 需要 ${expected_len} 字节，当前 ${key_len} 字节"; sleep 3; return; }
 
