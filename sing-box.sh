@@ -1446,17 +1446,17 @@ warp_manage() {
     jq -r '.route.rules[] | select(.rule_set != null) | .rule_set[]?' "$route_file" 2>/dev/null | sort -u | while read tag; do
         echo -e " - ${skyblue}$tag${re}"
     done || echo "  无"
-    green "\n已添加的 SOCKS5/SS2022 代理出站:"
+    green "\n已添加的 Socks5/SS2022 代理出站:"
     jq -r '.outbounds[] | select(.tag != "direct") | " - \(.tag) [\(.type)]"' "$outbound_file" 2>/dev/null || echo "  无"
 
     echo ""
-    green "1. 设置分流服务 (未添加 SOCKS5/SS2022 直接设置则使用WARP)"
+    green "1. 设置分流服务 (未添加 Socks5/SS2022 直接设置则使用 WARP)"
     skyblue "----------------------"
     red "2. 删除分流服务"
     skyblue "--------------"
     green "3. 添加 Socks5/SS2022 出站"
     skyblue "----------------------"
-    red "4. 删除 SOCKS5/SS2022 出站"
+    red "4. 删除 Socks5/SS2022 出站"
     skyblue "----------------------"
     purple "0. 返回主菜单"
     skyblue "------------"
@@ -1520,7 +1520,7 @@ add_rule_menu() {
         else . end' \
         "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
 
-    local out_tags=($(jq -r '.outbounds[] | select(.tag != "direct") | .tag' "$outbound_file" 2>/dev/null))
+    local out_tags=($(jq -r '.outbounds[] | select(.tag != "direct" and .tag != "wireguard-out") | .tag' "$outbound_file" 2>/dev/null))
     if [ ${#out_tags[@]} -eq 0 ]; then
         selected_out="wireguard-out"
         yellow "未找到其他出站，将自动使用 wireguard-out。"
@@ -1559,13 +1559,13 @@ add_rule_menu() {
 
 # 设置全局代理出站
 set_global_outbound() {
-    # 检查是否存在 SOCKS5/SS2022 代理出站（排除 direct 和 wireguard-out）
+    # 检查是否存在 Socks5/SS2022 代理出站（排除 direct 和 wireguard-out）
     local proxy_tags
     proxy_tags=($(jq -r '.outbounds[] | select(.tag != "direct" and .tag != "wireguard-out") | .tag' \
         "$outbound_file" 2>/dev/null))
 
     if [ ${#proxy_tags[@]} -eq 0 ]; then
-        yellow "\n当前没有可用的 SOCKS5/SS2022 代理出站。"
+        yellow "\n当前没有可用的 Socks5/SS2022 代理出站。"
         yellow "请先返回 → 设置分流服务 → 添加 Socks5/SS2022 出站，再设置全局代理。\n"
         sleep 3; add_rule_menu; return
     fi
@@ -1681,138 +1681,119 @@ delete_rule_menu() {
 add_socks5_proxy() {
     clear
     echo ""
-    green "添加分流出站："
-    green "1. SOCKS5 / SOCKS"
-    green "2. Shadowsocks-2022 (SS2022)"
+    green "请选择代理出站类型:"
+    green "1. Socks5"
+    green "2. Shadowsocks-2022"
     purple "0. 返回"
     reading "请输入选择: " proxy_choice
-
     case "$proxy_choice" in
-        1)
-            reading "请输入 SOCKS5 URL (支持 socks://, socks5://): " proxy_url
-            [ -z "$proxy_url" ] && { red "输入为空！"; sleep 1; return; }
-            proto=$(echo "$proxy_url" | grep -oP '^[a-zA-Z0-9]+(?=://)')
-            [[ ! "$proto" =~ ^(socks5|socks)$ ]] && { red "仅支持 socks:// 或 socks5://"; sleep 2; return; }
-            outbound_type="socks"
-            after_proto="${proxy_url#*://}"
-            if [[ "$after_proto" == *"#"* ]]; then
-                tag_from_url="${after_proto##*#}"; after_proto="${after_proto%%#*}"
-            else
-                tag_from_url=""
-            fi
-            if [[ "$after_proto" == *"@"* ]]; then
-                user_pass="${after_proto%%@*}"; host_port="${after_proto##*@}"
-            else
-                user_pass=""; host_port="$after_proto"
-            fi
-            user=""; password=""
-            if [ -n "$user_pass" ]; then
-                decoded=$(printf '%s' "$user_pass" | base64 -d 2>/dev/null)
-                if [ -n "$decoded" ] && [[ "$decoded" == *":"* ]]; then
-                    user="${decoded%%:*}"; password="${decoded#*:}"
-                elif [[ "$user_pass" == *":"* ]]; then
-                    user="${user_pass%%:*}"; password="${user_pass#*:}"
-                else
-                    user="$user_pass"
-                fi
-            fi
-            server="${host_port%%:*}"; port="${host_port##*:}"
-            [ -z "$server" ] || [ -z "$port" ] && { red "格式错误：缺少IP或端口"; sleep 2; return; }
-            [ -n "$tag_from_url" ] && tag="$tag_from_url" || tag="socks-${server}-${port}"
-            jq -e --arg tag "$tag" '.outbounds[] | select(.tag == $tag)' "$outbound_file" >/dev/null 2>&1 && { red "出站标签 '${tag}' 已存在"; sleep 2; return; }
-            if [ -n "$user" ] && [ -n "$password" ]; then
-                jq --arg tag "$tag" --arg server "$server" --arg port "$port" --arg user "$user" --arg password "$password" \
-                  '.outbounds += [{"type":"socks","tag":$tag,"server":$server,"server_port":($port|tonumber),"username":$user,"password":$password}]' \
-                  "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
-            else
-                jq --arg tag "$tag" --arg server "$server" --arg port "$port" \
-                  '.outbounds += [{"type":"socks","tag":$tag,"server":$server,"server_port":($port|tonumber)}]' \
-                  "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
-            fi
-            ;;
-        2)
-            reading "请输入 SS2022 链接 (ss://...): " proxy_url
-            [ -z "$proxy_url" ] && { red "输入为空！"; sleep 1; return; }
-            [[ "$proxy_url" == ss://* ]] || { red "仅支持 ss:// 链接"; sleep 2; return; }
-            after_proto="${proxy_url#ss://}"
-            after_proto="${after_proto%%\?*}"
-            if [[ "$after_proto" == *"#"* ]]; then
-                tag="${after_proto##*#}"; after_proto="${after_proto%%#*}"
-            else
-                tag=""
-            fi
-            # 支持标准 SIP002：ss://BASE64(method:password)@host:port
-            if [[ "$after_proto" != *"@"* ]]; then
-                red "SS2022 链接格式错误：需要包含 @服务器:端口"; sleep 2; return
-            fi
-            userinfo="${after_proto%%@*}"
-            host_port="${after_proto##*@}"
-            if [[ "$host_port" == \[*\]:* ]]; then
-                server="${host_port#\[}"; server="${server%%\]*}"; port="${host_port##*]:}"
-            else
-                server="${host_port%:*}"; port="${host_port##*:}"
-            fi
-            [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || { red "SS2022 端口错误"; sleep 2; return; }
-            normalized="$userinfo"
-            normalized="${normalized//-/+}"; normalized="${normalized//_/\/}"
-            case $((${#normalized}%4)) in 2) normalized="${normalized}==";; 3) normalized="${normalized}=";; 1) red "SS2022 Base64 密钥部分格式错误"; sleep 2; return;; esac
-            decoded=$(printf '%s' "$normalized" | base64 -d 2>/dev/null)
-            [ -n "$decoded" ] && [[ "$decoded" == *":"* ]] || { red "无法解析 SS2022 method:password"; sleep 2; return; }
-            method="${decoded%%:*}"; ss_key="${decoded#*:}"
-            case "$method" in
-                2022-blake3-aes-128-gcm) expected_len=16 ;;
-                2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) expected_len=32 ;;
-                *) red "不是支持的 SS2022 加密方式: $method"; sleep 2; return ;;
-            esac
-            key_norm="$ss_key"; key_norm="${key_norm//-/+}"; key_norm="${key_norm//_/\/}"
-            case $((${#key_norm}%4)) in 2) key_norm="${key_norm}==";; 3) key_norm="${key_norm}=";; 1) red "SS2022 密钥 Base64 格式错误"; sleep 2; return;; esac
-            actual_len=$(printf '%s' "$key_norm" | base64 -d 2>/dev/null | wc -c)
-            [ "$actual_len" -eq "$expected_len" ] || { red "SS2022 密钥长度错误：${method} 需要 ${expected_len} 字节，当前 ${actual_len} 字节"; sleep 2; return; }
-            [ -n "$tag" ] || tag="ss2022-${server}-${port}"
-            jq -e --arg tag "$tag" '.outbounds[] | select(.tag == $tag)' "$outbound_file" >/dev/null 2>&1 && { red "出站标签 '${tag}' 已存在"; sleep 2; return; }
-            # 关键：password 必须保留原始 Base64 字符串，不能写入解码后的二进制。
-            jq --arg tag "$tag" --arg server "$server" --arg port "$port" --arg method "$method" --arg password "$ss_key" \
-              '.outbounds += [{"type":"shadowsocks","tag":$tag,"server":$server,"server_port":($port|tonumber),"method":$method,"password":$password}]' \
-              "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
-            ;;
-        0) return ;;
-        *) red "无效选项"; sleep 1; return ;;
+        1) add_socks5_outbound ;;
+        2) add_ss2022_outbound ;;
+        0) warp_manage; return ;;
+        *) red "无效选项"; sleep 1; add_socks5_proxy ;;
     esac
-
-    restart_singbox
-    if command_exists systemctl && ! systemctl is-active --quiet sing-box; then
-        red "sing-box 启动失败，本次添加的出站可能有问题。"
-    else
-        green "
-${tag} 分流出站已添加"
-    fi
-    sleep 2; warp_manage
 }
 
+add_socks5_outbound() {
+    clear
+    reading "请输入 Socks5 代理URL (支持 socks:// 或 socks5://，支持用户名密码): " proxy_url
+    [ -z "$proxy_url" ] && { red "输入为空！"; sleep 1; return; }
+    proto=$(echo "$proxy_url" | grep -oP '^[a-zA-Z0-9]+(?=://)')
+    [[ ! "$proto" =~ ^(socks5|socks)$ ]] && { red "仅支持 socks:// 或 socks5://"; sleep 2; return; }
+
+    after_proto="${proxy_url#*://}"
+    if [[ "$after_proto" == *"#"* ]]; then tag_from_url="${after_proto##*#}"; after_proto="${after_proto%%#*}"; else tag_from_url=""; fi
+    if [[ "$after_proto" == *"@"* ]]; then user_pass="${after_proto%%@*}"; host_port="${after_proto##*@}"; else user_pass=""; host_port="$after_proto"; fi
+    user=""; password=""
+    if [ -n "$user_pass" ]; then
+        decoded=$(echo "$user_pass" | base64 -d 2>/dev/null)
+        if [ -n "$decoded" ] && [[ "$decoded" != "$user_pass" ]] && [[ "$decoded" == *":"* ]]; then user="${decoded%%:*}"; password="${decoded#*:}"
+        elif [[ "$user_pass" == *":"* ]]; then user="${user_pass%%:*}"; password="${user_pass#*:}"
+        else user="$user_pass"; fi
+    fi
+    server="${host_port%%:*}"; port="${host_port##*:}"
+    [ -z "$server" ] || [ -z "$port" ] && { red "格式错误：缺少IP/域名或端口"; sleep 2; return; }
+    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || { red "端口无效"; sleep 2; return; }
+
+    local proxy_auth=""
+    [ -n "$user" ] && [ -n "$password" ] && proxy_auth="${user}:${password}@" || { [ -n "$user" ] && proxy_auth="${user}@"; }
+    yellow "正在测试 Socks5 代理 socks5://${server}:${port} ..."
+    test_result=$(curl -s --max-time 8 --proxy "socks5h://${proxy_auth}${server}:${port}" "https://api.ip.sb/ip" 2>/dev/null)
+    if [ -z "$test_result" ]; then
+        yellow "警告：代理连通性测试失败。"
+        reading "是否仍然添加此代理？(y/n): " force_add
+        [[ ! "$force_add" =~ ^[yY]$ ]] && { yellow "已取消"; sleep 1; return; }
+    else green "Socks5 代理可用，出口 IP: $test_result"; fi
+
+    [ -n "$tag_from_url" ] && tag="$tag_from_url" || tag="socks-${server}-${port}"
+    jq -e --arg tag "$tag" '.outbounds[] | select(.tag == $tag)' "$outbound_file" >/dev/null 2>&1 && { red "出站标签 '${tag}' 已存在"; sleep 2; return; }
+    if [ -n "$user" ] && [ -n "$password" ]; then
+        jq --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg user "$user" --arg password "$password" '.outbounds += [{"type":"socks","tag":$tag,"server":$server,"server_port":$port,"username":$user,"password":$password}]' "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+    else
+        jq --arg tag "$tag" --arg server "$server" --argjson port "$port" '.outbounds += [{"type":"socks","tag":$tag,"server":$server,"server_port":$port}]' "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+    fi
+    switch_rules_to_outbound "$tag"; restart_singbox
+    green "\nSocks5 出站 '${tag}' 已添加\n"; sleep 2; warp_manage
+}
+
+add_ss2022_outbound() {
+    clear
+    green "请输入 SS2022 节点链接，例如："
+    yellow "ss://BASE64(method:password)@server:port#名称"
+    reading "SS2022 节点链接: " proxy_url
+    [ -z "$proxy_url" ] && { red "输入为空！"; sleep 1; return; }
+    [[ "$proxy_url" =~ ^ss:// ]] || { red "仅支持 ss:// SS2022 节点链接"; sleep 2; return; }
+
+    after_proto="${proxy_url#ss://}"
+    if [[ "$after_proto" == *"#"* ]]; then tag_from_url="${after_proto##*#}"; after_proto="${after_proto%%#*}"; else tag_from_url=""; fi
+    [[ "$after_proto" == *"@"* ]] || { red "SS2022 链接格式错误：缺少 @"; sleep 2; return; }
+    userinfo="${after_proto%%@*}"; host_port="${after_proto##*@}"
+    decoded=$(printf '%s' "$userinfo" | base64 -d 2>/dev/null)
+    [ -z "$decoded" ] && decoded=$(printf '%s' "$userinfo" | base64 -d -i 2>/dev/null)
+    [ -z "$decoded" ] || [[ "$decoded" != *":"* ]] && { red "无法解析 SS2022 method/password"; sleep 2; return; }
+    ss_method="${decoded%%:*}"; ss_password="${decoded#*:}"
+    case "$ss_method" in 2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) ;; *) red "不是支持的 SS2022 加密方式: ${ss_method}"; sleep 2; return ;; esac
+
+    if [[ "$host_port" =~ ^\[([0-9A-Fa-f:]+)\]:([0-9]+)$ ]]; then server="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"; else server="${host_port%:*}"; port="${host_port##*:}"; fi
+    [ -z "$server" ] || [ -z "$port" ] && { red "格式错误：缺少IP/域名或端口"; sleep 2; return; }
+    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || { red "端口无效"; sleep 2; return; }
+
+    key_len=$(printf '%s' "$ss_password" | base64 -d 2>/dev/null | wc -c | tr -d ' ')
+    case "$ss_method" in 2022-blake3-aes-128-gcm) expected_len=16 ;; *) expected_len=32 ;; esac
+    [ "$key_len" = "$expected_len" ] || { red "SS2022 密钥长度错误：${ss_method} 需要 ${expected_len} 字节，当前 ${key_len} 字节"; sleep 3; return; }
+
+    [ -n "$tag_from_url" ] && tag="$tag_from_url" || tag="ss2022-${server}-${port}"
+    jq -e --arg tag "$tag" '.outbounds[] | select(.tag == $tag)' "$outbound_file" >/dev/null 2>&1 && { red "出站标签 '${tag}' 已存在"; sleep 2; return; }
+    jq --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg method "$ss_method" --arg password "$ss_password" '.outbounds += [{"type":"shadowsocks","tag":$tag,"server":$server,"server_port":$port,"method":$method,"password":$password}]' "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+
+    switch_rules_to_outbound "$tag"; restart_singbox
+    green "\nSS2022 出站 '${tag}' 已添加\n"; sleep 2; warp_manage
+}
+
+switch_rules_to_outbound() {
+    local tag="$1"
+    if jq -e '.route.rules | length > 0' "$route_file" >/dev/null 2>&1; then
+        jq --arg tag "$tag" '.route.rules[].outbound = $tag' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+        yellow "已将现有分流规则出站切换为 '${tag}'。"
+    fi
+}
 
 delete_socks5_proxy() {
     clear
-    green "当前可用出站列表:"
-    local out_list=$(jq -r '[.outbounds[] | select(.tag != "direct")] | to_entries | .[] | "\(.key+1). \(.value.tag) [\(.value.type)]"' "$outbound_file" 2>/dev/null)
-    [ -z "$out_list" ] && { yellow "没有可删除的出站。"; sleep 2; return; }
-    echo "$out_list"
-
-    reading "输入要删除的出站编号或标签: " del_input
+    green "当前可用 Socks5 / SS2022 出站列表:"
+    local out_list=$(jq -r '[.outbounds[] | select(.tag != "direct" and .tag != "wireguard-out" and (.type == "socks" or .type == "shadowsocks"))] | to_entries | .[] | "\(.key+1). \(.value.tag) [\(.value.type)]"' "$outbound_file" 2>/dev/null)
+    [ -z "$out_list" ] && { yellow "没有可删除的 Socks5 / SS2022 出站。"; sleep 2; return; }
+    echo "$out_list"; reading "输入要删除的出站编号或标签: " del_input
     if [[ "$del_input" =~ ^[0-9]+$ ]]; then
-        tag=$(jq -r --arg idx "$del_input" '.outbounds | map(select(.tag != "direct")) | .[($idx | tonumber)-1].tag // empty' "$outbound_file")
+        tag=$(jq -r --arg idx "$del_input" '[.outbounds[] | select(.tag != "direct" and .tag != "wireguard-out" and (.type == "socks" or .type == "shadowsocks"))] | .[($idx | tonumber)-1].tag // empty' "$outbound_file")
         [ -z "$tag" ] && { red "编号无效！"; sleep 1; return; }
     else
         tag="$del_input"
-        jq -e --arg tag "$tag" '.outbounds[] | select(.tag == $tag)' "$outbound_file" > /dev/null 2>&1 || { red "标签 '${tag}' 不存在！"; sleep 1; return; }
+        jq -e --arg tag "$tag" '.outbounds[] | select(.tag == $tag and (.type == "socks" or .type == "shadowsocks"))' "$outbound_file" >/dev/null 2>&1 || { red "Socks5 / SS2022 出站标签 '${tag}' 不存在！"; sleep 1; return; }
     fi
-    [ "$tag" == "wireguard-out" ] && { red "wireguard-out 为系统内置，不可删除！"; sleep 2; return; }
-
     jq --arg tag "$tag" 'del(.outbounds[] | select(.tag == $tag))' "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
     jq --arg tag "$tag" '.route.rules = [.route.rules[] | select(.outbound != $tag)]' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
-
-    restart_singbox
-    green "${tag} 代理出站已删除。"
-    sleep 1
+    restart_singbox; green "${tag} Socks5 / SS2022 出站已删除。"; sleep 1
 }
 
 # ============================================================
