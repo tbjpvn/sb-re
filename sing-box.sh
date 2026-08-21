@@ -1678,6 +1678,13 @@ delete_rule_menu() {
     sleep 1; warp_manage
 }
 
+# URL 解码：处理 ss2022 (SIP002) 链接中密钥/用户名部分常见的 %XX 百分号编码
+# 例如 %2B -> +  %3D -> =  （注意：不把 '+' 转成空格，避免破坏 base64 内容）
+urldecode() {
+    local data="${1//%/\\x}"
+    printf '%b' "$data"
+}
+
 add_socks5_proxy() {
     clear
     reading "请输入代理URL (支持socks://,socks5://,http://,ss://(ss2022) 支持v2rayN导出的节点链接): " proxy_url
@@ -1711,6 +1718,9 @@ add_socks5_proxy() {
             user="${decoded%%:*}"; password="${decoded#*:}"
         elif [[ "$user_pass" == *":"* ]]; then
             user="${user_pass%%:*}"; password="${user_pass#*:}"
+            # SIP002/ss2022 明文格式：userinfo 里的 +、= 等特殊字符可能做了 %XX 百分号编码，需解码
+            user=$(urldecode "$user")
+            password=$(urldecode "$password")
         else
             user="$user_pass"
         fi
