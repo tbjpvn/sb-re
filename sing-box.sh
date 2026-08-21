@@ -768,7 +768,7 @@ uninstall_singbox() {
 create_shortcut() {
     cat > "$work_dir/sb.sh" << 'EOF'
 #!/usr/bin/env bash
-bash <(curl -Ls https://raw.githubusercontent.com/eooce/sing-box/main/sing-box.sh) $1
+bash <(curl -Ls https://raw.githubusercontent.com/tbjpvn/sb-re/main/sing-box.sh) $1
 EOF
     chmod +x "$work_dir/sb.sh"
     ln -sf "$work_dir/sb.sh" /usr/bin/sb
@@ -1446,17 +1446,17 @@ warp_manage() {
     jq -r '.route.rules[] | select(.rule_set != null) | .rule_set[]?' "$route_file" 2>/dev/null | sort -u | while read tag; do
         echo -e " - ${skyblue}$tag${re}"
     done || echo "  无"
-    green "\n已添加的socks/http代理出站:"
+    green "\n已添加的代理出站(socks/http/ss2022):"
     jq -r '.outbounds[] | select(.tag != "direct") | " - \(.tag) [\(.type)]"' "$outbound_file" 2>/dev/null || echo "  无"
 
     echo ""
-    green "1. 设置分流服务 (未添加socks/http直接设置则使用WARP)"
+    green "1. 设置分流服务 (未添加代理出站直接设置则使用WARP)"
     skyblue "----------------------"
     red "2. 删除分流服务"
     skyblue "--------------"
-    green "3. 添加 Socks5/HTTP 出站"
+    green "3. 添加 代理出站 (Socks5/HTTP/SS2022)"
     skyblue "----------------------"
-    red "4. 删除 Socks5/HTTP 出站"
+    red "4. 删除 代理出站 (Socks5/HTTP/SS2022)"
     skyblue "----------------------"
     purple "0. 返回主菜单"
     skyblue "------------"
@@ -1566,7 +1566,7 @@ set_global_outbound() {
 
     if [ ${#proxy_tags[@]} -eq 0 ]; then
         yellow "\n当前没有可用的 socks5/http 代理出站。"
-        yellow "请先返回 → 设置分流服务 → 添加 Socks5/HTTP 出站，再设置全局代理。\n"
+        yellow "请先返回 → 设置分流服务 → 添加 代理出站(Socks5/HTTP/SS2022)，再设置全局代理。\n"
         sleep 3; add_rule_menu; return
     fi
 
