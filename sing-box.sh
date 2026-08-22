@@ -2255,14 +2255,34 @@ manage_protocols() {
 
 # 检测并安装 acme.sh
 install_acme() {
-    if [ ! -f "${HOME}/.acme.sh/acme.sh" ]; then
-        yellow "正在安装 acme.sh...\n"
-        curl -s https://get.acme.sh | sh -s email="admin@${domain}" >/dev/null 2>&1
-        if [ ! -f "${HOME}/.acme.sh/acme.sh" ]; then
-            red "acme.sh 安装失败，请检查网络后重试！"
-            return 1
-        fi
+    if [ -f "${HOME}/.acme.sh/acme.sh" ]; then
+        "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1
+        return 0
     fi
+
+    yellow "正在安装 acme.sh...\n"
+    local install_log
+    install_log=$(curl -s https://get.acme.sh | sh -s email="admin@${domain}" 2>&1)
+
+    if [ ! -f "${HOME}/.acme.sh/acme.sh" ]; then
+        yellow "官方源安装失败，尝试使用国内Gitee镜像安装...\n"
+        manage_packages install git >/dev/null 2>&1
+        local tmp_acme_dir
+        tmp_acme_dir=$(mktemp -d)
+        if git clone -q --depth=1 https://gitee.com/neilpang/acme.sh.git "${tmp_acme_dir}/acme.sh" 2>/dev/null; then
+            ( cd "${tmp_acme_dir}/acme.sh" && ./acme.sh --install -m "admin@${domain}" >/dev/null 2>&1 )
+        fi
+        rm -rf "$tmp_acme_dir"
+    fi
+
+    if [ ! -f "${HOME}/.acme.sh/acme.sh" ]; then
+        red "\nacme.sh 安装失败！错误信息如下：\n"
+        echo "$install_log" | tail -15
+        red "\n请检查服务器是否能访问 github.com / get.acme.sh，或手动执行以下命令安装后重试本菜单：\n"
+        yellow "curl https://get.acme.sh | sh -s email=your@email.com\n"
+        return 1
+    fi
+
     "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1
     return 0
 }
