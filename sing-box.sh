@@ -2264,8 +2264,22 @@ install_acme() {
     fi
 
     yellow "正在安装 acme.sh...\n"
+
+    # acme.sh 安装前置检查需要crontab(用于自动续期)，这里尽量装好对应系统的cron服务
+    if command_exists apt; then
+        manage_packages install cron >/dev/null 2>&1
+        systemctl enable --now cron >/dev/null 2>&1
+    elif command_exists dnf || command_exists yum; then
+        manage_packages install cronie >/dev/null 2>&1
+        systemctl enable --now crond >/dev/null 2>&1
+    elif command_exists apk; then
+        manage_packages install dcron >/dev/null 2>&1
+        rc-update add dcron default >/dev/null 2>&1
+        rc-service dcron start >/dev/null 2>&1
+    fi
+
     local install_log
-    install_log=$(curl -s https://get.acme.sh | sh -s email="$acme_email" 2>&1)
+    install_log=$(curl -s https://get.acme.sh | sh -s email="$acme_email" --force 2>&1)
 
     if [ ! -f "${HOME}/.acme.sh/acme.sh" ]; then
         yellow "官方源安装失败，尝试使用Gitee镜像安装...\n"
@@ -2273,7 +2287,7 @@ install_acme() {
         local tmp_acme_dir
         tmp_acme_dir=$(mktemp -d)
         if git clone -q --depth=1 https://gitee.com/neilpang/acme.sh.git "${tmp_acme_dir}/acme.sh" 2>/dev/null; then
-            ( cd "${tmp_acme_dir}/acme.sh" && ./acme.sh --install -m "$acme_email" >/dev/null 2>&1 )
+            ( cd "${tmp_acme_dir}/acme.sh" && ./acme.sh --install -m "$acme_email" --force >/dev/null 2>&1 )
         fi
         rm -rf "$tmp_acme_dir"
     fi
