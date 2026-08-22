@@ -2251,6 +2251,176 @@ manage_protocols() {
     manage_protocols
 }
 
+# ================== 域名证书管理 (Hysteria2 / TUIC5) ==================
+
+# 检测并安装 acme.sh
+install_acme() {
+    if [ ! -f "${HOME}/.acme.sh/acme.sh" ]; then
+        yellow "正在安装 acme.sh...\n"
+        curl -s https://get.acme.sh | sh -s email="admin@${domain}" >/dev/null 2>&1
+        if [ ! -f "${HOME}/.acme.sh/acme.sh" ]; then
+            red "acme.sh 安装失败，请检查网络后重试！"
+            return 1
+        fi
+    fi
+    "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1
+    return 0
+}
+
+# 申请域名证书，成功后将替换hy2和tuic当前使用的bing.com自签证书
+apply_domain_cert() {
+    check_singbox &>/dev/null
+    if [ $? -eq 2 ]; then
+        yellow "sing-box 尚未安装！请先安装 sing-box。"; sleep 2; return
+    fi
+
+    clear; echo ""
+    green "=== 申请域名证书 (用于 Hysteria2 / TUIC5) ===\n"
+    yellow "申请前请确保："
+    yellow "1. 域名已经解析到本机IP"
+    yellow "2. 80端口未被其他程序占用（脚本会临时用80端口完成验证）\n"
+    reading "请输入你要申请证书的域名: " domain
+    if [ -z "$domain" ]; then
+        red "域名不能为空！"; sleep 1; return
+    fi
+
+    yellow "\n正在检测域名解析..."
+    local server_ip4 resolved_ip
+    server_ip4=$(curl -4 -sm 5 ip.sb)
+    resolved_ip=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | head -1)
+    if [ -n "$server_ip4" ] && [ -n "$resolved_ip" ] && [ "$server_ip4" != "$resolved_ip" ]; then
+        red "警告：域名 ${domain} 解析的IP(${resolved_ip}) 与本机IP(${server_ip4}) 不一致！"
+        reading "证书申请大概率会失败，是否仍然继续? (y/n，默认n): " force_continue
+        if [[ "$force_continue" != "y" && "$force_continue" != "Y" ]]; then
+            yellow "已取消申请。"; sleep 1; return
+        fi
+    fi
+
+    manage_packages install socat >/dev/null 2>&1
+    install_acme || { sleep 2; return; }
+    allow_port 80/tcp >/dev/null 2>&1
+
+    local acme="${HOME}/.acme.sh/acme.sh"
+    local nginx_was_running=1
+    check_nginx &>/dev/null; [ $? -eq 0 ] && nginx_was_running=0
+    [ "$nginx_was_running" -eq 0 ] && manage_service "nginx" "stop" >/dev/null 2>&1
+
+    yellow "\n正在申请证书，请稍候...\n"
+    "$acme" --issue -d "$domain" --standalone -k ec-256 --force
+    local issue_result=$?
+
+    [ "$nginx_was_running" -eq 0 ] && manage_service "nginx" "start" >/dev/null 2>&1
+
+    if [ $issue_result -ne 0 ]; then
+        red "\n证书申请失败！请检查域名解析是否生效、80端口是否被占用。\n"
+        sleep 2; return
+    fi
+
+    local reload_cmd="systemctl restart sing-box"
+    command_exists rc-service && reload_cmd="rc-service sing-box restart"
+
+    "$acme" --install-cert -d "$domain" --ecc \
+        --key-file "${work_dir}/private.key" \
+        --fullchain-file "${work_dir}/cert.pem" \
+        --reloadcmd "$reload_cmd"
+
+    if [ $? -ne 0 ] || [ ! -s "${work_dir}/cert.pem" ] || [ ! -s "${work_dir}/private.key" ]; then
+        red "\n证书安装失败！\n"; sleep 2; return
+    fi
+
+    chmod 644 "${work_dir}/cert.pem"
+    chmod 600 "${work_dir}/private.key"
+    echo "$domain" > "${work_dir}/cert_domain.txt"
+
+    restart_singbox
+
+    # 域名证书路径与hy2/tuic原先自签证书路径一致(cert.pem/private.key)，无需改动inbounds.json
+    if [ -f "$client_dir" ]; then
+        sed -i -E "s#(hysteria2://[^?]*\?)sni=[^&]*&insecure=1&pinSHA256=[^&]*#\1sni=${domain}\&insecure=0#" "$client_dir"
+        sed -i -E "s#(tuic://[^?]*\?)sni=[^&]*#\1sni=${domain}#" "$client_dir"
+        sed -i -E "s#(tuic://[^#]*)allow_insecure=1#\1allow_insecure=0#" "$client_dir"
+        base64 -w0 "$client_dir" > "${work_dir}/sub.txt"
+    fi
+
+    green "\n域名证书申请成功！原bing.com自签证书已失效，hysteria2和tuic现已使用域名证书: ${purple}${domain}${re}"
+    yellow "证书路径: ${work_dir}/cert.pem  密钥路径: ${work_dir}/private.key"
+    yellow "acme.sh 已配置自动续期任务，到期前会自动续签证书并重启sing-box。\n"
+    if [ -f "$client_dir" ]; then
+        while IFS= read -r line; do [ -n "$line" ] && yellow "$line"; done < "$client_dir"
+    fi
+}
+
+# 恢复bing.com自签证书（用于回退域名证书）
+restore_selfsigned_cert() {
+    check_singbox &>/dev/null
+    if [ $? -eq 2 ]; then
+        yellow "sing-box 尚未安装！"; sleep 1; return
+    fi
+
+    if [ ! -f "${work_dir}/cert_domain.txt" ]; then
+        yellow "当前未使用域名证书，无需恢复。"; sleep 1; return
+    fi
+
+    local old_domain
+    old_domain=$(cat "${work_dir}/cert_domain.txt")
+    reading "\n确认要停用域名证书(${old_domain})并恢复bing.com自签证书吗？(y/n): " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        yellow "已取消。"; sleep 1; return
+    fi
+
+    openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
+    openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
+    chmod 600 "${work_dir}/private.key"
+
+    [ -f "${HOME}/.acme.sh/acme.sh" ] && "${HOME}/.acme.sh/acme.sh" --remove -d "$old_domain" --ecc >/dev/null 2>&1
+    rm -f "${work_dir}/cert_domain.txt"
+
+    restart_singbox
+
+    local fingerprint
+    fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
+    if [ -f "$client_dir" ]; then
+        sed -i -E "s#(hysteria2://[^?]*\?)sni=[^&]*&insecure=0#\1sni=www.bing.com\&insecure=1\&pinSHA256=${fingerprint}#" "$client_dir"
+        sed -i -E "s#(tuic://[^?]*\?)sni=[^&]*#\1sni=www.bing.com#" "$client_dir"
+        sed -i -E "s#(tuic://[^#]*)allow_insecure=0#\1allow_insecure=1#" "$client_dir"
+        base64 -w0 "$client_dir" > "${work_dir}/sub.txt"
+    fi
+
+    green "\n已恢复为bing.com自签证书\n"
+}
+
+# 域名证书管理菜单
+manage_cert() {
+    check_singbox &>/dev/null
+    if [ $? -eq 2 ]; then
+        yellow "sing-box 尚未安装！请先安装 sing-box。"; sleep 2; menu; return
+    fi
+
+    clear; echo ""
+    green "=== 域名证书管理 (Hysteria2 / TUIC5) ===\n"
+    if [ -f "${work_dir}/cert_domain.txt" ]; then
+        green "当前证书状态: 域名证书 (${purple}$(cat "${work_dir}/cert_domain.txt")${re})"
+    else
+        yellow "当前证书状态: bing.com 自签证书"
+    fi
+    echo ""
+    green "1. 申请/更换域名证书"
+    red   "2. 恢复自签证书"
+    skyblue "-----------------------------"
+    purple "0. 返回主菜单"
+    skyblue "-----------------------------"
+    reading "请输入选择: " cert_choice
+    echo ""
+    case "${cert_choice}" in
+        1) apply_domain_cert ;;
+        2) restore_selfsigned_cert ;;
+        0) menu; return ;;
+        *) red "无效的选项！" ;;
+    esac
+    read -n 1 -s -r -p $'\n\033[1;91m按任意键返回域名证书管理菜单...\033[0m\n'
+    manage_cert
+}
+
 # 主菜单
 menu() {
     singbox_status=$(check_singbox 2>/dev/null)
@@ -2277,8 +2447,9 @@ menu() {
     green "8. WARP分流管理"
     echo "==============="
     green "9. 增加/删除协议"
+    green "10. 域名证书管理(hy2/tuic)"
     echo "==============="
-    purple "10. ssh综合工具箱"
+    purple "11. ssh综合工具箱"
     echo "==============="
     red "0. 退出脚本"
     echo "==========="
@@ -2325,7 +2496,7 @@ case "$1" in
         # 无参数：进入交互式主菜单
         while true; do
             menu
-            reading "请输入选择(0-10): " choice 
+            reading "请输入选择(0-11): " choice 
             echo ""
             need_pause=true  
             case "${choice}" in
@@ -2360,14 +2531,15 @@ case "$1" in
                 7)  disable_open_sub;   need_pause=true ;;
                 8)  warp_manage;        need_pause=false ;;
                 9)  manage_protocols;   need_pause=false ;;
-                10)
+                10) manage_cert;        need_pause=false ;;
+                11)
                     clear
                     bash <(curl -Ls ssh_tool.eooce.com)
                     need_pause=false
                     ;;
                 0)  exit 0 ;;       
                 *)
-                    red "无效的选项，请输入 0-10"
+                    red "无效的选项，请输入 0-11"
                     need_pause=true
                     ;;
             esac
