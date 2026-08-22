@@ -2255,6 +2255,9 @@ manage_protocols() {
 
 # 检测并安装 acme.sh
 install_acme() {
+    local acme_email="$1"
+    [ -z "$acme_email" ] && acme_email="admin@gmail.com"
+
     if [ -f "${HOME}/.acme.sh/acme.sh" ]; then
         "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1
         return 0
@@ -2262,15 +2265,15 @@ install_acme() {
 
     yellow "正在安装 acme.sh...\n"
     local install_log
-    install_log=$(curl -s https://get.acme.sh | sh -s email="admin@${domain}" 2>&1)
+    install_log=$(curl -s https://get.acme.sh | sh -s email="$acme_email" 2>&1)
 
     if [ ! -f "${HOME}/.acme.sh/acme.sh" ]; then
-        yellow "官方源安装失败，尝试使用国内Gitee镜像安装...\n"
+        yellow "官方源安装失败，尝试使用Gitee镜像安装...\n"
         manage_packages install git >/dev/null 2>&1
         local tmp_acme_dir
         tmp_acme_dir=$(mktemp -d)
         if git clone -q --depth=1 https://gitee.com/neilpang/acme.sh.git "${tmp_acme_dir}/acme.sh" 2>/dev/null; then
-            ( cd "${tmp_acme_dir}/acme.sh" && ./acme.sh --install -m "admin@${domain}" >/dev/null 2>&1 )
+            ( cd "${tmp_acme_dir}/acme.sh" && ./acme.sh --install -m "$acme_email" >/dev/null 2>&1 )
         fi
         rm -rf "$tmp_acme_dir"
     fi
@@ -2278,7 +2281,7 @@ install_acme() {
     if [ ! -f "${HOME}/.acme.sh/acme.sh" ]; then
         red "\nacme.sh 安装失败！错误信息如下：\n"
         echo "$install_log" | tail -15
-        red "\n请检查服务器是否能访问 github.com / get.acme.sh，或手动执行以下命令安装后重试本菜单：\n"
+        red "\n请检查网络后重试，或手动执行以下命令安装后重试本菜单：\n"
         yellow "curl https://get.acme.sh | sh -s email=your@email.com\n"
         return 1
     fi
@@ -2303,6 +2306,8 @@ apply_domain_cert() {
     if [ -z "$domain" ]; then
         red "域名不能为空！"; sleep 1; return
     fi
+    reading "请输入联系邮箱 (回车默认使用 admin@gmail.com): " cert_email
+    [ -z "$cert_email" ] && cert_email="admin@gmail.com"
 
     yellow "\n正在检测域名解析..."
     local server_ip4 resolved_ip
@@ -2317,7 +2322,7 @@ apply_domain_cert() {
     fi
 
     manage_packages install socat >/dev/null 2>&1
-    install_acme || { sleep 2; return; }
+    install_acme "$cert_email" || { sleep 2; return; }
     allow_port 80/tcp >/dev/null 2>&1
 
     local acme="${HOME}/.acme.sh/acme.sh"
