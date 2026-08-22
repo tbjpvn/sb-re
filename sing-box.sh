@@ -2321,18 +2321,30 @@ apply_domain_cert() {
     allow_port 80/tcp >/dev/null 2>&1
 
     local acme="${HOME}/.acme.sh/acme.sh"
+
+    # 尽量彻底释放80端口，避免被其他残留服务(nginx/apache/caddy/其他面板等)占用导致验证失败
     local nginx_was_running=1
     check_nginx &>/dev/null; [ $? -eq 0 ] && nginx_was_running=0
     [ "$nginx_was_running" -eq 0 ] && manage_service "nginx" "stop" >/dev/null 2>&1
+    for svc in apache2 httpd caddy reality-80; do
+        command_exists systemctl && systemctl stop "$svc" >/dev/null 2>&1
+        command_exists rc-service && rc-service "$svc" stop >/dev/null 2>&1
+    done
+    fuser -k -9 80/tcp >/dev/null 2>&1
+    sleep 1
 
     yellow "\n正在申请证书，请稍候...\n"
-    "$acme" --issue -d "$domain" --standalone -k ec-256 --force
+    local issue_log
+    issue_log=$("$acme" --issue -d "$domain" --standalone --listen-v6 -k ec-256 --force \
+        --pre-hook "systemctl stop nginx >/dev/null 2>&1; rc-service nginx stop >/dev/null 2>&1; fuser -k -9 80/tcp >/dev/null 2>&1; true" \
+        --post-hook "true" 2>&1)
     local issue_result=$?
+    echo "$issue_log" | tail -20
 
     [ "$nginx_was_running" -eq 0 ] && manage_service "nginx" "start" >/dev/null 2>&1
 
     if [ $issue_result -ne 0 ]; then
-        red "\n证书申请失败！请检查域名解析是否生效、80端口是否被占用。\n"
+        red "\n证书申请失败！以上是acme.sh的详细输出，请检查域名解析是否生效、80端口是否仍被占用。\n"
         sleep 2; return
     fi
 
