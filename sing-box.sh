@@ -2421,6 +2421,182 @@ manage_cert() {
     manage_cert
 }
 
+# ================== 出站 IPv4/IPv6 优先级设置 ==================
+
+# 修改出站IPv4/IPv6优先级(通过sing-box DNS解析策略控制出站走v4还是v6)
+manage_outbound_strategy() {
+    check_singbox &>/dev/null
+    if [ $? -eq 2 ]; then
+        yellow "sing-box 尚未安装！请先安装 sing-box。"; sleep 2; menu; return
+    fi
+
+    local dns_file="${conf_dir}/dns.json"
+    local current_strategy
+    current_strategy=$(jq -r '.dns.strategy // "未设置"' "$dns_file" 2>/dev/null)
+
+    clear; echo ""
+    green "=== 出站 IPv4/IPv6 优先级设置 ===\n"
+    green "当前策略: ${purple}${current_strategy}${re}\n"
+    green "1. V4 only 出站 (ipv4_only，只使用IPv4出站)"
+    skyblue "-----------------------------"
+    green "2. V4 优先出站  (prefer_ipv4，优先IPv4，无IPv4再用IPv6)"
+    skyblue "-----------------------------"
+    green "3. V6 only 出站 (ipv6_only，只使用IPv6出站)"
+    skyblue "-----------------------------"
+    green "4. V6 优先出站  (prefer_ipv6，优先IPv6，无IPv6再用IPv4)"
+    skyblue "-----------------------------"
+    purple "0. 返回主菜单"
+    skyblue "-----------------------------"
+    reading "请输入选择: " strategy_choice
+    echo ""
+
+    local new_strategy=""
+    case "${strategy_choice}" in
+        1) new_strategy="ipv4_only" ;;
+        2) new_strategy="prefer_ipv4" ;;
+        3) new_strategy="ipv6_only" ;;
+        4) new_strategy="prefer_ipv6" ;;
+        0) menu; return ;;
+        *)
+            red "无效的选项！"
+            read -n 1 -s -r -p $'\n\033[1;91m按任意键返回...\033[0m\n'
+            manage_outbound_strategy; return
+            ;;
+    esac
+
+    jq --arg s "$new_strategy" '.dns.strategy = $s' "$dns_file" > "${dns_file}.tmp" && mv "${dns_file}.tmp" "$dns_file"
+    restart_singbox
+    green "\n出站IPv4/IPv6优先级已设置为：${purple}${new_strategy}${re}\n"
+    read -n 1 -s -r -p $'\n\033[1;91m按任意键返回主菜单...\033[0m\n'
+    menu
+}
+
+# ================== sing-box 内核查看与更新 ==================
+
+# 下载并替换指定版本的sing-box内核，成功则重启服务，失败自动回滚
+update_singbox_core() {
+    local target_version="$1"
+    local label="$2"
+
+    if [ -z "$target_version" ]; then
+        red "未获取到有效的版本号！"; sleep 1; return 1
+    fi
+
+    local ARCH_RAW ARCH
+    ARCH_RAW=$(uname -m)
+    case "${ARCH_RAW}" in
+        'x86_64' | 'amd64')  ARCH='amd64' ;;
+        'x86' | 'i686' | 'i386') ARCH='386' ;;
+        'aarch64' | 'arm64') ARCH='arm64' ;;
+        'armv7l')  ARCH='armv7' ;;
+        's390x')   ARCH='s390x' ;;
+        *) red "不支持的架构: ${ARCH_RAW}"; return 1 ;;
+    esac
+
+    local tmp_dir pkg_name dl_url
+    tmp_dir=$(mktemp -d)
+    pkg_name="sing-box-${target_version}-linux-${ARCH}"
+    dl_url="https://github.com/SagerNet/sing-box/releases/download/v${target_version}/${pkg_name}.tar.gz"
+
+    yellow "\n正在下载 ${label} v${target_version} (${ARCH})...\n"
+    if ! curl -sL --fail -o "${tmp_dir}/${pkg_name}.tar.gz" "$dl_url"; then
+        red "下载失败！请确认版本号 v${target_version} 是否存在，以及是否有对应架构(${ARCH})的发行包。\n"
+        rm -rf "$tmp_dir"; return 1
+    fi
+
+    tar -xzf "${tmp_dir}/${pkg_name}.tar.gz" -C "$tmp_dir" 2>/dev/null
+    if [ ! -f "${tmp_dir}/${pkg_name}/sing-box" ]; then
+        red "解压失败或未找到sing-box二进制文件！\n"
+        rm -rf "$tmp_dir"; return 1
+    fi
+
+    cp "${work_dir}/sing-box" "${work_dir}/sing-box.bak" 2>/dev/null
+    stop_singbox >/dev/null 2>&1
+    cp "${tmp_dir}/${pkg_name}/sing-box" "${work_dir}/sing-box"
+    chmod +x "${work_dir}/sing-box"
+    rm -rf "$tmp_dir"
+
+    local new_ver
+    new_ver=$("${work_dir}/sing-box" version 2>/dev/null | head -1)
+    if [ -z "$new_ver" ]; then
+        red "\n新内核校验失败，正在回滚到旧版本...\n"
+        [ -f "${work_dir}/sing-box.bak" ] && mv "${work_dir}/sing-box.bak" "${work_dir}/sing-box" && chmod +x "${work_dir}/sing-box"
+        restart_singbox
+        return 1
+    fi
+
+    rm -f "${work_dir}/sing-box.bak"
+    restart_singbox
+    green "\nsing-box 内核已更新为 ${label}：${purple}${new_ver}${re}\n"
+    return 0
+}
+
+# sing-box内核管理菜单
+manage_singbox_core() {
+    check_singbox &>/dev/null
+    if [ $? -eq 2 ]; then
+        yellow "sing-box 尚未安装！请先安装 sing-box。"; sleep 2; menu; return
+    fi
+
+    clear; echo ""
+    green "=== sing-box 内核查看与更新 ===\n"
+    local cur_ver
+    cur_ver=$("${work_dir}/sing-box" version 2>/dev/null | head -1)
+    green "当前内核版本: ${purple}${cur_ver:-未知}${re}\n"
+    green "1. 查看当前内核版本详情"
+    skyblue "-----------------------------"
+    green "2. 更新到最新稳定正式版"
+    skyblue "-----------------------------"
+    green "3. 更新到最新测试版(Beta/RC/Pre-release)"
+    skyblue "-----------------------------"
+    green "4. 更新到指定版本"
+    skyblue "-----------------------------"
+    purple "0. 返回主菜单"
+    skyblue "-----------------------------"
+    reading "请输入选择: " core_choice
+    echo ""
+    case "${core_choice}" in
+        1)
+            "${work_dir}/sing-box" version
+            ;;
+        2)
+            yellow "正在获取最新稳定正式版信息...\n"
+            local latest_version
+            latest_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==false and .draft==false)][0].tag_name // empty' | sed 's/^v//')
+            if [ -z "$latest_version" ]; then
+                red "获取版本信息失败，请检查网络！\n"
+            else
+                reading "即将更新到最新稳定版 v${latest_version}，确认继续？(y/n): " confirm
+                [[ "$confirm" == "y" || "$confirm" == "Y" ]] && update_singbox_core "$latest_version" "最新稳定正式版"
+            fi
+            ;;
+        3)
+            yellow "正在获取最新测试版信息...\n"
+            local beta_version
+            beta_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==true and .draft==false)][0].tag_name // empty' | sed 's/^v//')
+            if [ -z "$beta_version" ]; then
+                red "未获取到测试版信息（可能当前没有可用的测试版）！\n"
+            else
+                reading "即将更新到最新测试版 v${beta_version}，确认继续？(y/n): " confirm
+                [[ "$confirm" == "y" || "$confirm" == "Y" ]] && update_singbox_core "$beta_version" "最新测试版"
+            fi
+            ;;
+        4)
+            reading "请输入要更新到的版本号 (如 1.11.4，不需要带v前缀): " spec_version
+            spec_version=$(echo "$spec_version" | sed 's/^v//')
+            if [ -z "$spec_version" ]; then
+                red "版本号不能为空！\n"
+            else
+                update_singbox_core "$spec_version" "指定版本"
+            fi
+            ;;
+        0) menu; return ;;
+        *) red "无效的选项！" ;;
+    esac
+    read -n 1 -s -r -p $'\n\033[1;91m按任意键返回内核管理菜单...\033[0m\n'
+    manage_singbox_core
+}
+
 # 主菜单
 menu() {
     singbox_status=$(check_singbox 2>/dev/null)
@@ -2448,8 +2624,10 @@ menu() {
     echo "==============="
     green "9. 增加/删除协议"
     green "10. 域名证书管理(hy2/tuic)"
+    green "11. 出站IPv4/IPv6优先级"
+    green "12. sing-box内核查看/更新"
     echo "==============="
-    purple "11. ssh综合工具箱"
+    purple "13. ssh综合工具箱"
     echo "==============="
     red "0. 退出脚本"
     echo "==========="
@@ -2496,7 +2674,7 @@ case "$1" in
         # 无参数：进入交互式主菜单
         while true; do
             menu
-            reading "请输入选择(0-11): " choice 
+            reading "请输入选择(0-13): " choice 
             echo ""
             need_pause=true  
             case "${choice}" in
@@ -2532,14 +2710,16 @@ case "$1" in
                 8)  warp_manage;        need_pause=false ;;
                 9)  manage_protocols;   need_pause=false ;;
                 10) manage_cert;        need_pause=false ;;
-                11)
+                11) manage_outbound_strategy; need_pause=false ;;
+                12) manage_singbox_core; need_pause=false ;;
+                13)
                     clear
                     bash <(curl -Ls ssh_tool.eooce.com)
                     need_pause=false
                     ;;
                 0)  exit 0 ;;       
                 *)
-                    red "无效的选项，请输入 0-11"
+                    red "无效的选项，请输入 0-13"
                     need_pause=true
                     ;;
             esac
