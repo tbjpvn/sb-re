@@ -389,8 +389,7 @@ EOF
   "outbounds": [
     {
       "type": "direct",
-      "tag": "direct",
-      "domain_strategy": "$dns_strategy"
+      "tag": "direct"
     }
   ]
 }
@@ -1610,10 +1609,7 @@ restore_direct_outbound() {
 
     # 恢复 outbounds.json 中的 direct 出站（不存在则插入到数组最前面）
     if ! jq -e '.outbounds[] | select(.tag == "direct")' "$outbound_file" > /dev/null 2>&1; then
-        jq --arg s "$cur_dns_strategy" '.outbounds = [{"type": "direct", "tag": "direct", "domain_strategy": $s}] + .outbounds' \
-            "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
-    else
-        jq --arg s "$cur_dns_strategy" '(.outbounds[] | select(.tag == "direct")) .domain_strategy = $s' \
+        jq '.outbounds = [{"type": "direct", "tag": "direct"}] + .outbounds' \
             "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
     fi
 
@@ -2538,18 +2534,14 @@ manage_outbound_strategy() {
     # 1. 更新 dns.json 中的默认策略（供dns模块内部解析使用）
     jq --arg s "$new_strategy" '.dns.strategy = $s' "$dns_file" > "${dns_file}.tmp" && mv "${dns_file}.tmp" "$dns_file"
 
-    # 2. 关键：更新 direct 出站的 domain_strategy（真正决定出站拨号时优先用v4还是v6）
-    if [ -f "$outbound_file" ]; then
-        if jq -e '.outbounds[] | select(.tag == "direct")' "$outbound_file" > /dev/null 2>&1; then
-            jq --arg s "$new_strategy" '(.outbounds[] | select(.tag == "direct")) .domain_strategy = $s' \
-                "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
-        else
-            jq --arg s "$new_strategy" '.outbounds = [{"type": "direct", "tag": "direct", "domain_strategy": $s}] + .outbounds' \
-                "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
-        fi
+    # 2. 清理 direct 出站上可能残留的旧版 domain_strategy 字段
+    #    （sing-box 1.12.0+ 已废弃该拨号字段写法，不清理会导致新内核 FATAL 拒绝启动）
+    if [ -f "$outbound_file" ] && jq -e '.outbounds[] | select(.tag == "direct") | has("domain_strategy")' "$outbound_file" 2>/dev/null | grep -q true; then
+        jq '(.outbounds[] | select(.tag == "direct")) |= del(.domain_strategy)' \
+            "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
     fi
 
-    # 3. 同步更新 route.json 中的 default_domain_resolver（兼容 sing-box 1.11+ 的新出站解析机制）
+    # 3. 关键：更新 route.json 中的 default_domain_resolver（sing-box 1.11+ 的正式出站解析机制，未废弃）
     if [ -f "$route_file" ]; then
         jq --arg s "$new_strategy" \
             '.route.default_domain_resolver = {"server": "local", "strategy": $s}' \
@@ -2616,8 +2608,36 @@ update_singbox_core() {
         return 1
     fi
 
-    rm -f "${work_dir}/sing-box.bak"
+    # 关键：新内核可能存在配置不兼容/破坏性变更（如废弃字段被移除），
+    # 仅校验 version 命令不能代表配置能被新内核正常加载，必须实际校验配置文件
+    yellow "正在校验现有配置与新内核的兼容性...\n"
+    local check_output
+    check_output=$("${work_dir}/sing-box" check -C "${conf_dir}" 2>&1)
+    if [ $? -ne 0 ]; then
+        red "\n新内核 ${new_ver} 无法加载现有配置，可能存在破坏性变更，正在回滚到旧版本...\n"
+        echo "$check_output" | head -20
+        if [ -f "${work_dir}/sing-box.bak" ]; then
+            mv "${work_dir}/sing-box.bak" "${work_dir}/sing-box" && chmod +x "${work_dir}/sing-box"
+        fi
+        restart_singbox
+        yellow "\n已回滚到更新前的内核版本。如需使用新内核，请根据上方报错信息手动调整 ${conf_dir} 下的配置文件后再重试。\n"
+        return 1
+    fi
+
     restart_singbox
+    sleep 2
+    check_singbox &>/dev/null
+    if [ $? -ne 0 ]; then
+        red "\n新内核 ${new_ver} 配置校验通过，但服务实际启动失败，正在回滚到旧版本...\n"
+        if [ -f "${work_dir}/sing-box.bak" ]; then
+            mv "${work_dir}/sing-box.bak" "${work_dir}/sing-box" && chmod +x "${work_dir}/sing-box"
+        fi
+        restart_singbox
+        yellow "\n已回滚到更新前的内核版本，请检查 ${work_dir}/sb.log 或 journalctl -u sing-box 获取详细报错。\n"
+        return 1
+    fi
+
+    rm -f "${work_dir}/sing-box.bak"
     green "\nsing-box 内核已更新为 ${label}：${purple}${new_ver}${re}\n"
     return 0
 }
