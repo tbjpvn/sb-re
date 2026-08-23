@@ -2337,11 +2337,27 @@ apply_domain_cert() {
     [ -z "$cert_email" ] && cert_email="admin@gmail.com"
 
     yellow "\n正在检测域名解析..."
-    local server_ip4 resolved_ip
+    local server_ip4 server_ip6 resolved_ip4 resolved_ip6
     server_ip4=$(curl -4 -sm 5 ip.sb)
-    resolved_ip=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | head -1)
-    if [ -n "$server_ip4" ] && [ -n "$resolved_ip" ] && [ "$server_ip4" != "$resolved_ip" ]; then
-        red "警告：域名 ${domain} 解析的IP(${resolved_ip}) 与本机IP(${server_ip4}) 不一致！"
+    server_ip6=$(curl -6 -sm 5 ip.sb)
+    resolved_ip4=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | head -1)
+    resolved_ip6=$(getent ahostsv6 "$domain" 2>/dev/null | awk '{print $1}' | head -1)
+    if [ -n "$server_ip4" ] && [ -n "$resolved_ip4" ] && [ "$server_ip4" != "$resolved_ip4" ]; then
+        red "警告：域名 ${domain} 的A记录(${resolved_ip4}) 与本机IPv4(${server_ip4}) 不一致！"
+        reading "证书申请大概率会失败，是否仍然继续? (y/n，默认n): " force_continue
+        if [[ "$force_continue" != "y" && "$force_continue" != "Y" ]]; then
+            yellow "已取消申请。"; sleep 1; return
+        fi
+    fi
+    if [ -n "$server_ip6" ] && [ -n "$resolved_ip6" ] && [ "$server_ip6" != "$resolved_ip6" ]; then
+        red "警告：域名 ${domain} 的AAAA记录(${resolved_ip6}) 与本机IPv6(${server_ip6}) 不一致！"
+        reading "证书申请大概率会失败，是否仍然继续? (y/n，默认n): " force_continue
+        if [[ "$force_continue" != "y" && "$force_continue" != "Y" ]]; then
+            yellow "已取消申请。"; sleep 1; return
+        fi
+    fi
+    if [ -z "$resolved_ip4" ] && [ -z "$resolved_ip6" ]; then
+        red "警告：域名 ${domain} 未检测到任何A/AAAA解析记录！"
         reading "证书申请大概率会失败，是否仍然继续? (y/n，默认n): " force_continue
         if [[ "$force_continue" != "y" && "$force_continue" != "Y" ]]; then
             yellow "已取消申请。"; sleep 1; return
@@ -2367,7 +2383,7 @@ apply_domain_cert() {
 
     yellow "\n正在申请证书，请稍候...\n"
     local issue_log
-    issue_log=$("$acme" --issue -d "$domain" --standalone --listen-v6 -k ec-256 --force \
+    issue_log=$("$acme" --issue -d "$domain" --standalone --listen-v6 --local-address :: -k ec-256 --force \
         --pre-hook "systemctl stop nginx >/dev/null 2>&1; rc-service nginx stop >/dev/null 2>&1; fuser -k -9 80/tcp >/dev/null 2>&1; true" \
         --post-hook "true" 2>&1)
     local issue_result=$?
