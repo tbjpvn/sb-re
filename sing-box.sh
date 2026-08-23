@@ -26,6 +26,7 @@ server_name="sing-box"
 work_dir="/etc/sing-box"
 conf_dir="${work_dir}/conf"
 client_dir="${work_dir}/url.txt"
+SCRIPT_RAW_URL="https://raw.githubusercontent.com/tbjpvn/sb-re/main/sing-box.sh"
 export vless_port=${PORT:-$(shuf -i 1000-65000 -n 1)}
 export CFIP=${CFIP:-'cdns.doon.eu.org'} 
 export ARGO_PORT=${ARGO_PORT:-'8001'} 
@@ -770,9 +771,9 @@ uninstall_singbox() {
 
 # 创建快捷指令
 create_shortcut() {
-    cat > "$work_dir/sb.sh" << 'EOF'
+    cat > "$work_dir/sb.sh" << EOF
 #!/usr/bin/env bash
-bash <(curl -Ls https://raw.githubusercontent.com/tbjpvn/sb-re/main/sing-box.sh) $1
+bash <(curl -Ls ${SCRIPT_RAW_URL}) \$1
 EOF
     chmod +x "$work_dir/sb.sh"
     ln -sf "$work_dir/sb.sh" /usr/bin/sb
@@ -784,6 +785,84 @@ change_hosts() {
     sh -c 'echo "0 0" > /proc/sys/net/ipv4/ping_group_range'
     sed -i '1s/.*/127.0.0.1   localhost/' /etc/hosts
     sed -i '2s/.*/::1         localhost/' /etc/hosts
+}
+
+# 同步Github最新脚本：下载->校验->备份旧版本->覆盖
+update_self_script() {
+    clear
+    green "\n=== 同步Github最新脚本 ===\n"
+
+    # 确定脚本本地落盘路径：通过 bash <(curl ...) 或 sb 快捷指令运行时 $0 不是真实文件，
+    # 统一固定落盘到 work_dir 下，作为“本地持久化副本”的唯一位置
+    local self_path
+    self_path=$(readlink -f "$0" 2>/dev/null)
+    if [ -z "$self_path" ] || [ ! -f "$self_path" ] || [[ "$self_path" == /dev/fd/* ]] || [[ "$self_path" == /proc/self/fd/* ]]; then
+        self_path="${work_dir}/sing-box.sh"
+        yellow "检测到当前是通过管道/临时方式运行，更新后的脚本将固定保存到：${purple}${self_path}${re}\n"
+    fi
+
+    yellow "正在从Github拉取最新脚本...\n"
+    local tmp_new="${work_dir}/sing-box.sh.new"
+    mkdir -p "$work_dir"
+    if ! curl -Ls -o "$tmp_new" "$SCRIPT_RAW_URL"; then
+        red "\n下载失败，请检查网络后重试\n"
+        rm -f "$tmp_new"
+        return 1
+    fi
+
+    # 基本健全性检查，避免网络异常/Github报错页把本地脚本覆盖成垃圾文件
+    if [ ! -s "$tmp_new" ]; then
+        red "\n下载到的文件为空，已取消更新\n"
+        rm -f "$tmp_new"
+        return 1
+    fi
+    local new_size
+    new_size=$(wc -c < "$tmp_new")
+    if [ "$new_size" -lt 10000 ]; then
+        red "\n下载到的文件体积异常（仅${new_size}字节），可能不是完整脚本，已取消更新\n"
+        rm -f "$tmp_new"
+        return 1
+    fi
+    local syntax_err
+    syntax_err=$(bash -n "$tmp_new" 2>&1)
+    if [ $? -ne 0 ]; then
+        red "\n新脚本语法校验未通过，已取消更新，错误信息：\n"
+        echo "$syntax_err" | head -20
+        rm -f "$tmp_new"
+        return 1
+    fi
+
+    if [ -f "$self_path" ] && cmp -s "$tmp_new" "$self_path"; then
+        yellow "\n当前已是最新版本，无需更新\n"
+        rm -f "$tmp_new"
+        return 0
+    fi
+
+    # 备份现有版本：询问是否备份，只保留固定一份（用固定文件名覆盖旧备份，不堆积）
+    if [ -f "$self_path" ]; then
+        reading "是否备份当前版本？(y/n，默认y): " backup_choice
+        if [[ -z "$backup_choice" || "$backup_choice" =~ ^[yY]$ ]]; then
+            local backup_path="${self_path}.bak"
+            cp -f "$self_path" "$backup_path"
+            green "已备份旧版本到：${purple}${backup_path}${re}（只保留最近一份，会覆盖上一次的备份）"
+        else
+            yellow "已跳过备份，直接更新"
+        fi
+    fi
+
+    mv -f "$tmp_new" "$self_path"
+    chmod +x "$self_path"
+
+    # 确保 sb 快捷指令存在（其内容每次都会重新拉取最新脚本，这里只是兜底修复指令缺失的情况）
+    [ ! -e /usr/bin/sb ] && [ -f "${work_dir}/sb.sh" ] && ln -sf "${work_dir}/sb.sh" /usr/bin/sb
+
+    green "\n脚本已更新到最新版本，本地保存路径：${purple}${self_path}${re}\n"
+    reading "是否立即重新加载新脚本？(y/n，默认y): " reload_choice
+    if [[ -z "$reload_choice" || "$reload_choice" =~ ^[yY]$ ]]; then
+        exec bash "$self_path"
+    else
+        yellow "\n可稍后手动执行 ${purple}bash ${self_path}${re} 或 ${purple}sb${re} 使用新版本\n"
+    fi
 }
 
 # 非交互静默安装（-i 参数）
@@ -914,7 +993,7 @@ change_config() {
                        "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
                     restart_singbox
                     allow_port $new_port/tcp > /dev/null 2>&1
-                    sed -i 's/\(vless:\/\/[^@]*@[^:]*:\)[0-9]\{1,\}/\1'"$new_port"'/' $client_dir
+                    sed -i -E 's#(vless://[^@]*@(\[[0-9a-fA-F:]+\]|[^:]*)):[0-9]+#\1:'"$new_port"'#' $client_dir
                     base64 -w0 /etc/sing-box/url.txt > /etc/sing-box/sub.txt
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
                     green "\nvless-reality端口已修改成：${purple}$new_port${re}\n"
@@ -927,7 +1006,7 @@ change_config() {
                        "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
                     restart_singbox
                     allow_port $new_port/udp > /dev/null 2>&1
-                    sed -i 's/\(hysteria2:\/\/[^@]*@[^:]*:\)[0-9]\{1,\}/\1'"$new_port"'/' $client_dir
+                    sed -i -E 's#(hysteria2://[^@]*@(\[[0-9a-fA-F:]+\]|[^:]*)):[0-9]+#\1:'"$new_port"'#' $client_dir
                     base64 -w0 $client_dir > /etc/sing-box/sub.txt
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
                     green "\nhysteria2端口已修改为：${purple}${new_port}${re}\n"
@@ -940,7 +1019,7 @@ change_config() {
                        "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
                     restart_singbox
                     allow_port $new_port/udp > /dev/null 2>&1
-                    sed -i 's/\(tuic:\/\/[^@]*@[^:]*:\)[0-9]\{1,\}/\1'"$new_port"'/' $client_dir
+                    sed -i -E 's#(tuic://[^@]*@(\[[0-9a-fA-F:]+\]|[^:]*)):[0-9]+#\1:'"$new_port"'#' $client_dir
                     base64 -w0 $client_dir > /etc/sing-box/sub.txt
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
                     green "\ntuic端口已修改为：${purple}${new_port}${re}\n"
@@ -1739,7 +1818,15 @@ add_socks5_proxy() {
         fi
     fi
 
-    server="${host_port%%:*}"; port="${host_port##*:}"
+    # 正确切分 host:port —— 必须先判断是否为带中括号的 IPv6 地址（如 [2001:db8::1]:8388），
+    # 否则用简单的 %%:* / ##*: 会把 IPv6 地址从第一个冒号处截断，导致 server 字段变成垃圾值
+    if [[ "$host_port" == \[*\]:* ]]; then
+        server="${host_port%%]:*}"
+        server="${server#\[}"
+        port="${host_port##*]:}"
+    else
+        server="${host_port%%:*}"; port="${host_port##*:}"
+    fi
     [ -z "$server" ] || [ -z "$port" ] && { red "格式错误：缺少ip或端口"; sleep 2; return; }
 
     if [ "$outbound_type" = "shadowsocks" ]; then
@@ -1749,6 +1836,10 @@ add_socks5_proxy() {
         yellow "Shadowsocks/ss2022 出站暂不支持在线检测（检测API仅支持socks/http），将直接添加，请自行确认服务器信息无误。"
     else
         [[ "$proto" == "socks" || "$proto" == "socks5" ]] && check_proto="socks5" || check_proto="$proto"
+
+        # 构造URL时用的host：IPv6需要加中括号，否则curl会把地址和端口解析错
+        local server_for_url="$server"
+        [[ "$server" == *:* ]] && server_for_url="[${server}]"
 
         # 判断是否为本地地址，本地地址跳过外部 API 检测，直接用 curl 测试
         local is_local=false
@@ -1762,8 +1853,8 @@ add_socks5_proxy() {
 
         if [ "$is_local" = true ]; then
             # 本地代理：直接用 curl 通过代理访问外网测试连通性
-            yellow "检测到本地代理 ${check_proto}://${server}:${port}，跳过外部API检测，正在用curl测试连通性..."
-            local curl_proxy_url="${check_proto}://${proxy_auth}${server}:${port}"
+            yellow "检测到本地代理 ${check_proto}://${server_for_url}:${port}，跳过外部API检测，正在用curl测试连通性..."
+            local curl_proxy_url="${check_proto}://${proxy_auth}${server_for_url}:${port}"
             local test_result
             test_result=$(curl -s --max-time 8 --proxy "$curl_proxy_url" "https://api.ip.sb/ip" 2>/dev/null)
             if [ -z "$test_result" ]; then
@@ -1775,10 +1866,10 @@ add_socks5_proxy() {
             fi
         else
             # 远程代理：调用外部 API 检测
-            yellow "正在测试代理 ${check_proto}://${server}:${port} ..."
+            yellow "正在测试代理 ${check_proto}://${server_for_url}:${port} ..."
             local api_response
             api_response=$(curl -s --max-time 8 -G \
-                --data-urlencode "proxy=${check_proto}://${proxy_auth}${server}:${port}" \
+                --data-urlencode "proxy=${check_proto}://${proxy_auth}${server_for_url}:${port}" \
                 "https://check.socks5.cmliussss.net/check" 2>/dev/null)
             [ -z "$api_response" ] && { red "API 请求失败"; sleep 2; return; }
 
@@ -2770,6 +2861,8 @@ menu() {
     echo "==============="
     purple "13. ssh综合工具箱"
     echo "==============="
+    green "14. 同步Github最新脚本"
+    echo "==============="
     red "0. 退出脚本"
     echo "==========="
     # ← 去掉 reading，只负责显示
@@ -2815,7 +2908,7 @@ case "$1" in
         # 无参数：进入交互式主菜单
         while true; do
             menu
-            reading "请输入选择(0-13): " choice 
+            reading "请输入选择(0-14): " choice 
             echo ""
             need_pause=true  
             case "${choice}" in
@@ -2858,9 +2951,10 @@ case "$1" in
                     bash <(curl -Ls ssh_tool.eooce.com)
                     need_pause=false
                     ;;
+                14) update_self_script; need_pause=false ;;
                 0)  exit 0 ;;       
                 *)
-                    red "无效的选项，请输入 0-13"
+                    red "无效的选项，请输入 0-14"
                     need_pause=true
                     ;;
             esac
