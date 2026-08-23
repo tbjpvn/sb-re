@@ -1591,7 +1591,21 @@ set_global_outbound() {
     # 从 outbounds.json 中删除 direct 出站，防止流量绕过代理
     jq 'del(.outbounds[] | select(.tag == "direct"))' \
         "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
-    rm -rf ${route_file} ${conf_dir}/endpoints.json
+
+    # 关键修复：之前这里是 rm -rf route.json，从未真正把流量指向选中的出站——
+    # 只是删掉了默认的 direct 出站。sing-box 在没有明确 route.final 时会隐式
+    # 回退使用 outbounds 数组里的第一个出站，跟菜单里选的是哪一个完全无关。
+    # 这就是为什么先添加的出站"能用"，后添加的（哪怕选中了）"不能用"——
+    # 从来没有真正生效过，一直都是第一个出站在承载全部流量。
+    # 现在改为显式清空分流规则并把 final 设为选中的出站。
+    if [ -f "$route_file" ]; then
+        jq --arg out "$selected_out" '.route.rules = [] | .route.final = $out' \
+            "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    else
+        jq -n --arg out "$selected_out" '{"route": {"rules": [], "final": $out}}' > "$route_file"
+    fi
+    rm -f "${conf_dir}/endpoints.json"
+
     restart_singbox
     green "\n已设置全局代理出站：${purple}${selected_out}${re}"
     yellow "所有流量将通过 ${selected_out} 转发，如需恢复请选择「恢复服务器原IP出站」\n"
