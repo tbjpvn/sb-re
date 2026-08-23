@@ -389,7 +389,8 @@ EOF
   "outbounds": [
     {
       "type": "direct",
-      "tag": "direct"
+      "tag": "direct",
+      "domain_strategy": "$dns_strategy"
     }
   ]
 }
@@ -436,7 +437,11 @@ EOF
       {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
     ],
     "rules": [{"rule_set": []}],
-    "final": "direct"
+    "final": "direct",
+    "default_domain_resolver": {
+      "server": "local",
+      "strategy": "$dns_strategy"
+    }
   }
 }
 EOF
@@ -1598,14 +1603,22 @@ set_global_outbound() {
 restore_direct_outbound() {
     yellow "\n正在恢复默认路由配置...\n"
 
+    # 读取当前IPv4/IPv6优先级策略，恢复时保持一致
+    local cur_dns_strategy
+    cur_dns_strategy=$(jq -r '.dns.strategy // "prefer_ipv4"' "${conf_dir}/dns.json" 2>/dev/null)
+    [ -z "$cur_dns_strategy" ] || [ "$cur_dns_strategy" = "null" ] && cur_dns_strategy="prefer_ipv4"
+
     # 恢复 outbounds.json 中的 direct 出站（不存在则插入到数组最前面）
     if ! jq -e '.outbounds[] | select(.tag == "direct")' "$outbound_file" > /dev/null 2>&1; then
-        jq '.outbounds = [{"type": "direct", "tag": "direct"}] + .outbounds' \
+        jq --arg s "$cur_dns_strategy" '.outbounds = [{"type": "direct", "tag": "direct", "domain_strategy": $s}] + .outbounds' \
+            "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+    else
+        jq --arg s "$cur_dns_strategy" '(.outbounds[] | select(.tag == "direct")) .domain_strategy = $s' \
             "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
     fi
 
     # 恢复默认 route.json
-    cat > "${route_file}" << 'EOF'
+    cat > "${route_file}" << EOF
 {
   "route": {
     "rule_set": [
@@ -1620,7 +1633,11 @@ restore_direct_outbound() {
       {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
     ],
     "rules": [{"rule_set": []}],
-    "final": "direct"
+    "final": "direct",
+    "default_domain_resolver": {
+      "server": "local",
+      "strategy": "$cur_dns_strategy"
+    }
   }
 }
 EOF
@@ -2515,7 +2532,30 @@ manage_outbound_strategy() {
             ;;
     esac
 
+    local route_file="${conf_dir}/route.json"
+    local outbound_file="${conf_dir}/outbounds.json"
+
+    # 1. 更新 dns.json 中的默认策略（供dns模块内部解析使用）
     jq --arg s "$new_strategy" '.dns.strategy = $s' "$dns_file" > "${dns_file}.tmp" && mv "${dns_file}.tmp" "$dns_file"
+
+    # 2. 关键：更新 direct 出站的 domain_strategy（真正决定出站拨号时优先用v4还是v6）
+    if [ -f "$outbound_file" ]; then
+        if jq -e '.outbounds[] | select(.tag == "direct")' "$outbound_file" > /dev/null 2>&1; then
+            jq --arg s "$new_strategy" '(.outbounds[] | select(.tag == "direct")) .domain_strategy = $s' \
+                "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+        else
+            jq --arg s "$new_strategy" '.outbounds = [{"type": "direct", "tag": "direct", "domain_strategy": $s}] + .outbounds' \
+                "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+        fi
+    fi
+
+    # 3. 同步更新 route.json 中的 default_domain_resolver（兼容 sing-box 1.11+ 的新出站解析机制）
+    if [ -f "$route_file" ]; then
+        jq --arg s "$new_strategy" \
+            '.route.default_domain_resolver = {"server": "local", "strategy": $s}' \
+            "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    fi
+
     restart_singbox
     green "\n出站IPv4/IPv6优先级已设置为：${purple}${new_strategy}${re}\n"
     read -n 1 -s -r -p $'\n\033[1;91m按任意键返回主菜单...\033[0m\n'
