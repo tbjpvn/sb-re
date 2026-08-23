@@ -2592,6 +2592,18 @@ update_singbox_core() {
         *) red "不支持的架构: ${ARCH_RAW}"; return 1 ;;
     esac
 
+    # Alpine (musl libc) 系统需要额外安装 gcompat 兼容层，
+    # 否则官方 GitHub 发行的 glibc 二进制文件在 Alpine 上会直接无法运行（无任何输出，误判为"内核校验失败"）
+    if [ -f /etc/alpine-release ]; then
+        if ! apk info -e gcompat >/dev/null 2>&1; then
+            yellow "\n检测到 Alpine (musl) 系统，正在安装 glibc 兼容层 gcompat...\n"
+            apk add --no-cache gcompat >/dev/null 2>&1
+            if ! apk info -e gcompat >/dev/null 2>&1; then
+                red "gcompat 安装失败，官方sing-box二进制在Alpine上大概率无法运行，请手动执行: apk add gcompat\n"
+            fi
+        fi
+    fi
+
     local tmp_dir pkg_name dl_url
     tmp_dir=$(mktemp -d)
     pkg_name="sing-box-${target_version}-linux-${ARCH}"
@@ -2615,10 +2627,12 @@ update_singbox_core() {
     chmod +x "${work_dir}/sing-box"
     rm -rf "$tmp_dir"
 
-    local new_ver
+    local new_ver new_ver_err
+    new_ver_err=$("${work_dir}/sing-box" version 2>&1 >/dev/null)
     new_ver=$("${work_dir}/sing-box" version 2>/dev/null | head -1)
     if [ -z "$new_ver" ]; then
         red "\n新内核校验失败，正在回滚到旧版本...\n"
+        [ -n "$new_ver_err" ] && { yellow "错误详情：\n"; echo "$new_ver_err" | head -10; }
         [ -f "${work_dir}/sing-box.bak" ] && mv "${work_dir}/sing-box.bak" "${work_dir}/sing-box" && chmod +x "${work_dir}/sing-box"
         restart_singbox
         return 1
