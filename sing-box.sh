@@ -215,8 +215,220 @@ allow_port() {
     fi
 }
 
+# ================== WARP 独立密钥生成 ==================
+# 向 Cloudflare 注册新设备，生成独立 WireGuard 密钥与 reserved
+# 成功返回 0 并写入 endpoints.json；失败返回 1（调用方可决定是否回退）
+generate_warp_endpoint() {
+    local quiet="${1:-}"
+    local sb_bin="${work_dir}/sing-box"
+    local endpoints_file="${conf_dir}/endpoints.json"
+    local warp_info_file="${work_dir}/warp_account.json"
+
+    [ ! -x "$sb_bin" ] && { [ -z "$quiet" ] && red "sing-box 二进制不存在，无法生成密钥"; return 1; }
+
+    [ -z "$quiet" ] && yellow "正在生成独立 WARP WireGuard 密钥并注册到 Cloudflare...\n"
+
+    # 1. 生成密钥对（优先 sing-box，其次 openssl X25519）
+    local private_key public_key key_output
+    key_output=$("$sb_bin" generate wg-keypair 2>/dev/null)
+    private_key=$(echo "$key_output" | awk '/PrivateKey:/ {print $2}')
+    public_key=$(echo "$key_output" | awk '/PublicKey:/ {print $2}')
+
+    if [ -z "$private_key" ] || [ -z "$public_key" ]; then
+        key_output=$("$sb_bin" generate wireguard-keypair 2>/dev/null)
+        private_key=$(echo "$key_output" | awk '/PrivateKey:/ {print $2}')
+        public_key=$(echo "$key_output" | awk '/PublicKey:/ {print $2}')
+    fi
+
+    if [ -z "$private_key" ] || [ -z "$public_key" ]; then
+        if command_exists openssl; then
+            local tmp_key
+            tmp_key=$(mktemp)
+            if openssl genpkey -algorithm X25519 -out "$tmp_key" 2>/dev/null; then
+                private_key=$(openssl pkey -in "$tmp_key" -outform DER 2>/dev/null | tail -c 32 | base64 -w0 2>/dev/null || openssl pkey -in "$tmp_key" -outform DER 2>/dev/null | tail -c 32 | base64)
+                public_key=$(openssl pkey -in "$tmp_key" -pubout -outform DER 2>/dev/null | tail -c 32 | base64 -w0 2>/dev/null || openssl pkey -in "$tmp_key" -pubout -outform DER 2>/dev/null | tail -c 32 | base64)
+                rm -f "$tmp_key"
+            else
+                rm -f "$tmp_key"
+            fi
+        fi
+    fi
+
+    if [ -z "$private_key" ] || [ -z "$public_key" ]; then
+        [ -z "$quiet" ] && red "生成 WireGuard 密钥对失败"
+        return 1
+    fi
+
+    # 2. 向 Cloudflare 注册
+    local install_id fcm_token tos_date reg_response
+    install_id=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 22)
+    fcm_token="${install_id}:APA91b$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 134)"
+    tos_date=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    local try=0 max_try=5
+    while [ $try -lt $max_try ]; do
+        try=$((try + 1))
+        reg_response=$(curl -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: okhttp/3.12.1" \
+            -H "CF-Client-Version: a-6.30-3596" \
+            -d "{\"key\":\"${public_key}\",\"install_id\":\"${install_id}\",\"fcm_token\":\"${fcm_token}\",\"tos\":\"${tos_date}\",\"model\":\"PC\",\"serial_number\":\"${install_id}\",\"locale\":\"en_US\"}" 2>/dev/null)
+
+        if echo "$reg_response" | jq -e '.config.interface.addresses.v4 // .config.client_id' >/dev/null 2>&1; then
+            break
+        fi
+        [ -z "$quiet" ] && yellow "第 ${try}/${max_try} 次注册未成功，重试中..."
+        sleep 2
+    done
+
+    if ! echo "$reg_response" | jq -e '.config' >/dev/null 2>&1; then
+        [ -z "$quiet" ] && red "Cloudflare WARP 注册失败（可能网络受限或 API 变更）"
+        [ -z "$quiet" ] && echo "$reg_response" | head -c 300
+        return 1
+    fi
+
+    # 3. 解析结果
+    local v4 v6 client_id peer_pub reserved_json device_id token
+    v4=$(echo "$reg_response" | jq -r '.config.interface.addresses.v4 // empty')
+    v6=$(echo "$reg_response" | jq -r '.config.interface.addresses.v6 // empty')
+    client_id=$(echo "$reg_response" | jq -r '.config.client_id // empty')
+    peer_pub=$(echo "$reg_response" | jq -r '.config.peers[0].public_key // "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="')
+    device_id=$(echo "$reg_response" | jq -r '.id // empty')
+    token=$(echo "$reg_response" | jq -r '.token // empty')
+
+    [ -z "$v4" ] && v4="172.16.0.2/32"
+    [[ "$v4" != */* ]] && v4="${v4}/32"
+    if [ -n "$v6" ] && [[ "$v6" != */* ]]; then
+        v6="${v6}/128"
+    fi
+
+    # reserved: client_id base64 解码后前 3 字节
+    if [ -n "$client_id" ]; then
+        local r_bytes
+        r_bytes=$(printf '%s' "$client_id" | base64 -d 2>/dev/null | od -An -tu1 -N3 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//')
+        if [ -n "$r_bytes" ]; then
+            reserved_json=$(echo "$r_bytes" | awk '{printf "[%d, %d, %d]", $1, $2, $3}')
+        else
+            reserved_json="[0, 0, 0]"
+        fi
+    else
+        reserved_json="[0, 0, 0]"
+    fi
+
+    # 4. 写入 endpoints.json
+    if [ -n "$v6" ]; then
+        cat > "$endpoints_file" << EOF
+{
+  "endpoints": [
+    {
+      "type": "wireguard",
+      "tag": "wireguard-out",
+      "mtu": 1280,
+      "address": [
+        "$v4",
+        "$v6"
+      ],
+      "private_key": "$private_key",
+      "peers": [
+        {
+          "address": "engage.cloudflareclient.com",
+          "port": 2408,
+          "public_key": "$peer_pub",
+          "allowed_ips": ["0.0.0.0/0", "::/0"],
+          "reserved": $reserved_json
+        }
+      ]
+    }
+  ]
+}
+EOF
+    else
+        cat > "$endpoints_file" << EOF
+{
+  "endpoints": [
+    {
+      "type": "wireguard",
+      "tag": "wireguard-out",
+      "mtu": 1280,
+      "address": [
+        "$v4"
+      ],
+      "private_key": "$private_key",
+      "peers": [
+        {
+          "address": "engage.cloudflareclient.com",
+          "port": 2408,
+          "public_key": "$peer_pub",
+          "allowed_ips": ["0.0.0.0/0", "::/0"],
+          "reserved": $reserved_json
+        }
+      ]
+    }
+  ]
+}
+EOF
+    fi
+
+    # 保存账户信息便于以后排查
+    printf '{"id":"%s","token":"%s","private_key":"%s","client_id":"%s","reserved":%s,"v4":"%s","v6":"%s"}\n' \
+        "$device_id" "$token" "$private_key" "$client_id" "$reserved_json" "$v4" "${v6:-}" > "$warp_info_file"
+    chmod 600 "$warp_info_file" 2>/dev/null
+    [ -z "$quiet" ] && green "WARP 独立密钥注册成功！\n  IPv4: ${purple}${v4}${re}\n  reserved: ${purple}${reserved_json}${re}\n"
+    return 0
+}
+
+# 写入默认（共享）WARP 配置作为回退
+write_fallback_warp_endpoint() {
+    cat > "${conf_dir}/endpoints.json" << 'WARP_FALLBACK_EOF'
+{
+  "endpoints": [
+    {
+      "type": "wireguard",
+      "tag": "wireguard-out",
+      "mtu": 1280,
+      "address": [
+        "172.16.0.2/32",
+        "2606:4700:110:8dfe:d141:69bb:6b80:925/128"
+      ],
+      "private_key": "YFYOAdbw1bKTHlNNi+aEjBM3BO7unuFC5rOkMRAz9XY=",
+      "peers": [
+        {
+          "address": "engage.cloudflareclient.com",
+          "port": 2408,
+          "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+          "allowed_ips": ["0.0.0.0/0", "::/0"],
+          "reserved": [78, 135, 76]
+        }
+      ]
+    }
+  ]
+}
+WARP_FALLBACK_EOF
+}
+
+# 菜单：重新生成 WARP 密钥
+regenerate_warp_keys() {
+    check_singbox &>/dev/null
+    if [ $? -eq 2 ]; then
+        yellow "sing-box 尚未安装！"; sleep 1; return
+    fi
+    yellow "\n将向 Cloudflare 重新注册独立 WARP 设备并替换当前 wireguard-out 配置。\n"
+    reading "确认继续？(y/n): " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        yellow "已取消。"; sleep 1; return
+    fi
+    if generate_warp_endpoint; then
+        restart_singbox
+        green "WARP 密钥已更新并重启 sing-box。\n"
+    else
+        red "注册失败，保持原有配置不变。\n"
+    fi
+    sleep 2
+}
+
 # 下载并安装 sing-box,cloudflared
 install_singbox() {
+
     clear
     purple "正在安装sing-box中，请稍后..."
     ARCH_RAW=$(uname -m)
@@ -395,31 +607,11 @@ EOF
 }
 EOF
 
-    cat > "${conf_dir}/endpoints.json" << EOF
-{
-  "endpoints": [
-    {
-      "type": "wireguard",
-      "tag": "wireguard-out",
-      "mtu": 1280,
-      "address": [
-        "172.16.0.2/32",
-        "2606:4700:110:8dfe:d141:69bb:6b80:925/128"
-      ],
-      "private_key": "YFYOAdbw1bKTHlNNi+aEjBM3BO7unuFC5rOkMRAz9XY=",
-      "peers": [
-        {
-          "address": "engage.cloudflareclient.com",
-          "port": 2408,
-          "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-          "allowed_ips": ["0.0.0.0/0", "::/0"],
-          "reserved": [78, 135, 76]
-        }
-      ]
-    }
-  ]
-}
-EOF
+    # 优先注册独立 WARP 密钥；失败则回退到共享密钥并提示
+    if ! generate_warp_endpoint; then
+        yellow "独立 WARP 注册失败，暂时使用共享密钥（可能不稳定，可稍后在「WARP分流管理」中重新生成）\n"
+        write_fallback_warp_endpoint
+    fi
 
     cat > "${conf_dir}/route.json" << EOF
 {
@@ -432,6 +624,7 @@ EOF
       {"tag":"twitter","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/twitter.srs","download_detour":"direct"},
       {"tag":"google","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/google.srs","download_detour":"direct"},
       {"tag":"telegram","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/telegram.srs","download_detour":"direct"},
+      {"tag":"telegram-ip","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/telegram.srs","download_detour":"direct"},
       {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
       {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
     ],
@@ -1462,6 +1655,8 @@ warp_manage() {
     skyblue "----------------------"
     red "4. 删除 代理出站 (Socks5/HTTP/SS2022)"
     skyblue "----------------------"
+    green "5. 重新生成独立 WARP 密钥"
+    skyblue "----------------------"
     purple "0. 返回主菜单"
     skyblue "------------"
     purple "00. 退出脚本"
@@ -1472,6 +1667,7 @@ warp_manage() {
         2)  delete_rule_menu ;;
         3)  add_socks5_proxy ;;
         4)  delete_socks5_proxy ;;
+        5)  regenerate_warp_keys; warp_manage ;;
         0)  menu ;;
         00) exit 0 ;;
         *)  red "无效选项"; sleep 1; warp_manage ;;
@@ -1543,21 +1739,45 @@ add_rule_menu() {
         selected_out="${out_tags[$((out_choice-1))]}"
     fi
 
-    jq --arg tag "$rule_tag" --arg out "$selected_out" '
-        if (.route.rules | length) == 0 then
-            .route.rules = [{"rule_set": [$tag], "outbound": $out}]
-        else
-            (first(.route.rules[] | select(.outbound == $out)) | .rule_set) as $existing
-            | if $existing then
-                .route.rules = [.route.rules[] | select(.outbound == $out).rule_set += [$tag]]
-              else
-                .route.rules += [{"rule_set": [$tag], "outbound": $out}]
-              end
-        end
-    ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    # Telegram 客户端大量直连 DC IP，仅 geosite 域名规则不够，需同时启用 geoip
+    local tags_to_add=("$rule_tag")
+    if [ "$rule_tag" = "telegram" ]; then
+        tags_to_add=("telegram" "telegram-ip")
+        # 确保 rule_set 定义里已有 telegram-ip（旧配置可能缺失）
+        if ! jq -e '.route.rule_set[]? | select(.tag == "telegram-ip")' "$route_file" >/dev/null 2>&1; then
+            jq '.route.rule_set += [{"tag":"telegram-ip","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/telegram.srs","download_detour":"direct"}]' \
+                "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+        fi
+    fi
+
+    for tag in "${tags_to_add[@]}"; do
+        # 已存在则跳过
+        if jq -e --arg tag "$tag" \
+            '.route.rules[] | select(.rule_set != null) | .rule_set[]? | select(. == $tag)' \
+            "$route_file" >/dev/null 2>&1; then
+            continue
+        fi
+        jq --arg tag "$tag" --arg out "$selected_out" '
+            if (.route.rules | length) == 0 then
+                .route.rules = [{"rule_set": [$tag], "outbound": $out}]
+            else
+                (first(.route.rules[] | select(.outbound == $out)) | .rule_set) as $existing
+                | if $existing then
+                    .route.rules = [.route.rules[] | select(.outbound == $out).rule_set += [$tag]]
+                  else
+                    .route.rules += [{"rule_set": [$tag], "outbound": $out}]
+                  end
+            end
+        ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    done
 
     restart_singbox
-    green "'${rule_tag}' 已分流至出站 '${selected_out}'"
+    if [ "$rule_tag" = "telegram" ]; then
+        green "'telegram' + 'telegram-ip'(GeoIP) 已分流至出站 '${selected_out}'"
+        yellow "提示: TG 大量走 IP 直连，已同时启用 geoip-telegram 规则集"
+    else
+        green "'${rule_tag}' 已分流至出站 '${selected_out}'"
+    fi
     sleep 1; warp_manage
 }
 
@@ -1591,7 +1811,8 @@ set_global_outbound() {
     # 从 outbounds.json 中删除 direct 出站，防止流量绕过代理
     jq 'del(.outbounds[] | select(.tag == "direct"))' \
         "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
-    rm -rf ${route_file} ${conf_dir}/endpoints.json
+    # 仅清空路由规则，保留 endpoints（WARP 密钥），避免丢失独立注册配置
+    rm -f "${route_file}"
     restart_singbox
     green "\n已设置全局代理出站：${purple}${selected_out}${re}"
     yellow "所有流量将通过 ${selected_out} 转发，如需恢复请选择「恢复服务器原IP出站」\n"
@@ -1625,6 +1846,7 @@ restore_direct_outbound() {
       {"tag":"twitter","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/twitter.srs","download_detour":"direct"},
       {"tag":"google","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/google.srs","download_detour":"direct"},
       {"tag":"telegram","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/telegram.srs","download_detour":"direct"},
+      {"tag":"telegram-ip","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/telegram.srs","download_detour":"direct"},
       {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
       {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
     ],
@@ -1638,32 +1860,12 @@ restore_direct_outbound() {
 }
 EOF
 
-    # 恢复默认 endpoints.json
-    cat > "${conf_dir}/endpoints.json" << EOF
-{
-  "endpoints": [
-    {
-      "type": "wireguard",
-      "tag": "wireguard-out",
-      "mtu": 1280,
-      "address": [
-        "172.16.0.2/32",
-        "2606:4700:110:8dfe:d141:69bb:6b80:925/128"
-      ],
-      "private_key": "YFYOAdbw1bKTHlNNi+aEjBM3BO7unuFC5rOkMRAz9XY=",
-      "peers": [
-        {
-          "address": "engage.cloudflareclient.com",
-          "port": 2408,
-          "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-          "allowed_ips": ["0.0.0.0/0", "::/0"],
-          "reserved": [78, 135, 76]
-        }
-      ]
-    }
-  ]
-}
-EOF
+    # 恢复 endpoints：优先保留已有独立密钥；若文件缺失则重新注册/回退
+    if [ ! -f "${conf_dir}/endpoints.json" ]; then
+        if ! generate_warp_endpoint quiet; then
+            write_fallback_warp_endpoint
+        fi
+    fi
     restart_singbox
     green "\n已恢复服务器原IP出站，所有流量走 direct。\n"
     sleep 2; warp_manage
@@ -1682,12 +1884,23 @@ delete_rule_menu() {
     if [ -z "$tag" ] || [ "$tag" == "null" ]; then
         red "无效的选择"; sleep 1; warp_manage; return
     fi
-    jq --arg tag "$tag" \
-       'del(.route.rules[] | select(.rule_set != null) | .rule_set[] | select(. == $tag)) |
-        .route.rules = [.route.rules[] | select(.rule_set != null and (.rule_set | length) > 0)]' \
-       "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    # 删除 telegram 时一并删除 telegram-ip
+    local tags_to_del=("$tag")
+    if [ "$tag" = "telegram" ] || [ "$tag" = "telegram-ip" ]; then
+        tags_to_del=("telegram" "telegram-ip")
+    fi
+    for t in "${tags_to_del[@]}"; do
+        jq --arg tag "$t" \
+           'del(.route.rules[] | select(.rule_set != null) | .rule_set[] | select(. == $tag)) |
+            .route.rules = [.route.rules[] | select(.rule_set != null and (.rule_set | length) > 0)]' \
+           "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    done
     restart_singbox
-    green "规则集 '${tag}' 已禁用。"
+    if [ "$tag" = "telegram" ] || [ "$tag" = "telegram-ip" ]; then
+        green "规则集 'telegram' 与 'telegram-ip' 已禁用。"
+    else
+        green "规则集 '${tag}' 已禁用。"
+    fi
     sleep 1; warp_manage
 }
 
