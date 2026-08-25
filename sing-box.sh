@@ -86,130 +86,22 @@ check_service() {
     return $?
 }
 
-# 判断指定 UDP 端口是否已绑定（兼容 ss 本地地址列在 $4/$5 的差异）
-is_udp_listening() {
-    local port=$1
-    [ -z "$port" ] && return 1
-    if command_exists ss; then
-        # 同时兼容 "0.0.0.0:PORT "、"[::]:PORT "、"*:PORT "
-        ss -H -uln 2>/dev/null | grep -E "[.:\]]${port}([[:space:]]|$)" >/dev/null && return 0
-        return 1
-    fi
-    if command_exists lsof; then
-        lsof -iUDP:"$port" -t >/dev/null 2>&1 && return 0
-        return 1
-    fi
-    return 1
-}
-
-# 轮询等待 hy2/tuic UDP 监听就绪
-wait_udp_ports() {
-    local max_wait=${1:-20}
-    local i=0 ok
-    if ! command_exists ss && ! command_exists lsof; then
-        return 0
-    fi
-    while [ $i -lt "$max_wait" ]; do
-        ok=1
-        [ -n "$tuic_port" ] && ! is_udp_listening "$tuic_port" && ok=0
-        [ -n "$hy2_port" ] && ! is_udp_listening "$hy2_port" && ok=0
-        [ "$ok" -eq 1 ] && return 0
-        sleep 1
-        i=$((i + 1))
-    done
-    return 1
-}
-
-# 安装完成后校验 hy2/tuic 的 UDP 端口是否真的绑定成功
+# 安装完成后校验hy2/tuic的UDP端口是否真的绑定成功，
+# sing-box绑定失败时通常只是静默不监听，不会让脚本报错，
+# 用户只能等到客户端连不上才发现，这里提前把问题暴露出来。
 verify_udp_listening() {
-    if ! command_exists ss && ! command_exists lsof; then
-        return 0
-    fi
+    command_exists ss || return 0
     local ok=1
-    if [ -n "$tuic_port" ] && ! is_udp_listening "$tuic_port"; then
+    if [ -n "$tuic_port" ] && ! ss -H -uln 2>/dev/null | grep -q ":${tuic_port} "; then
         red "警告：tuic端口 ${tuic_port}/udp 当前未监听，节点大概率不通，请到「6.修改节点配置->1.修改端口->3.修改tuic端口」重新分配。"
         ok=0
     fi
-    if [ -n "$hy2_port" ] && ! is_udp_listening "$hy2_port"; then
+    if [ -n "$hy2_port" ] && ! ss -H -uln 2>/dev/null | grep -q ":${hy2_port} "; then
         red "警告：hysteria2端口 ${hy2_port}/udp 当前未监听，节点大概率不通，请到「6.修改节点配置->1.修改端口->2.修改hysteria2端口」重新分配。"
         ok=0
     fi
     [ "$ok" -eq 1 ] && green "hysteria2/tuic 的UDP端口均已正常监听。"
-    [ "$ok" -eq 1 ]
-}
-
-# 仅在 hy2/tuic UDP 确实未监听时，自动换空闲端口并重启（不动 TCP/Reality/Argo）
-# 注意：不修改 listen 地址，不改防火墙框架，避免影响其他协议
-fix_udp_ports_if_needed() {
-    local max_try=${1:-3}
-    local try=0
-    local inbounds_file="${conf_dir}/inbounds.json"
-    local new_hy2 new_tuic
-
-    if ! command_exists ss && ! command_exists lsof; then
-        yellow "系统无 ss/lsof，跳过 UDP 自动修复"
-        return 0
-    fi
-
-    if wait_udp_ports 18; then
-        green "hysteria2/tuic 的UDP端口均已正常监听。"
-        return 0
-    fi
-
-    # 若整个 sing-box 都没起来，换 UDP 端口也没用，避免误改配置
-    if command_exists systemctl; then
-        systemctl is-active --quiet sing-box 2>/dev/null || {
-            red "sing-box 服务未运行，跳过 UDP 自动换口。请先检查服务日志。"
-            return 1
-        }
-    fi
-
-    while [ $try -lt "$max_try" ]; do
-        try=$((try + 1))
-        yellow "检测到 hy2/tuic UDP 未监听，自动更换端口并重启 (${try}/${max_try})..."
-
-        new_hy2=$(get_free_port 10000 65000)
-        new_tuic=$(get_free_port 10000 65000)
-        while [ "$new_hy2" = "$new_tuic" ] || \
-              { [ -n "$vless_port" ] && [ "$new_hy2" = "$vless_port" ]; } || \
-              { [ -n "$vless_port" ] && [ "$new_tuic" = "$vless_port" ]; } || \
-              { [ -n "$nginx_port" ] && [ "$new_hy2" = "$nginx_port" ]; } || \
-              { [ -n "$nginx_port" ] && [ "$new_tuic" = "$nginx_port" ]; } || \
-              { [ -n "$ARGO_PORT" ] && [ "$new_hy2" = "$ARGO_PORT" ]; } || \
-              { [ -n "$ARGO_PORT" ] && [ "$new_tuic" = "$ARGO_PORT" ]; }; do
-            new_hy2=$(get_free_port 10000 65000)
-            new_tuic=$(get_free_port 10000 65000)
-        done
-
-        hy2_port=$new_hy2
-        tuic_port=$new_tuic
-
-        if [ -f "$inbounds_file" ]; then
-            if ! jq --argjson hy2 "$hy2_port" --argjson tuic "$tuic_port" \
-                '(.inbounds[] | select(.type == "hysteria2").listen_port) = $hy2 |
-                 (.inbounds[] | select(.type == "tuic").listen_port) = $tuic' \
-                "$inbounds_file" > "${inbounds_file}.tmp"; then
-                red "更新 inbounds.json 失败，停止自动换口"
-                rm -f "${inbounds_file}.tmp"
-                return 1
-            fi
-            mv "${inbounds_file}.tmp" "$inbounds_file"
-        fi
-
-        allow_port "${hy2_port}/udp" "${tuic_port}/udp" >/dev/null 2>&1
-        restart_singbox >/dev/null 2>&1
-        sleep 2
-
-        if wait_udp_ports 18; then
-            green "已自动更换 UDP 端口：hysteria2=${hy2_port}  tuic=${tuic_port}"
-            return 0
-        fi
-    done
-
-    red "警告：多次自动更换后 hy2/tuic UDP 仍未监听。"
-    red "请检查云厂商安全组是否放行 UDP，或手动「修改节点配置」更换端口。"
-    verify_udp_listening || true
-    return 1
+    return 0
 }
 
 # 检查sing-box状态
@@ -973,7 +865,7 @@ EOF
           "password": "$uuid"
         }
       ],
-      "ignore_client_bandwidth": false,
+      "ignore_client_bandwidth": true,
       "masquerade": "https://bing.com",
       "tls": {
         "enabled": true,
@@ -1169,9 +1061,9 @@ vless://${uuid}@${server_ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision
 
 vmess://$(echo "$VMESS" | base64 -w0)
 
-hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none#${isp}-Hysteria2
+hysteria2://${uuid}@${server_ip}:${hy2_port}?sni=bing.com&insecure=1&alpn=h3#${isp}-Hysteria2
 
-tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${isp}-TUIC5
+tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${isp}-TUIC5
 EOF
 
     if [ -n "$extra_lines" ]; then
@@ -1400,8 +1292,6 @@ auto_install() {
 
     green "开始无交互式安装 sing-box..."
     manage_packages install nginx jq tar openssl lsof coreutils
-    command_exists ss || manage_packages install iproute2
-    command_exists ss || manage_packages install iproute
     install_singbox
 
     if command_exists systemctl; then
@@ -1416,7 +1306,8 @@ auto_install() {
         exit 1
     fi
 
-    fix_udp_ports_if_needed 3
+    sleep 5
+    verify_udp_listening
     get_info
     add_nginx_conf
     create_shortcut
@@ -1687,7 +1578,7 @@ IEOF
             isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | \
                 awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | sed 's/ /_/g' || echo "$hostname")
             sed -i.bak "/hysteria2:/d" $client_dir
-            sed -i "${line_number}i hysteria2://$uuid@$ip:$listen_port?peer=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none&mport=$listen_port,$min_port-$max_port#$isp-Hysteria2" $client_dir
+            sed -i "${line_number}i hysteria2://$uuid@$ip:$listen_port?sni=bing.com&insecure=1&alpn=h3&mport=$listen_port,$min_port-$max_port#$isp-Hysteria2" $client_dir
             base64 -w0 $client_dir > /etc/sing-box/sub.txt
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
             green "\nhysteria2端口跳跃已开启：${purple}$min_port-$max_port${re}\n"
@@ -3090,7 +2981,10 @@ apply_domain_cert() {
 
     # 域名证书路径与hy2/tuic原先自签证书路径一致(cert.pem/private.key)，无需改动inbounds.json
     if [ -f "$client_dir" ]; then
-        sed -i -E "s#(hysteria2://[^?]*\?)sni=[^&]*&insecure=1&pinSHA256=[^&]*#\1sni=${domain}\&insecure=0#" "$client_dir"
+        # 自签链接可能带 pinSHA256，域名证书场景去掉 pin 并统一 sni/insecure
+        sed -i -E "s#(hysteria2://[^?]*\?)sni=[^&]*#\1sni=${domain}#" "$client_dir"
+        sed -i -E "s#(hysteria2://[^#]*)insecure=1#\1insecure=0#" "$client_dir"
+        sed -i -E "s#(hysteria2://[^#]*)&pinSHA256=[^&#]*#\1#g" "$client_dir"
         sed -i -E "s#(tuic://[^?]*\?)sni=[^&]*#\1sni=${domain}#" "$client_dir"
         sed -i -E "s#(tuic://[^#]*)allow_insecure=1#\1allow_insecure=0#" "$client_dir"
         base64 -w0 "$client_dir" > "${work_dir}/sub.txt"
@@ -3131,11 +3025,12 @@ restore_selfsigned_cert() {
 
     restart_singbox
 
-    local fingerprint
-    fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
     if [ -f "$client_dir" ]; then
-        sed -i -E "s#(hysteria2://[^?]*\?)sni=[^&]*&insecure=0#\1sni=www.bing.com\&insecure=1\&pinSHA256=${fingerprint}#" "$client_dir"
-        sed -i -E "s#(tuic://[^?]*\?)sni=[^&]*#\1sni=www.bing.com#" "$client_dir"
+        # 恢复自签：sni 与证书 CN=bing.com 一致，不再写 pinSHA256（避免客户端钉死旧指纹）
+        sed -i -E "s#(hysteria2://[^?]*\?)sni=[^&]*#\1sni=bing.com#" "$client_dir"
+        sed -i -E "s#(hysteria2://[^#]*)insecure=0#\1insecure=1#" "$client_dir"
+        sed -i -E "s#(hysteria2://[^#]*)&pinSHA256=[^&#]*#\1#g" "$client_dir"
+        sed -i -E "s#(tuic://[^?]*\?)sni=[^&]*#\1sni=bing.com#" "$client_dir"
         sed -i -E "s#(tuic://[^#]*)allow_insecure=0#\1allow_insecure=1#" "$client_dir"
         base64 -w0 "$client_dir" > "${work_dir}/sub.txt"
     fi
@@ -3441,9 +3336,9 @@ menu() {
     green "10. 域名证书管理(hy2/tuic)"
     green "11. 出站IPv4/IPv6优先级"
     green "12. sing-box内核查看/更新"
-    green "13. 单栈VPS加装WARP全局出站"
+    green "14. 单栈VPS加装WARP全局出站"
     echo "==============="
-    purple "14. ssh综合工具箱"
+    purple "13. ssh综合工具箱"
     echo "==============="
     red "0. 退出脚本"
     echo "==========="
@@ -3500,8 +3395,6 @@ case "$1" in
                         yellow "sing-box 已经安装！\n"
                     else
                         manage_packages install nginx jq tar openssl lsof coreutils
-                        command_exists ss || manage_packages install iproute2
-                        command_exists ss || manage_packages install iproute
                         install_singbox
                         if command_exists systemctl; then
                             main_systemd_services
@@ -3513,7 +3406,8 @@ case "$1" in
                         else
                             echo "Unsupported init system"; exit 1
                         fi
-                        fix_udp_ports_if_needed 3
+                        sleep 5
+                        verify_udp_listening
                         get_info
                         add_nginx_conf
                         create_shortcut
@@ -3530,12 +3424,12 @@ case "$1" in
                 10) manage_cert;        need_pause=false ;;
                 11) manage_outbound_strategy; need_pause=false ;;
                 12) manage_singbox_core; need_pause=false ;;
-                13) system_warp_menu;   need_pause=false ;;
-                14)
+                13)
                     clear
                     bash <(curl -Ls ssh_tool.eooce.com)
                     need_pause=false
                     ;;
+                14) system_warp_menu;   need_pause=false ;;
                 0)  exit 0 ;;       
                 *)
                     red "无效的选项，请输入 0-14"
