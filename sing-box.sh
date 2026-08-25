@@ -39,6 +39,37 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# 检查端口当前是否空闲（TCP和UDP都不能被占用，避免sing-box起服时静默绑定失败）
+is_port_free() {
+    local port=$1
+    if command_exists ss; then
+        ss -H -tuln 2>/dev/null | awk '{print $5}' | grep -Eq "[.:]${port}\$" && return 1
+        return 0
+    elif command_exists lsof; then
+        lsof -iTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1 && return 1
+        lsof -iUDP:"$port" -t >/dev/null 2>&1 && return 1
+        return 0
+    fi
+    # 没有ss也没有lsof时无法检测，默认放行（不阻断安装）
+    return 0
+}
+
+# 在指定范围内取一个当前真正空闲的端口，最多尝试200次
+get_free_port() {
+    local min=$1 max=$2 tries=0 port
+    while [ $tries -lt 200 ]; do
+        port=$(shuf -i "${min}-${max}" -n 1)
+        if is_port_free "$port"; then
+            echo "$port"
+            return 0
+        fi
+        tries=$((tries+1))
+    done
+    # 兜底：200次都没找到空闲端口（极少见），返回最后一次尝试的值
+    echo "$port"
+    return 1
+}
+
 # 检查服务状态通用函数
 check_service() {
     local service_name=$1
@@ -52,6 +83,24 @@ check_service() {
         systemctl is-active "${service_name}" | grep -q "^active$" && green "running" || yellow "not running"
     fi
     return $?
+}
+
+# 安装完成后校验hy2/tuic的UDP端口是否真的绑定成功，
+# sing-box绑定失败时通常只是静默不监听，不会让脚本报错，
+# 用户只能等到客户端连不上才发现，这里提前把问题暴露出来。
+verify_udp_listening() {
+    command_exists ss || return 0
+    local ok=1
+    if [ -n "$tuic_port" ] && ! ss -H -uln 2>/dev/null | grep -q ":${tuic_port} "; then
+        red "警告：tuic端口 ${tuic_port}/udp 当前未监听，节点大概率不通，请到「6.修改节点配置->1.修改端口->3.修改tuic端口」重新分配。"
+        ok=0
+    fi
+    if [ -n "$hy2_port" ] && ! ss -H -uln 2>/dev/null | grep -q ":${hy2_port} "; then
+        red "警告：hysteria2端口 ${hy2_port}/udp 当前未监听，节点大概率不通，请到「6.修改节点配置->1.修改端口->2.修改hysteria2端口」重新分配。"
+        ok=0
+    fi
+    [ "$ok" -eq 1 ] && green "hysteria2/tuic 的UDP端口均已正常监听。"
+    return 0
 }
 
 # 检查sing-box状态
@@ -453,9 +502,23 @@ install_singbox() {
     # rm -rf "${work_dir}/${server_name}.tar.gz" "${work_dir}/sing-box-${latest_version}-linux-${ARCH}"
     chown root:root ${work_dir} && chmod +x ${work_dir}/${server_name} ${work_dir}/argo ${work_dir}/qrencode
 
-    nginx_port=$(($vless_port + 1))
-    tuic_port=$(($vless_port + 2))
-    hy2_port=$(($vless_port + 3))
+    # 确保vless_port本身也是空闲的（防止PORT环境变量或随机数刚好撞上已占用端口）
+    while ! is_port_free "$vless_port"; do
+        vless_port=$(shuf -i 1000-65000 -n 1)
+    done
+    # nginx/tuic/hy2端口不再用vless_port做固定偏移(+1/+2/+3)，
+    # 因为那样必须连续3个端口同时空闲才行，冲突概率高很多——
+    # 这正是"装完UDP不通，得改端口，有时要改好几次"的根本原因。
+    # 改为分别独立挑选当前空闲的端口，并确保互不相同。
+    nginx_port=$(get_free_port 1000 65000)
+    tuic_port=$(get_free_port 1000 65000)
+    hy2_port=$(get_free_port 1000 65000)
+    while [ "$nginx_port" = "$vless_port" ] || [ "$tuic_port" = "$vless_port" ] || [ "$hy2_port" = "$vless_port" ] || \
+          [ "$nginx_port" = "$tuic_port" ] || [ "$nginx_port" = "$hy2_port" ] || [ "$tuic_port" = "$hy2_port" ]; do
+        nginx_port=$(get_free_port 1000 65000)
+        tuic_port=$(get_free_port 1000 65000)
+        hy2_port=$(get_free_port 1000 65000)
+    done
     uuid=$(cat /proc/sys/kernel/random/uuid)
     password=$(< /dev/urandom tr -dc 'A-Za-z0-9' | head -c 24)
     output=$(/etc/sing-box/sing-box generate reality-keypair)
@@ -1004,6 +1067,7 @@ auto_install() {
     fi
 
     sleep 5
+    verify_udp_listening
     get_info
     add_nginx_conf
     create_shortcut
@@ -1101,7 +1165,15 @@ change_config() {
             case "${choice}" in
                 1)
                     reading "\n请输入vless-reality端口 (回车跳过将使用随机端口): " new_port
-                    [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
+                    if [ -z "$new_port" ]; then
+                        new_port=$(get_free_port 2000 65000)
+                    else
+                        until is_port_free "$new_port"; do
+                            echo -e "${red}端口 $new_port 已被占用${re}"
+                            reading "请输入vless-reality端口 (回车将使用随机端口): " new_port
+                            [ -z "$new_port" ] && { new_port=$(get_free_port 2000 65000); break; }
+                        done
+                    fi
                     jq --arg port "$new_port" \
                        '(.inbounds[] | select(.type == "vless").listen_port) = ($port | tonumber)' \
                        "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
@@ -1114,7 +1186,15 @@ change_config() {
                     ;;
                 2)
                     reading "\n请输入hysteria2端口 (回车跳过将使用随机端口): " new_port
-                    [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
+                    if [ -z "$new_port" ]; then
+                        new_port=$(get_free_port 2000 65000)
+                    else
+                        until is_port_free "$new_port"; do
+                            echo -e "${red}端口 $new_port 已被占用${re}"
+                            reading "请输入hysteria2端口 (回车将使用随机端口): " new_port
+                            [ -z "$new_port" ] && { new_port=$(get_free_port 2000 65000); break; }
+                        done
+                    fi
                     jq --arg port "$new_port" \
                        '(.inbounds[] | select(.type == "hysteria2").listen_port) = ($port | tonumber)' \
                        "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
@@ -1127,7 +1207,15 @@ change_config() {
                     ;;
                 3)
                     reading "\n请输入tuic端口 (回车跳过将使用随机端口): " new_port
-                    [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
+                    if [ -z "$new_port" ]; then
+                        new_port=$(get_free_port 2000 65000)
+                    else
+                        until is_port_free "$new_port"; do
+                            echo -e "${red}端口 $new_port 已被占用${re}"
+                            reading "请输入tuic端口 (回车将使用随机端口): " new_port
+                            [ -z "$new_port" ] && { new_port=$(get_free_port 2000 65000); break; }
+                        done
+                    fi
                     jq --arg port "$new_port" \
                        '(.inbounds[] | select(.type == "tuic").listen_port) = ($port | tonumber)' \
                        "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
@@ -1140,7 +1228,15 @@ change_config() {
                     ;;
                 4)
                     reading "\n请输入vmess-argo端口 (回车跳过将使用随机端口): " new_port
-                    [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
+                    if [ -z "$new_port" ]; then
+                        new_port=$(get_free_port 2000 65000)
+                    else
+                        until is_port_free "$new_port"; do
+                            echo -e "${red}端口 $new_port 已被占用${re}"
+                            reading "请输入vmess-argo端口 (回车将使用随机端口): " new_port
+                            [ -z "$new_port" ] && { new_port=$(get_free_port 2000 65000); break; }
+                        done
+                    fi
                     jq --arg port "$new_port" \
                        '(.inbounds[] | select(.type == "vmess").listen_port) = ($port | tonumber)' \
                        "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
@@ -3066,6 +3162,7 @@ case "$1" in
                             echo "Unsupported init system"; exit 1
                         fi
                         sleep 5
+                        verify_udp_listening
                         get_info
                         add_nginx_conf
                         create_shortcut
