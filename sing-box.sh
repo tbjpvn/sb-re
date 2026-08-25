@@ -1061,7 +1061,7 @@ vless://${uuid}@${server_ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision
 
 vmess://$(echo "$VMESS" | base64 -w0)
 
-hysteria2://${uuid}@${server_ip}:${hy2_port}?sni=bing.com&insecure=1&alpn=h3#${isp}-Hysteria2
+hysteria2://${uuid}@${server_ip}:${hy2_port}?sni=bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3#${isp}-Hysteria2
 
 tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${isp}-TUIC5
 EOF
@@ -1578,7 +1578,7 @@ IEOF
             isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | \
                 awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | sed 's/ /_/g' || echo "$hostname")
             sed -i.bak "/hysteria2:/d" $client_dir
-            sed -i "${line_number}i hysteria2://$uuid@$ip:$listen_port?sni=bing.com&insecure=1&alpn=h3&mport=$listen_port,$min_port-$max_port#$isp-Hysteria2" $client_dir
+            sed -i "${line_number}i hysteria2://$uuid@$ip:$listen_port?sni=bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&mport=$listen_port,$min_port-$max_port#$isp-Hysteria2" $client_dir
             base64 -w0 $client_dir > /etc/sing-box/sub.txt
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
             green "\nhysteria2端口跳跃已开启：${purple}$min_port-$max_port${re}\n"
@@ -2981,7 +2981,7 @@ apply_domain_cert() {
 
     # 域名证书路径与hy2/tuic原先自签证书路径一致(cert.pem/private.key)，无需改动inbounds.json
     if [ -f "$client_dir" ]; then
-        # 自签链接可能带 pinSHA256，域名证书场景去掉 pin 并统一 sni/insecure
+        # 换域名证书：更新 sni、关闭 insecure，并去掉自签 pinSHA256
         sed -i -E "s#(hysteria2://[^?]*\?)sni=[^&]*#\1sni=${domain}#" "$client_dir"
         sed -i -E "s#(hysteria2://[^#]*)insecure=1#\1insecure=0#" "$client_dir"
         sed -i -E "s#(hysteria2://[^#]*)&pinSHA256=[^&#]*#\1#g" "$client_dir"
@@ -3025,11 +3025,17 @@ restore_selfsigned_cert() {
 
     restart_singbox
 
+    local fingerprint
+    fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
     if [ -f "$client_dir" ]; then
-        # 恢复自签：sni 与证书 CN=bing.com 一致，不再写 pinSHA256（避免客户端钉死旧指纹）
+        # 恢复自签：sni 与 CN=bing.com 一致，并重新写入当前证书的 pinSHA256
         sed -i -E "s#(hysteria2://[^?]*\?)sni=[^&]*#\1sni=bing.com#" "$client_dir"
         sed -i -E "s#(hysteria2://[^#]*)insecure=0#\1insecure=1#" "$client_dir"
-        sed -i -E "s#(hysteria2://[^#]*)&pinSHA256=[^&#]*#\1#g" "$client_dir"
+        if echo "$(cat "$client_dir")" | grep -q 'hysteria2://.*pinSHA256='; then
+            sed -i -E "s#(hysteria2://[^#]*pinSHA256=)[^&#]*#\1${fingerprint}#g" "$client_dir"
+        else
+            sed -i -E "s#(hysteria2://[^#]*insecure=1)#\1\&pinSHA256=${fingerprint}#g" "$client_dir"
+        fi
         sed -i -E "s#(tuic://[^?]*\?)sni=[^&]*#\1sni=bing.com#" "$client_dir"
         sed -i -E "s#(tuic://[^#]*)allow_insecure=0#\1allow_insecure=1#" "$client_dir"
         base64 -w0 "$client_dir" > "${work_dir}/sub.txt"
