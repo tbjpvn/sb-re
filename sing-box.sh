@@ -213,6 +213,30 @@ get_realip() {
     fi
 }
 
+# 获取ISP信息（国家码-运营商），固定使用与get_realip()判定出的连接协议栈一致的
+# 出口去查询，避免加装WARP出站(单栈VPS加装WARP全局出站功能)后，
+# 系统默认路由/DNS优先选择了WARP出口，导致isp被误判为"Cloudflare_Warp"
+# 而覆盖了原本的真实ISP名称(如 Yuusei 等)。
+get_isp() {
+    local addr flag result
+    addr=$(get_realip)
+    case "$addr" in
+        \[*\]) flag="-6" ;;
+        *) flag="-4" ;;
+    esac
+    result=$(curl "$flag" -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" 2>/dev/null | tr -d '\n' | \
+        awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | \
+        sed 's/ /_/g')
+    if [ -z "$result" ]; then
+        result=$(curl "$flag" -sm 3 -H "User-Agent: Mozilla/5.0" "https://ipapi.co/json" 2>/dev/null | tr -d '\n' | \
+            awk -F\" '{c="";o="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="org")o=$(x+2)};if(c&&o)print c"-"o}' | \
+            sed 's/ /_/g')
+    fi
+    [ -z "$result" ] && return 1
+    echo "$result"
+    return 0
+}
+
 # 处理防火墙
 allow_port() {
     has_ufw=0
@@ -1027,12 +1051,8 @@ get_info() {
     yellow "\nip检测中,请稍等...\n"
     server_ip=$(get_realip)
     clear
-    isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | \
-        awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | \
-        sed 's/ /_/g' || \
-        curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://ipapi.co/json" | tr -d '\n' | \
-        awk -F\" '{c="";o="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="org")o=$(x+2)};if(c&&o)print c"-"o}' | \
-        sed 's/ /_/g' || echo "$hostname")
+    isp=$(get_isp || echo "$hostname")
+
 
     if [ -f "${work_dir}/argo.log" ]; then
         for i in {1..5}; do
@@ -1507,8 +1527,7 @@ change_config() {
             restart_singbox
             sed -i -E 's/(vless:\/\/|hysteria2:\/\/|anytls:\/\/)[^@]*(@.*)/\1'"$new_uuid"'\2/' $client_dir
             sed -i -E "s#tuic://[0-9a-f-]{36}:[0-9a-f-]{36}@#tuic://$new_uuid:$new_uuid@#g" $client_dir
-            isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | \
-                awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | sed 's/ /_/g' || echo "$hostname")
+            isp=$(get_isp || echo "$hostname")
             argodomain=$(grep -oE 'https://[[:alnum:]+\.-]+\.trycloudflare\.com' "${work_dir}/argo.log" | sed 's@https://@@')
             VMESS="{ \"v\": \"2\", \"ps\": \"${isp}-VMess-Argo\", \"add\": \"${CFIP}\", \"port\": \"443\", \"id\": \"${new_uuid}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"\", \"allowInsecure\": \"false\"}"
             encoded_vmess=$(echo "$VMESS" | base64 -w0)
@@ -1575,8 +1594,7 @@ IEOF
             fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
             uuid=$(sed -n 's/.*hysteria2:\/\/\([^@]*\)@.*/\1/p' $client_dir)
             line_number=$(grep -n 'hysteria2://' $client_dir | cut -d':' -f1)
-            isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | \
-                awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | sed 's/ /_/g' || echo "$hostname")
+            isp=$(get_isp || echo "$hostname")
             sed -i.bak "/hysteria2:/d" $client_dir
             sed -i "${line_number}i hysteria2://$uuid@$ip:$listen_port?peer=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none&mport=$listen_port,$min_port-$max_port#$isp-Hysteria2" $client_dir
             base64 -w0 $client_dir > /etc/sing-box/sub.txt
@@ -2517,9 +2535,7 @@ add_socks5_inbound() {
     local server_ip
     server_ip=$(get_realip)
     local isp
-    isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' \
-        | awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' \
-        | sed 's/ /_/g' || echo "Socks5")
+    isp=$(get_isp || echo "Socks5")
 
     local url_line="socks://$(printf '%s' "${sk_user}:${sk_pass}" | base64 -w0)@${server_ip}:${sk_port}#${isp}-Socks5"
 
@@ -2611,9 +2627,7 @@ add_anytls() {
     local server_ip
     server_ip=$(get_realip)
     local isp
-    isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' \
-        | awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' \
-        | sed 's/ /_/g' || echo "AnyTLS")
+    isp=$(get_isp || echo "AnyTLS")
 
     local url_line="anytls://${current_uuid}@${server_ip}:${at_port}?insecure=1&sni=bing.com#${isp}-AnyTLS"
 
@@ -2710,9 +2724,7 @@ add_ss2022() {
     local server_ip
     server_ip=$(get_realip)
     local isp
-    isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' \
-        | awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' \
-        | sed 's/ /_/g' || echo "SS2022")
+    isp=$(get_isp || echo "SS2022")
 
     local ss_userinfo
     ss_userinfo=$(printf '%s:%s' "${ss_method}" "${ss_key}" | base64 -w0)
