@@ -1,3 +1,113 @@
+Skip to main content
+Ctrl+K
+Ctrl+J
+
+
+
+sing-box.sh
+你把这主菜单的13和14的两个数字给对换一下，看着好不顺眼
+
+
+思考了 34s
+已对换完成：
+
+13 → 单栈VPS加装WARP全局出站
+14 → ssh综合工具箱
+对应的 case 分支也已同步修改。
+
+发给我
+
+
+思考了 6s
+修改后的脚本已准备好，可直接下载：
+
+你查一下这脚本的UDP是否有问题，有时安装完后节点不能用，改端口后就能用
+
+
+思考了 1m 25s
+查过了。脚本已经意识到「装完 UDP 不通、改端口又好」这类问题，并做了一部分修复，但仍有几处会让 hy2 / tuic 装完偶发不通。
+
+已有防护（注释里也写了）
+不再用 vless_port+1/+2/+3 连续端口
+以前三个口必须同时空闲，冲突概率高，这正是注释里说的根因之一。现在 nginx / tuic / hy2 各自 get_free_port，并保证互不相同。
+is_port_free 会查 TCP + UDP（ss -tuln 或 lsof），减少「配置写了但 bind 失败、服务还显示 running」的情况。
+装完后有 verify_udp_listening，用 ss -uln 检查 hy2/tuic 是否真的在听，失败会红字提示去改端口。
+allow_port 会放行对应 UDP（ufw / firewalld / iptables / ip6tables）。
+这些方向是对的，所以「改端口就好」和「装完偶发不通」仍然对得上：校验失败时脚本只警告，不会自动换口重绑。
+
+仍可能导致「装完 UDP 不通」的点
+1. 绑定失败只告警，不自动换口（最直接）
+verify_udp_listening() {
+    ...
+    # 只 red 警告，不重新选端口、不改配置、不重启
+}
+装完 sleep 5 后若 UDP 没起来，用户只能手动「改端口」。这和「改端口就好」完全一致。
+
+2. 时机偏紧
+start sing-box → sleep 5 → verify_udp_listening
+服务是 RestartSec=10。若首次启动因端口/配置失败再拉起，5 秒时可能还没听上，校验误报或漏报都有可能。
+
+3. 无 ss/lsof 时端口检测直接放行
+# 没有ss也没有lsof时无法检测，默认放行（不阻断安装）
+return 0
+极简系统上可能选到已占用 UDP 口，sing-box 对 UDP 绑定失败往往静默不听，表现就是节点不通。
+
+4. 防火墙覆盖不全
+只处理 ufw / firewalld / iptables，纯 nftables 未写规则。
+装了 ufw 但未 enable 时，ufw allow 不一定真正生效。
+云厂商安全组 / 控制台 UDP 脚本管不到（很多机子默认只开 TCP）。
+云防火墙拦某个高位 UDP 口时，也会出现「这个口不通，换一个就通」。
+
+5. listen: "::" 在 IPv6 异常环境上的风险
+hy2/tuic 都是 "listen": "::"。
+
+在 IPv6 半残、关闭或 bindv6only 怪异的机器上，可能整段 inbound 起不来；换端口仍用 ::，所以这更像环境问题，不是「改端口必好」的主因，但值得注意。
+
+6. 校验匹配略脆
+ss -H -uln | grep -q ":${tuic_port} "
+依赖「端口后面有空格」。多数发行版的 ss 没问题，个别格式下可能误报未监听。
+
+7. 选口与起服之间仍有竞态
+get_free_port 与真正 bind 之间若有别的进程占口（少见），仍会静默失败；改端口等于重新走一遍「选空闲口 + 放行 + 重启」。
+
+和「改端口就好」的对应关系
+现象	更可能原因
+装完 hy2/tuic 不通，改端口后通	原 UDP 口冲突 / 未真正 bind；或主机/云防火墙拦了该口
+Reality（TCP）正常，只有 UDP 挂	更像防火墙或 UDP 绑定问题，不是 UUID/证书
+改端口要改好几次才通	多次撞占用口，或云侧只放行部分 UDP 段
+证书、insecure、客户端内核问题不会单靠改端口解决；脚本里也提示过 hy2/tuic 可开「跳过证书验证」。
+
+结论
+不是「完全没管 UDP」：独立选口、空闲检测、放行、装后校验都有。
+仍有缺口：绑定失败不自动换口、启动等待偏短、无 ss 时检测失效、nft/云防火墙覆盖不足。
+所以仍会出现：装完偶发 UDP 不通 → 改端口（重新选口 + 放行 + 重启）就好。
+若要改脚本，比较有效的是：
+
+verify_udp_listening 失败时自动重选空闲 UDP 口 → 改 inbounds → 放行 → 重启 → 再校验（最多 3 次）
+sleep 5 改成轮询：最多等 15～20 秒，直到 ss 看到监听或超时
+补 nftables 放行；有 ufw 时检查是否 active
+装前确保有 iproute2（ss）
+可选：检测 IPv6 不可用时 hy2/tuic 改为 listen: "0.0.0.0"
+需要的话我可以直接按上面几点改一版脚本。
+
+可以，你帮我改一下，然后发给我
+
+
+思考了 3m 7s
+已改完，主要变更如下：
+
+装完自动修 UDP：未监听时自动换空闲口 → 写配置 → 放行防火墙 → 重启，最多 3 次
+轮询等待：最多约 18 秒，确认 hy2/tuic 真的在听，不再死等 5 秒
+防火墙：补充 nftables；ufw 规则照常写入
+依赖：没有 ss 时自动装 iproute2 / iproute
+无 IPv6：入站改为 0.0.0.0，避免 :: 绑定失败
+脚本已准备好，可直接下载：
+
+
+
+
+
+sing-box.sh
 #!/bin/bash
 
 # =========================
@@ -44,7 +154,8 @@ command_exists() {
 is_port_free() {
     local port=$1
     if command_exists ss; then
-        ss -H -tuln 2>/dev/null | awk '{print $5}' | grep -Eq "[.:]${port}\$" && return 1
+        # Local Address 可能在 $4 或 $5（不同 ss 版本列略有差异），统一扫整行
+        ss -H -tuln 2>/dev/null | grep -Eq "[.:]${port}([^0-9]|$)" && return 1
         return 0
     elif command_exists lsof; then
         lsof -iTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1 && return 1
@@ -71,6 +182,106 @@ get_free_port() {
     return 1
 }
 
+# 判断指定 UDP 端口是否已被进程绑定监听（比 is_port_free 更针对“是否真的在听”）
+is_udp_listening() {
+    local port=$1
+    [ -z "$port" ] && return 1
+    if command_exists ss; then
+        ss -H -uln 2>/dev/null | grep -Eq "[.:]${port}([^0-9]|$)" && return 0
+        return 1
+    elif command_exists lsof; then
+        lsof -iUDP:"$port" -t >/dev/null 2>&1 && return 0
+        return 1
+    fi
+    return 1
+}
+
+# 轮询等待 hy2/tuic UDP 真正开始监听，默认最多等 20 秒
+wait_udp_ports() {
+    local max_wait=${1:-20}
+    local i=0 ok
+    command_exists ss || command_exists lsof || return 0
+    while [ $i -lt "$max_wait" ]; do
+        ok=1
+        [ -n "$tuic_port" ] && ! is_udp_listening "$tuic_port" && ok=0
+        [ -n "$hy2_port" ] && ! is_udp_listening "$hy2_port" && ok=0
+        [ "$ok" -eq 1 ] && return 0
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# 安装完成后校验 hy2/tuic 的 UDP 端口是否真的绑定成功
+verify_udp_listening() {
+    command_exists ss || command_exists lsof || return 0
+    local ok=1
+    if [ -n "$tuic_port" ] && ! is_udp_listening "$tuic_port"; then
+        red "警告：tuic端口 ${tuic_port}/udp 当前未监听，节点大概率不通，请到「6.修改节点配置->1.修改端口->3.修改tuic端口」重新分配。"
+        ok=0
+    fi
+    if [ -n "$hy2_port" ] && ! is_udp_listening "$hy2_port"; then
+        red "警告：hysteria2端口 ${hy2_port}/udp 当前未监听，节点大概率不通，请到「6.修改节点配置->1.修改端口->2.修改hysteria2端口」重新分配。"
+        ok=0
+    fi
+    [ "$ok" -eq 1 ] && green "hysteria2/tuic 的UDP端口均已正常监听。"
+    return $((1 - ok))
+}
+
+# 若 hy2/tuic UDP 未监听，自动换空闲端口、放行防火墙、重启并复检（最多 max_try 次）
+# 解决「装完UDP不通，改端口就好」：绑定失败时脚本侧自动完成换口，无需用户手动操作
+fix_udp_ports_if_needed() {
+    local max_try=${1:-3}
+    local try=0
+    local inbounds_file="${conf_dir}/inbounds.json"
+    local new_hy2 new_tuic
+
+    if wait_udp_ports 18; then
+        green "hysteria2/tuic 的UDP端口均已正常监听。"
+        return 0
+    fi
+
+    while [ $try -lt "$max_try" ]; do
+        try=$((try + 1))
+        yellow "检测到 hy2/tuic UDP 未正常监听，正在自动更换端口并重启 (第 ${try}/${max_try} 次)..."
+
+        new_hy2=$(get_free_port 10000 65000)
+        new_tuic=$(get_free_port 10000 65000)
+        while [ "$new_hy2" = "$new_tuic" ] || \
+              { [ -n "$vless_port" ] && { [ "$new_hy2" = "$vless_port" ] || [ "$new_tuic" = "$vless_port" ]; }; } || \
+              { [ -n "$nginx_port" ] && { [ "$new_hy2" = "$nginx_port" ] || [ "$new_tuic" = "$nginx_port" ]; }; } || \
+              { [ -n "$ARGO_PORT" ] && { [ "$new_hy2" = "$ARGO_PORT" ] || [ "$new_tuic" = "$ARGO_PORT" ]; }; }; do
+            new_hy2=$(get_free_port 10000 65000)
+            new_tuic=$(get_free_port 10000 65000)
+        done
+
+        hy2_port=$new_hy2
+        tuic_port=$new_tuic
+
+        if [ -f "$inbounds_file" ]; then
+            jq --argjson hy2 "$hy2_port" --argjson tuic "$tuic_port" \
+               '(.inbounds[] | select(.type == "hysteria2").listen_port) = $hy2 |
+                (.inbounds[] | select(.type == "tuic").listen_port) = $tuic' \
+               "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+        fi
+
+        allow_port "${hy2_port}/udp" "${tuic_port}/udp" >/dev/null 2>&1
+        restart_singbox >/dev/null 2>&1
+        sleep 2
+
+        if wait_udp_ports 18; then
+            green "已自动更换端口并监听成功：hysteria2=${purple}${hy2_port}${re}  tuic=${purple}${tuic_port}${re}"
+            return 0
+        fi
+    done
+
+    red "警告：多次自动更换端口后 hy2/tuic UDP 仍未监听。"
+    red "请检查：1) 云厂商安全组/防火墙是否放行 UDP  2) 本机是否禁用了 IPv6 导致 :: 绑定失败"
+    red "也可手动到「6.修改节点配置->1.修改端口」重新分配 hy2/tuic 端口。"
+    verify_udp_listening
+    return 1
+}
+
 # 检查服务状态通用函数
 check_service() {
     local service_name=$1
@@ -84,24 +295,6 @@ check_service() {
         systemctl is-active "${service_name}" | grep -q "^active$" && green "running" || yellow "not running"
     fi
     return $?
-}
-
-# 安装完成后校验hy2/tuic的UDP端口是否真的绑定成功，
-# sing-box绑定失败时通常只是静默不监听，不会让脚本报错，
-# 用户只能等到客户端连不上才发现，这里提前把问题暴露出来。
-verify_udp_listening() {
-    command_exists ss || return 0
-    local ok=1
-    if [ -n "$tuic_port" ] && ! ss -H -uln 2>/dev/null | grep -q ":${tuic_port} "; then
-        red "警告：tuic端口 ${tuic_port}/udp 当前未监听，节点大概率不通，请到「6.修改节点配置->1.修改端口->3.修改tuic端口」重新分配。"
-        ok=0
-    fi
-    if [ -n "$hy2_port" ] && ! ss -H -uln 2>/dev/null | grep -q ":${hy2_port} "; then
-        red "警告：hysteria2端口 ${hy2_port}/udp 当前未监听，节点大概率不通，请到「6.修改节点配置->1.修改端口->2.修改hysteria2端口」重新分配。"
-        ok=0
-    fi
-    [ "$ok" -eq 1 ] && green "hysteria2/tuic 的UDP端口均已正常监听。"
-    return 0
 }
 
 # 检查sing-box状态
@@ -213,17 +406,20 @@ get_realip() {
     fi
 }
 
-# 处理防火墙
+# 处理防火墙（ufw / firewalld / iptables / ip6tables / nftables）
 allow_port() {
     has_ufw=0
     has_firewalld=0
     has_iptables=0
     has_ip6tables=0
+    has_nft=0
 
+    # ufw 仅在 Status: active 时真正生效；未启用时仍写入规则，避免用户日后 enable 时丢规则
     command_exists ufw && has_ufw=1
     command_exists firewall-cmd && systemctl is-active firewalld >/dev/null 2>&1 && has_firewalld=1
     command_exists iptables && has_iptables=1
     command_exists ip6tables && has_ip6tables=1
+    command_exists nft && has_nft=1
 
     [ "$has_ufw" -eq 1 ] && ufw --force default allow outgoing >/dev/null 2>&1
     [ "$has_firewalld" -eq 1 ] && firewall-cmd --permanent --zone=public --set-target=ACCEPT >/dev/null 2>&1
@@ -247,6 +443,22 @@ allow_port() {
         [ "$has_firewalld" -eq 1 ] && firewall-cmd --permanent --add-port=${port}/${proto} >/dev/null 2>&1
         [ "$has_iptables" -eq 1 ] && (iptables -C INPUT -p ${proto} --dport ${port} -j ACCEPT 2>/dev/null || iptables -I INPUT 4 -p ${proto} --dport ${port} -j ACCEPT)
         [ "$has_ip6tables" -eq 1 ] && (ip6tables -C INPUT -p ${proto} --dport ${port} -j ACCEPT 2>/dev/null || ip6tables -I INPUT 4 -p ${proto} --dport ${port} -j ACCEPT)
+        # nftables：尽量往常见 filter input 链插入放行规则（失败静默，避免干扰纯 iptables 环境）
+        if [ "$has_nft" -eq 1 ]; then
+            if nft list chain inet filter input >/dev/null 2>&1; then
+                nft list chain inet filter input 2>/dev/null | grep -q "udp dport ${port} .*accept\|tcp dport ${port} .*accept\|${proto} dport ${port}" || \
+                    nft insert rule inet filter input ${proto} dport ${port} accept >/dev/null 2>&1
+            elif nft list chain ip filter INPUT >/dev/null 2>&1; then
+                nft list chain ip filter INPUT 2>/dev/null | grep -q "${proto} dport ${port}" || \
+                    nft insert rule ip filter INPUT ${proto} dport ${port} accept >/dev/null 2>&1
+            fi
+            if [ "$proto" = "udp" ] || [ "$proto" = "tcp" ]; then
+                if nft list chain ip6 filter INPUT >/dev/null 2>&1; then
+                    nft list chain ip6 filter INPUT 2>/dev/null | grep -q "${proto} dport ${port}" || \
+                        nft insert rule ip6 filter INPUT ${proto} dport ${port} accept >/dev/null 2>&1
+                fi
+            fi
+        fi
     done
 
     [ "$has_firewalld" -eq 1 ] && firewall-cmd --reload >/dev/null 2>&1
@@ -772,6 +984,13 @@ install_singbox() {
     
     fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
     
+    # 无 IPv6 时 listen "::" 可能导致整个 inbound 绑定失败（UDP 尤为常见），改为只监听 IPv4
+    sb_listen="::"
+    if [ ! -s /proc/net/if_inet6 ]; then
+        sb_listen="0.0.0.0"
+        yellow "检测到系统未启用 IPv6，入站将监听 0.0.0.0（避免 :: 绑定失败）\n"
+    fi
+
     dns_strategy=$(ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1 && echo "prefer_ipv4" || \
         (ping -c 1 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && echo "prefer_ipv6" || echo "prefer_ipv4"))
     
@@ -817,7 +1036,7 @@ EOF
     {
       "type": "vless",
       "tag": "vless-reality",
-      "listen": "::",
+      "listen": "$sb_listen",
       "listen_port": $vless_port,
       "users": [
         {
@@ -842,7 +1061,7 @@ EOF
     {
       "type": "vmess",
       "tag": "vmess-ws",
-      "listen": "::",
+      "listen": "$sb_listen",
       "listen_port": ${ARGO_PORT},
       "users": [
         {
@@ -858,7 +1077,7 @@ EOF
     {
       "type": "hysteria2",
       "tag": "hysteria2",
-      "listen": "::",
+      "listen": "$sb_listen",
       "listen_port": $hy2_port,
       "users": [
         {
@@ -879,7 +1098,7 @@ EOF
     {
       "type": "tuic",
       "tag": "tuic",
-      "listen": "::",
+      "listen": "$sb_listen",
       "listen_port": $tuic_port,
       "users": [
         {
@@ -1291,7 +1510,10 @@ auto_install() {
     fi
 
     green "开始无交互式安装 sing-box..."
+    # iproute2/iproute 提供 ss，用于端口占用检测与 UDP 监听校验
     manage_packages install nginx jq tar openssl lsof coreutils
+    command_exists ss || manage_packages install iproute2
+    command_exists ss || manage_packages install iproute
     install_singbox
 
     if command_exists systemctl; then
@@ -1306,8 +1528,7 @@ auto_install() {
         exit 1
     fi
 
-    sleep 5
-    verify_udp_listening
+    fix_udp_ports_if_needed 3
     get_info
     add_nginx_conf
     create_shortcut
@@ -3391,6 +3612,8 @@ case "$1" in
                         yellow "sing-box 已经安装！\n"
                     else
                         manage_packages install nginx jq tar openssl lsof coreutils
+                        command_exists ss || manage_packages install iproute2
+                        command_exists ss || manage_packages install iproute
                         install_singbox
                         if command_exists systemctl; then
                             main_systemd_services
@@ -3402,8 +3625,7 @@ case "$1" in
                         else
                             echo "Unsupported init system"; exit 1
                         fi
-                        sleep 5
-                        verify_udp_listening
+                        fix_udp_ports_if_needed 3
                         get_info
                         add_nginx_conf
                         create_shortcut
@@ -3442,3 +3664,4 @@ case "$1" in
         exit 1
         ;;
 esac
+Swap Menu Items 13 and 14 - Grok
