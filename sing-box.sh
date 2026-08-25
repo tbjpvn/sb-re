@@ -1640,7 +1640,7 @@ warp_manage() {
     echo ""
     green "=== WARP 分流管理 ===\n"
     green "当前已启用的分流规则集:"
-    jq -r '.route.rules[] | select(.rule_set != null) | .rule_set[]?' "$route_file" 2>/dev/null | sort -u | while read tag; do
+    jq -r '.route.rules[] | select(.rule_set != null) | .rule_set[]?' "$route_file" 2>/dev/null | sort -u | grep -v '^telegram-ip$' | while read tag; do
         echo -e " - ${skyblue}$tag${re}"
     done || echo "  无"
     green "\n已添加的代理出站(socks/http/ss2022):"
@@ -1709,7 +1709,12 @@ add_rule_menu() {
         *)  red "无效选项"; sleep 1; add_rule_menu; return ;;
     esac
 
-    if jq -e --arg tag "$rule_tag" \
+    if [ "$rule_tag" = "telegram" ]; then
+        if jq -e '.route.rules[] | select(.rule_set != null) | .rule_set[]? | select(. == "telegram" or . == "telegram-ip")' \
+            "$route_file" > /dev/null 2>&1; then
+            yellow "规则集 'telegram' 已启用。"; sleep 1; warp_manage; return
+        fi
+    elif jq -e --arg tag "$rule_tag" \
         '.route.rules[] | select(.rule_set != null) | .rule_set[]? | select(. == $tag)' \
         "$route_file" > /dev/null 2>&1; then
         yellow "规则集 '${rule_tag}' 已启用。"; sleep 1; warp_manage; return
@@ -1773,8 +1778,7 @@ add_rule_menu() {
 
     restart_singbox
     if [ "$rule_tag" = "telegram" ]; then
-        green "'telegram' + 'telegram-ip'(GeoIP) 已分流至出站 '${selected_out}'"
-        yellow "提示: TG 大量走 IP 直连，已同时启用 geoip-telegram 规则集"
+        green "'telegram' 已分流至出站 '${selected_out}'（已自动包含 IP 规则）"
     else
         green "'${rule_tag}' 已分流至出站 '${selected_out}'"
     fi
@@ -1874,7 +1878,7 @@ EOF
 delete_rule_menu() {
     clear
     green "当前已启用的分流规则集:"
-    jq -r '.route.rules[] | select(.rule_set != null) | .rule_set[]?' "$route_file" | nl -w2 -s'. '
+    jq -r '.route.rules[] | select(.rule_set != null) | .rule_set[]?' "$route_file" | grep -v '^telegram-ip$' | nl -w2 -s'. '
     reading "\n输入要删除的规则名称或序号: " del_input
     if [[ "$del_input" =~ ^[0-9]+$ ]]; then
         tag=$(jq -r --arg idx "$del_input" '[.route.rules[] | select(.rule_set != null) | .rule_set[]] | .[(($idx | tonumber) - 1)]' "$route_file")
@@ -1897,7 +1901,7 @@ delete_rule_menu() {
     done
     restart_singbox
     if [ "$tag" = "telegram" ] || [ "$tag" = "telegram-ip" ]; then
-        green "规则集 'telegram' 与 'telegram-ip' 已禁用。"
+        green "规则集 'telegram' 已禁用。"
     else
         green "规则集 '${tag}' 已禁用。"
     fi
