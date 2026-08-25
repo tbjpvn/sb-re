@@ -26,6 +26,7 @@ server_name="sing-box"
 work_dir="/etc/sing-box"
 conf_dir="${work_dir}/conf"
 client_dir="${work_dir}/url.txt"
+sys_warp_dir="/etc/wireguard"
 export vless_port=${PORT:-$(shuf -i 10000-65000 -n 1)}
 export CFIP=${CFIP:-'cdns.doon.eu.org'} 
 export ARGO_PORT=${ARGO_PORT:-'8001'} 
@@ -453,6 +454,245 @@ write_fallback_warp_endpoint() {
   ]
 }
 WARP_FALLBACK_EOF
+}
+
+# ================== 单栈VPS加装WARP全局出站(系统级) ==================
+# 与上面 sing-box 内部 wireguard-out(仅用于sing-box分流)不同，
+# 这里通过系统级 WireGuard(wg-quick) 为纯IPv4/纯IPv6主机加装缺失协议栈的
+# WARP出站，效果对整台主机全局生效(不仅限于sing-box本身)。
+sys_warp_iface() {
+    [ "$1" = "4" ] && echo "wgcf-v4" || echo "wgcf-v6"
+}
+
+# 向 Cloudflare 注册一个新的 WARP 账号，结果写入全局变量:
+# REG_PRIV / REG_V4 / REG_V6 / REG_PEER
+cf_warp_register() {
+    local sb_bin="${work_dir}/sing-box"
+    local priv="" pub="" key_output
+
+    if [ -x "$sb_bin" ]; then
+        key_output=$("$sb_bin" generate wg-keypair 2>/dev/null)
+        priv=$(echo "$key_output" | awk '/PrivateKey:/ {print $2}')
+        pub=$(echo "$key_output" | awk '/PublicKey:/ {print $2}')
+    fi
+
+    if [ -z "$priv" ] || [ -z "$pub" ]; then
+        command_exists wg || manage_packages install wireguard-tools
+        if command_exists wg; then
+            priv=$(wg genkey)
+            pub=$(echo "$priv" | wg pubkey)
+        fi
+    fi
+
+    if [ -z "$priv" ] || [ -z "$pub" ]; then
+        red "生成 WireGuard 密钥对失败\n"
+        return 1
+    fi
+
+    local install_id fcm_token tos_date reg_response try=0
+    install_id=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 22)
+    fcm_token="${install_id}:APA91b$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 134)"
+    tos_date=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    while [ $try -lt 5 ]; do
+        try=$((try + 1))
+        reg_response=$(curl -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: okhttp/3.12.1" \
+            -H "CF-Client-Version: a-6.30-3596" \
+            -d "{\"key\":\"${pub}\",\"install_id\":\"${install_id}\",\"fcm_token\":\"${fcm_token}\",\"tos\":\"${tos_date}\",\"model\":\"PC\",\"serial_number\":\"${install_id}\",\"locale\":\"en_US\"}" 2>/dev/null)
+        echo "$reg_response" | jq -e '.config' >/dev/null 2>&1 && break
+        yellow "第 ${try}/5 次注册未成功，重试中...\n"
+        sleep 2
+    done
+
+    if ! echo "$reg_response" | jq -e '.config' >/dev/null 2>&1; then
+        red "Cloudflare WARP 注册失败（可能网络受限或 API 变更）\n"
+        return 1
+    fi
+
+    REG_PRIV="$priv"
+    REG_V4=$(echo "$reg_response" | jq -r '.config.interface.addresses.v4 // empty')
+    REG_V6=$(echo "$reg_response" | jq -r '.config.interface.addresses.v6 // empty')
+    REG_PEER=$(echo "$reg_response" | jq -r '.config.peers[0].public_key // "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="')
+    [ -z "$REG_V4" ] && REG_V4="172.16.0.2"
+    return 0
+}
+
+# 写入 wg-quick 配置文件。family=4 表示给纯IPv6主机加装IPv4出站，
+# family=6 表示给纯IPv4主机加装IPv6出站。
+# 关键点: Endpoint 使用主机已有协议栈可达的Cloudflare地址，
+#         AllowedIPs 只放行缺失的那个协议栈，避免影响已有的直连协议栈。
+sys_warp_write_conf() {
+    local family="$1" iface addr_line endpoint allowed
+    iface=$(sys_warp_iface "$family")
+    mkdir -p "$sys_warp_dir"
+
+    if [ "$family" = "4" ]; then
+        endpoint="[2606:4700:d0::a29f:c001]:2408"
+        allowed="0.0.0.0/0"
+    else
+        endpoint="162.159.192.1:2408"
+        allowed="::/0"
+    fi
+
+    addr_line="${REG_V4}/32"
+    [ -n "$REG_V6" ] && addr_line="${addr_line}, ${REG_V6}/128"
+
+    cat > "${sys_warp_dir}/${iface}.conf" << EOF
+[Interface]
+PrivateKey = ${REG_PRIV}
+Address = ${addr_line}
+MTU = 1280
+
+[Peer]
+PublicKey = ${REG_PEER}
+Endpoint = ${endpoint}
+AllowedIPs = ${allowed}
+PersistentKeepalive = 25
+EOF
+    chmod 600 "${sys_warp_dir}/${iface}.conf"
+}
+
+# 开机自启：优先systemd，其次尝试crontab @reboot兜底
+sys_warp_enable_boot() {
+    local iface="$1"
+    if command_exists systemctl; then
+        systemctl enable "wg-quick@${iface}" &>/dev/null
+    elif command_exists crontab; then
+        (crontab -l 2>/dev/null | grep -v "wg-quick up ${iface}"; echo "@reboot wg-quick up ${iface}") | crontab - 2>/dev/null
+    else
+        yellow "未检测到systemd/crontab，请手动确保开机执行: wg-quick up ${iface}\n"
+    fi
+}
+
+sys_warp_disable_boot() {
+    local iface="$1"
+    command_exists systemctl && systemctl disable "wg-quick@${iface}" &>/dev/null
+    command_exists crontab && { crontab -l 2>/dev/null | grep -v "wg-quick up ${iface}" | crontab - 2>/dev/null; }
+}
+
+# 查看当前系统级WARP出站状态
+sys_warp_status() {
+    local f iface
+    for f in 4 6; do
+        iface=$(sys_warp_iface "$f")
+        if [ -f "${sys_warp_dir}/${iface}.conf" ]; then
+            if ip link show "$iface" &>/dev/null; then
+                green "  ${iface}: ${green}运行中${re}\n"
+            else
+                yellow "  ${iface}: 配置已生成但接口未运行\n"
+            fi
+        else
+            purple "  ${iface}: 未安装\n"
+        fi
+    done
+}
+
+# 加装WARP出站主流程
+sys_warp_add() {
+    local family="$1" iface
+    iface=$(sys_warp_iface "$family")
+
+    if [ -f "${sys_warp_dir}/${iface}.conf" ]; then
+        reading "检测到 ${iface} 已存在配置，是否重新生成并覆盖？(y/n): " sw_overwrite
+        echo ""
+        if [[ "$sw_overwrite" != "y" && "$sw_overwrite" != "Y" ]]; then
+            yellow "已取消\n"
+            return
+        fi
+        wg-quick down "$iface" &>/dev/null
+    fi
+
+    command_exists wg || manage_packages install wireguard-tools
+    command_exists wg-quick || manage_packages install wireguard-tools
+    command_exists curl || manage_packages install curl
+    command_exists jq || manage_packages install jq
+
+    yellow "正在向 Cloudflare 注册独立 WARP 账号...\n"
+    if ! cf_warp_register; then
+        return 1
+    fi
+
+    sys_warp_write_conf "$family"
+
+    yellow "正在启动 WARP 出站接口 ${iface}...\n"
+    if ! wg-quick up "$iface" 2>&1; then
+        red "\n接口启动失败，当前环境可能不支持内核WireGuard(常见于部分OpenVZ/LXC容器)，请更换支持WireGuard/TUN的VPS后重试\n"
+        rm -f "${sys_warp_dir}/${iface}.conf"
+        return 1
+    fi
+
+    sys_warp_enable_boot "$iface"
+
+    green "\n✅ WARP 出站已加装成功！接口: ${purple}${iface}${re}，已设置开机自启\n"
+    if [ "$family" = "4" ]; then
+        local got_v4
+        got_v4=$(curl -4 -sm 5 ip.sb 2>/dev/null)
+        green "当前出口IPv4: ${purple}${got_v4:-获取失败，可稍后自行执行: curl -4 ip.sb 检查}${re}\n"
+    else
+        local got_v6
+        got_v6=$(curl -6 -sm 5 ip.sb 2>/dev/null)
+        green "当前出口IPv6: ${purple}${got_v6:-获取失败，可稍后自行执行: curl -6 ip.sb 检查}${re}\n"
+    fi
+}
+
+# 删除指定协议栈的WARP出站
+sys_warp_remove() {
+    local family="$1" iface
+    iface=$(sys_warp_iface "$family")
+    if [ ! -f "${sys_warp_dir}/${iface}.conf" ]; then
+        yellow "${iface} 未安装，无需删除\n"
+        return
+    fi
+    wg-quick down "$iface" &>/dev/null
+    sys_warp_disable_boot "$iface"
+    rm -f "${sys_warp_dir}/${iface}.conf"
+    green "${iface} 出站已删除\n"
+}
+
+sys_warp_delete_menu() {
+    clear; echo ""
+    purple "=== 删除WARP出站 ===\n"
+    green  "1. 删除IPv4 WARP出站(wgcf-v4)"
+    green  "2. 删除IPv6 WARP出站(wgcf-v6)"
+    red    "3. 全部删除"
+    purple "0. 返回上级菜单"
+    echo "==========================="
+    reading "请输入选择(0-3): " sw_del_choice
+    echo ""
+    case "$sw_del_choice" in
+        1) sys_warp_remove 4 ;;
+        2) sys_warp_remove 6 ;;
+        3) sys_warp_remove 4; sys_warp_remove 6 ;;
+        0) system_warp_menu; return ;;
+        *) red "无效选项\n" ;;
+    esac
+    read -n 1 -s -r -p $'\n按任意键返回...'
+    system_warp_menu
+}
+
+# 菜单：单栈VPS加装WARP全局出站
+system_warp_menu() {
+    clear; echo ""
+    purple "=== 单栈VPS加装WARP全局出站(IPv4/IPv6) ===\n"
+    yellow "通过系统级WireGuard为纯IPv4/纯IPv6主机加装缺失协议栈的WARP出站，全局生效(非仅sing-box)\n\n"
+    sys_warp_status
+    echo ""
+    green  "1. 纯IPv6VPS —— 加装IPv4 WARP出站"
+    green  "2. 纯IPv4VPS —— 加装IPv6 WARP出站"
+    red    "3. 删除WARP出站"
+    purple "0. 返回主菜单"
+    echo "==========================="
+    reading "请输入选择(0-3): " sw_choice
+    echo ""
+    case "$sw_choice" in
+        1) sys_warp_add 4; read -n 1 -s -r -p $'\n按任意键返回...'; system_warp_menu ;;
+        2) sys_warp_add 6; read -n 1 -s -r -p $'\n按任意键返回...'; system_warp_menu ;;
+        3) sys_warp_delete_menu ;;
+        0) return ;;
+        *) red "无效选项\n"; sleep 1; system_warp_menu ;;
+    esac
 }
 
 # 菜单：重新生成 WARP 密钥
@@ -3092,6 +3332,7 @@ menu() {
     green "10. 域名证书管理(hy2/tuic)"
     green "11. 出站IPv4/IPv6优先级"
     green "12. sing-box内核查看/更新"
+    green "14. 单栈VPS加装WARP全局出站"
     echo "==============="
     purple "13. ssh综合工具箱"
     echo "==============="
@@ -3140,7 +3381,7 @@ case "$1" in
         # 无参数：进入交互式主菜单
         while true; do
             menu
-            reading "请输入选择(0-13): " choice 
+            reading "请输入选择(0-14): " choice 
             echo ""
             need_pause=true  
             case "${choice}" in
@@ -3184,9 +3425,10 @@ case "$1" in
                     bash <(curl -Ls ssh_tool.eooce.com)
                     need_pause=false
                     ;;
+                14) system_warp_menu;   need_pause=false ;;
                 0)  exit 0 ;;       
                 *)
-                    red "无效的选项，请输入 0-13"
+                    red "无效的选项，请输入 0-14"
                     need_pause=true
                     ;;
             esac
