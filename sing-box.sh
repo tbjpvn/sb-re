@@ -213,30 +213,6 @@ get_realip() {
     fi
 }
 
-# 节点备注名：优先国家-ISP；若出口被识别为 WARP/Cloudflare 等，则改用本机主机名（避免显示 Cloudflare_Warp）
-get_node_remark() {
-    local name host
-    host=$(hostname 2>/dev/null | head -1 | tr -d '[:space:]')
-    [ -z "$host" ] && host=$(cat /etc/hostname 2>/dev/null | head -1 | tr -d '[:space:]')
-    [ -z "$host" ] && host="node"
-    host=$(echo "$host" | sed 's/ /_/g')
-
-    name=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" 2>/dev/null | tr -d '\n' | \
-        awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | \
-        sed 's/ /_/g')
-    if [ -z "$name" ]; then
-        name=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://ipapi.co/json" 2>/dev/null | tr -d '\n' | \
-            awk -F\" '{c="";o="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="org")o=$(x+2)};if(c&&o)print c"-"o}' | \
-            sed 's/ /_/g')
-    fi
-
-    if [ -z "$name" ] || echo "$name" | grep -qiE 'Cloudflare|WARP|UnReal|AEZA|Andrei'; then
-        echo "$host"
-    else
-        echo "$name"
-    fi
-}
-
 # 处理防火墙
 allow_port() {
     has_ufw=0
@@ -889,7 +865,7 @@ EOF
           "password": "$uuid"
         }
       ],
-      "ignore_client_bandwidth": true,
+      "ignore_client_bandwidth": false,
       "masquerade": "https://bing.com",
       "tls": {
         "enabled": true,
@@ -1051,7 +1027,12 @@ get_info() {
     yellow "\nip检测中,请稍等...\n"
     server_ip=$(get_realip)
     clear
-    isp=$(get_node_remark)
+    isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | \
+        awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | \
+        sed 's/ /_/g' || \
+        curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://ipapi.co/json" | tr -d '\n' | \
+        awk -F\" '{c="";o="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="org")o=$(x+2)};if(c&&o)print c"-"o}' | \
+        sed 's/ /_/g' || echo "$hostname")
 
     if [ -f "${work_dir}/argo.log" ]; then
         for i in {1..5}; do
@@ -1080,9 +1061,9 @@ vless://${uuid}@${server_ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision
 
 vmess://$(echo "$VMESS" | base64 -w0)
 
-hysteria2://${uuid}@${server_ip}:${hy2_port}?sni=bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3#${isp}-Hysteria2
+hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none#${isp}-Hysteria2
 
-tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${isp}-TUIC5
+tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${isp}-TUIC5
 EOF
 
     if [ -n "$extra_lines" ]; then
@@ -1526,7 +1507,8 @@ change_config() {
             restart_singbox
             sed -i -E 's/(vless:\/\/|hysteria2:\/\/|anytls:\/\/)[^@]*(@.*)/\1'"$new_uuid"'\2/' $client_dir
             sed -i -E "s#tuic://[0-9a-f-]{36}:[0-9a-f-]{36}@#tuic://$new_uuid:$new_uuid@#g" $client_dir
-            isp=$(get_node_remark)
+            isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | \
+                awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | sed 's/ /_/g' || echo "$hostname")
             argodomain=$(grep -oE 'https://[[:alnum:]+\.-]+\.trycloudflare\.com' "${work_dir}/argo.log" | sed 's@https://@@')
             VMESS="{ \"v\": \"2\", \"ps\": \"${isp}-VMess-Argo\", \"add\": \"${CFIP}\", \"port\": \"443\", \"id\": \"${new_uuid}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"\", \"allowInsecure\": \"false\"}"
             encoded_vmess=$(echo "$VMESS" | base64 -w0)
@@ -1593,9 +1575,10 @@ IEOF
             fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
             uuid=$(sed -n 's/.*hysteria2:\/\/\([^@]*\)@.*/\1/p' $client_dir)
             line_number=$(grep -n 'hysteria2://' $client_dir | cut -d':' -f1)
-            isp=$(get_node_remark)
+            isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | \
+                awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | sed 's/ /_/g' || echo "$hostname")
             sed -i.bak "/hysteria2:/d" $client_dir
-            sed -i "${line_number}i hysteria2://$uuid@$ip:$listen_port?sni=bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&mport=$listen_port,$min_port-$max_port#$isp-Hysteria2" $client_dir
+            sed -i "${line_number}i hysteria2://$uuid@$ip:$listen_port?peer=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none&mport=$listen_port,$min_port-$max_port#$isp-Hysteria2" $client_dir
             base64 -w0 $client_dir > /etc/sing-box/sub.txt
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
             green "\nhysteria2端口跳跃已开启：${purple}$min_port-$max_port${re}\n"
@@ -2534,7 +2517,9 @@ add_socks5_inbound() {
     local server_ip
     server_ip=$(get_realip)
     local isp
-    isp=$(get_node_remark)
+    isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' \
+        | awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' \
+        | sed 's/ /_/g' || echo "Socks5")
 
     local url_line="socks://$(printf '%s' "${sk_user}:${sk_pass}" | base64 -w0)@${server_ip}:${sk_port}#${isp}-Socks5"
 
@@ -2626,7 +2611,9 @@ add_anytls() {
     local server_ip
     server_ip=$(get_realip)
     local isp
-    isp=$(get_node_remark)
+    isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' \
+        | awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' \
+        | sed 's/ /_/g' || echo "AnyTLS")
 
     local url_line="anytls://${current_uuid}@${server_ip}:${at_port}?insecure=1&sni=bing.com#${isp}-AnyTLS"
 
@@ -2723,7 +2710,9 @@ add_ss2022() {
     local server_ip
     server_ip=$(get_realip)
     local isp
-    isp=$(get_node_remark)
+    isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' \
+        | awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' \
+        | sed 's/ /_/g' || echo "SS2022")
 
     local ss_userinfo
     ss_userinfo=$(printf '%s:%s' "${ss_method}" "${ss_key}" | base64 -w0)
@@ -3036,8 +3025,8 @@ restore_selfsigned_cert() {
     local fingerprint
     fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
     if [ -f "$client_dir" ]; then
-        sed -i -E "s#(hysteria2://[^?]*\?)sni=[^&]*&insecure=0#\1sni=bing.com\&insecure=1\&pinSHA256=${fingerprint}#" "$client_dir"
-        sed -i -E "s#(tuic://[^?]*\?)sni=[^&]*#\1sni=bing.com#" "$client_dir"
+        sed -i -E "s#(hysteria2://[^?]*\?)sni=[^&]*&insecure=0#\1sni=www.bing.com\&insecure=1\&pinSHA256=${fingerprint}#" "$client_dir"
+        sed -i -E "s#(tuic://[^?]*\?)sni=[^&]*#\1sni=www.bing.com#" "$client_dir"
         sed -i -E "s#(tuic://[^#]*)allow_insecure=0#\1allow_insecure=1#" "$client_dir"
         base64 -w0 "$client_dir" > "${work_dir}/sub.txt"
     fi
