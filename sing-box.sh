@@ -109,6 +109,23 @@ check_singbox() {
     check_service "sing-box" "${work_dir}/${server_name}"
 }
 
+# 检查当前系统TCP拥塞控制算法及队列规则(qdisc)
+check_congestion() {
+    local cc qdisc
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    if [ -z "$cc" ]; then
+        yellow "unknown"
+        return 1
+    fi
+    if [ -n "$qdisc" ]; then
+        green "${cc}+${qdisc}"
+    else
+        green "${cc}"
+    fi
+    return 0
+}
+
 # 检查argo状态
 check_argo() {
     check_service "argo" "${work_dir}/argo"
@@ -3320,6 +3337,7 @@ menu() {
     singbox_status=$(check_singbox 2>/dev/null)
     nginx_status=$(check_nginx 2>/dev/null)
     argo_status=$(check_argo 2>/dev/null)
+    congestion_status=$(check_congestion 2>/dev/null)
 
     clear; echo ""
     green "Telegram群组: ${purple}https://t.me/eooceu${re}"
@@ -3328,7 +3346,8 @@ menu() {
     purple "=== 老王sing-box四合一安装脚本 ===\n"
     purple "---Argo 状态: ${argo_status}"
     purple "--Nginx 状态: ${nginx_status}"
-    purple "singbox 状态: ${singbox_status}\n"
+    purple "singbox 状态: ${singbox_status}"
+    purple "拥塞控制算法: ${congestion_status}\n"
     green "1. 安装sing-box"
     red   "2. 卸载sing-box"
     echo "==============="
@@ -3344,9 +3363,9 @@ menu() {
     green "10. 域名证书管理(hy2/tuic)"
     green "11. 出站IPv4/IPv6优先级"
     green "12. sing-box内核查看/更新"
-    green "14. 单栈VPS加装WARP全局出站"
+    green "13. 单栈VPS加装WARP全局出站"
     echo "==============="
-    purple "13. ssh综合工具箱"
+    purple "20. ssh综合工具箱"
     echo "==============="
     red "0. 退出脚本"
     echo "==========="
@@ -3393,7 +3412,7 @@ case "$1" in
         # 无参数：进入交互式主菜单
         while true; do
             menu
-            reading "请输入选择(0-14): " choice 
+            reading "请输入选择(0-13,20): " choice 
             echo ""
             need_pause=true  
             case "${choice}" in
@@ -3432,15 +3451,15 @@ case "$1" in
                 10) manage_cert;        need_pause=false ;;
                 11) manage_outbound_strategy; need_pause=false ;;
                 12) manage_singbox_core; need_pause=false ;;
-                13)
+                13) system_warp_menu;   need_pause=false ;;
+                20)
                     clear
                     bash <(curl -Ls ssh_tool.eooce.com)
                     need_pause=false
                     ;;
-                14) system_warp_menu;   need_pause=false ;;
                 0)  exit 0 ;;       
                 *)
-                    red "无效的选项，请输入 0-14"
+                    red "无效的选项，请输入 0-13 或 20"
                     need_pause=true
                     ;;
             esac
