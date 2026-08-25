@@ -230,6 +230,46 @@ get_realip() {
     fi
 }
 
+# 通过GitHub API/下载链接获取内容，自动兼容纯IPv6服务器。
+# 注意：github.com、api.github.com、codeload.github.com 官方长期未提供IPv6(AAAA)解析，
+# 纯IPv6 VPS在没有配置NAT64或WARP出站(见「单栈VPS加装WARP全局出站」)时无法直连，
+# 直连超时/失败后这里自动改走几个可用的Cloudflare镜像代理重试，避免直接把连接失败
+# 伪装成一段无意义的jq报错甩给用户。
+# 用法: gh_fetch_json <api_url>   —— 返回JSON文本，失败返回非0
+gh_fetch_json() {
+    local url=$1 out proxy
+    out=$(curl -s -m 8 "$url" 2>/dev/null)
+    if [ -n "$out" ] && echo "$out" | jq -e . >/dev/null 2>&1; then
+        echo "$out"; return 0
+    fi
+    for proxy in "https://gh-proxy.com/" "https://ghfast.top/" "https://github.moeyy.xyz/"; do
+        out=$(curl -s -m 8 "${proxy}${url}" 2>/dev/null)
+        if [ -n "$out" ] && echo "$out" | jq -e . >/dev/null 2>&1; then
+            echo "$out"; return 0
+        fi
+    done
+    return 1
+}
+
+# 用法: gh_download <原始下载URL> <本地保存路径>   —— 成功返回0
+gh_download() {
+    local url=$1 dest=$2 proxy
+    if curl -sL --fail -m 60 -o "$dest" "$url" 2>/dev/null; then
+        return 0
+    fi
+    for proxy in "https://gh-proxy.com/" "https://ghfast.top/" "https://github.moeyy.xyz/"; do
+        if curl -sL --fail -m 60 -o "$dest" "${proxy}${url}" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 提示纯IPv6直连GitHub失败时的通用引导文案
+gh_ipv6_hint() {
+    yellow "提示：GitHub官方(github.com/api.github.com)长期未提供IPv6解析，纯IPv6 VPS在未配置NAT64或WARP出站时通常无法直连，脚本已自动尝试镜像代理但仍失败（可能是网络波动或镜像暂时不可用）。可到主菜单「单栈VPS加装WARP全局出站」加装IPv4 WARP出站后重试，或稍后再试。\n"
+}
+
 # 获取ISP信息（国家码-运营商），固定使用与get_realip()判定出的连接协议栈一致的
 # 出口去查询，避免加装WARP出站(单栈VPS加装WARP全局出站功能)后，
 # 系统默认路由/DNS优先选择了WARP出口，导致isp被误判为"Cloudflare_Warp"
@@ -3204,8 +3244,9 @@ update_singbox_core() {
     dl_url="https://github.com/SagerNet/sing-box/releases/download/v${target_version}/${pkg_name}.tar.gz"
 
     yellow "\n正在下载 ${label} v${target_version} (${ARCH})...\n"
-    if ! curl -sL --fail -o "${tmp_dir}/${pkg_name}.tar.gz" "$dl_url"; then
+    if ! gh_download "$dl_url" "${tmp_dir}/${pkg_name}.tar.gz"; then
         red "下载失败！请确认版本号 v${target_version} 是否存在，以及是否有对应架构(${ARCH})的发行包。\n"
+        gh_ipv6_hint
         rm -rf "$tmp_dir"; return 1
     fi
 
@@ -3296,10 +3337,13 @@ manage_singbox_core() {
             ;;
         2)
             yellow "正在获取最新稳定正式版信息...\n"
-            local latest_version
-            latest_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==false and .draft==false)][0].tag_name // empty' | sed 's/^v//')
+            local releases_json latest_version
+            if releases_json=$(gh_fetch_json "https://api.github.com/repos/SagerNet/sing-box/releases"); then
+                latest_version=$(echo "$releases_json" | jq -r '[.[] | select(.prerelease==false and .draft==false)][0].tag_name // empty' | sed 's/^v//')
+            fi
             if [ -z "$latest_version" ]; then
                 red "获取版本信息失败，请检查网络！\n"
+                gh_ipv6_hint
             else
                 reading "即将更新到最新稳定版 v${latest_version}，确认继续？(y/n): " confirm
                 [[ "$confirm" == "y" || "$confirm" == "Y" ]] && update_singbox_core "$latest_version" "最新稳定正式版"
@@ -3307,10 +3351,13 @@ manage_singbox_core() {
             ;;
         3)
             yellow "正在获取最新测试版信息...\n"
-            local beta_version
-            beta_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==true and .draft==false)][0].tag_name // empty' | sed 's/^v//')
+            local releases_json beta_version
+            if releases_json=$(gh_fetch_json "https://api.github.com/repos/SagerNet/sing-box/releases"); then
+                beta_version=$(echo "$releases_json" | jq -r '[.[] | select(.prerelease==true and .draft==false)][0].tag_name // empty' | sed 's/^v//')
+            fi
             if [ -z "$beta_version" ]; then
-                red "未获取到测试版信息（可能当前没有可用的测试版）！\n"
+                red "未获取到测试版信息（可能当前没有可用的测试版，也可能是网络问题）！\n"
+                gh_ipv6_hint
             else
                 reading "即将更新到最新测试版 v${beta_version}，确认继续？(y/n): " confirm
                 [[ "$confirm" == "y" || "$confirm" == "Y" ]] && update_singbox_core "$beta_version" "最新测试版"
