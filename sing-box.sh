@@ -26,7 +26,7 @@ server_name="sing-box"
 work_dir="/etc/sing-box"
 conf_dir="${work_dir}/conf"
 client_dir="${work_dir}/url.txt"
-export vless_port=${PORT:-$(shuf -i 1000-65000 -n 1)}
+export vless_port=${PORT:-$(shuf -i 10000-65000 -n 1)}
 export CFIP=${CFIP:-'cdns.doon.eu.org'} 
 export ARGO_PORT=${ARGO_PORT:-'8001'} 
 export CFPORT=${CFPORT:-'443'} 
@@ -504,20 +504,20 @@ install_singbox() {
 
     # 确保vless_port本身也是空闲的（防止PORT环境变量或随机数刚好撞上已占用端口）
     while ! is_port_free "$vless_port"; do
-        vless_port=$(shuf -i 1000-65000 -n 1)
+        vless_port=$(shuf -i 10000-65000 -n 1)
     done
     # nginx/tuic/hy2端口不再用vless_port做固定偏移(+1/+2/+3)，
     # 因为那样必须连续3个端口同时空闲才行，冲突概率高很多——
     # 这正是"装完UDP不通，得改端口，有时要改好几次"的根本原因。
     # 改为分别独立挑选当前空闲的端口，并确保互不相同。
-    nginx_port=$(get_free_port 1000 65000)
-    tuic_port=$(get_free_port 1000 65000)
-    hy2_port=$(get_free_port 1000 65000)
+    nginx_port=$(get_free_port 10000 65000)
+    tuic_port=$(get_free_port 10000 65000)
+    hy2_port=$(get_free_port 10000 65000)
     while [ "$nginx_port" = "$vless_port" ] || [ "$tuic_port" = "$vless_port" ] || [ "$hy2_port" = "$vless_port" ] || \
           [ "$nginx_port" = "$tuic_port" ] || [ "$nginx_port" = "$hy2_port" ] || [ "$tuic_port" = "$hy2_port" ]; do
-        nginx_port=$(get_free_port 1000 65000)
-        tuic_port=$(get_free_port 1000 65000)
-        hy2_port=$(get_free_port 1000 65000)
+        nginx_port=$(get_free_port 10000 65000)
+        tuic_port=$(get_free_port 10000 65000)
+        hy2_port=$(get_free_port 10000 65000)
     done
     uuid=$(cat /proc/sys/kernel/random/uuid)
     password=$(< /dev/urandom tr -dc 'A-Za-z0-9' | head -c 24)
@@ -1166,12 +1166,12 @@ change_config() {
                 1)
                     reading "\n请输入vless-reality端口 (回车跳过将使用随机端口): " new_port
                     if [ -z "$new_port" ]; then
-                        new_port=$(get_free_port 2000 65000)
+                        new_port=$(get_free_port 10000 65000)
                     else
                         until is_port_free "$new_port"; do
                             echo -e "${red}端口 $new_port 已被占用${re}"
                             reading "请输入vless-reality端口 (回车将使用随机端口): " new_port
-                            [ -z "$new_port" ] && { new_port=$(get_free_port 2000 65000); break; }
+                            [ -z "$new_port" ] && { new_port=$(get_free_port 10000 65000); break; }
                         done
                     fi
                     jq --arg port "$new_port" \
@@ -1187,12 +1187,12 @@ change_config() {
                 2)
                     reading "\n请输入hysteria2端口 (回车跳过将使用随机端口): " new_port
                     if [ -z "$new_port" ]; then
-                        new_port=$(get_free_port 2000 65000)
+                        new_port=$(get_free_port 10000 65000)
                     else
                         until is_port_free "$new_port"; do
                             echo -e "${red}端口 $new_port 已被占用${re}"
                             reading "请输入hysteria2端口 (回车将使用随机端口): " new_port
-                            [ -z "$new_port" ] && { new_port=$(get_free_port 2000 65000); break; }
+                            [ -z "$new_port" ] && { new_port=$(get_free_port 10000 65000); break; }
                         done
                     fi
                     jq --arg port "$new_port" \
@@ -1208,12 +1208,12 @@ change_config() {
                 3)
                     reading "\n请输入tuic端口 (回车跳过将使用随机端口): " new_port
                     if [ -z "$new_port" ]; then
-                        new_port=$(get_free_port 2000 65000)
+                        new_port=$(get_free_port 10000 65000)
                     else
                         until is_port_free "$new_port"; do
                             echo -e "${red}端口 $new_port 已被占用${re}"
                             reading "请输入tuic端口 (回车将使用随机端口): " new_port
-                            [ -z "$new_port" ] && { new_port=$(get_free_port 2000 65000); break; }
+                            [ -z "$new_port" ] && { new_port=$(get_free_port 10000 65000); break; }
                         done
                     fi
                     jq --arg port "$new_port" \
@@ -1229,12 +1229,12 @@ change_config() {
                 4)
                     reading "\n请输入vmess-argo端口 (回车跳过将使用随机端口): " new_port
                     if [ -z "$new_port" ]; then
-                        new_port=$(get_free_port 2000 65000)
+                        new_port=$(get_free_port 10000 65000)
                     else
                         until is_port_free "$new_port"; do
                             echo -e "${red}端口 $new_port 已被占用${re}"
                             reading "请输入vmess-argo端口 (回车将使用随机端口): " new_port
-                            [ -z "$new_port" ] && { new_port=$(get_free_port 2000 65000); break; }
+                            [ -z "$new_port" ] && { new_port=$(get_free_port 10000 65000); break; }
                         done
                     fi
                     jq --arg port "$new_port" \
@@ -1458,11 +1458,11 @@ disable_open_sub() {
             ;;
         3)
             reading "请输入新的订阅端口(1-65535,直接回车随机生成):" sub_port
-            [ -z "$sub_port" ] && sub_port=$(shuf -i 2000-65000 -n 1)
+            [ -z "$sub_port" ] && sub_port=$(shuf -i 10000-65000 -n 1)
             until [[ -z $(lsof -iTCP:"$sub_port" -sTCP:LISTEN -t) ]]; do
                 echo -e "${red}端口 $sub_port 已被占用${re}"
                 reading "请输入新的订阅端口(1-65535):" sub_port
-                [[ -z $sub_port ]] && sub_port=$(shuf -i 2000-65000 -n 1)
+                [[ -z $sub_port ]] && sub_port=$(shuf -i 10000-65000 -n 1)
             done
             green "新的订阅端口为：${purple}${sub_port}${re}"
             [ -f "/etc/nginx/conf.d/sing-box.conf" ] && \
