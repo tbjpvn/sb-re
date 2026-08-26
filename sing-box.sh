@@ -3379,40 +3379,6 @@ manage_singbox_core() {
     manage_singbox_core
 }
 
-
-# 切换为 BBR + fq 拥塞控制
-enable_bbr_fq() {
-    local sysctl_conf="/etc/sysctl.d/99-bbr-fq.conf"
-
-    if ! sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw "bbr"; then
-        modprobe tcp_bbr 2>/dev/null || true
-    fi
-
-    if ! sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw "bbr"; then
-        red "当前内核不支持 BBR，切换失败。"
-        return 1
-    fi
-
-    cat > "$sysctl_conf" << 'EOF'
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-EOF
-
-    sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1
-
-    local cc qdisc
-    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
-
-    if [ "$cc" = "bbr" ] && [ "$qdisc" = "fq" ]; then
-        green "已成功切换为 BBR + fq，并已设置为永久生效。"
-    else
-        red "切换失败，当前为: ${cc:-unknown}+${qdisc:-unknown}"
-        return 1
-    fi
-}
-
 # 主菜单
 menu() {
     singbox_status=$(check_singbox 2>/dev/null)
@@ -3445,7 +3411,6 @@ menu() {
     green "11. 出站IPv4/IPv6优先级"
     green "12. sing-box内核查看/更新"
     green "13. 单栈VPS加装WARP全局出站"
-    green "14. 切换为 BBR + fq 拥塞控制"
     echo "==============="
     purple "20. ssh综合工具箱"
     echo "==============="
@@ -3494,7 +3459,7 @@ case "$1" in
         # 无参数：进入交互式主菜单
         while true; do
             menu
-            reading "请输入选择(0-14,20): " choice 
+            reading "请输入选择(0-13,20): " choice 
             echo ""
             need_pause=true  
             case "${choice}" in
@@ -3534,7 +3499,6 @@ case "$1" in
                 11) manage_outbound_strategy; need_pause=false ;;
                 12) manage_singbox_core; need_pause=false ;;
                 13) system_warp_menu;   need_pause=false ;;
-                14) enable_bbr_fq;       need_pause=true ;;
                 20)
                     clear
                     bash <(curl -Ls ssh_tool.eooce.com)
@@ -3542,7 +3506,7 @@ case "$1" in
                     ;;
                 0)  exit 0 ;;       
                 *)
-                    red "无效的选项，请输入 0-14 或 20"
+                    red "无效的选项，请输入 0-13 或 20"
                     need_pause=true
                     ;;
             esac
