@@ -289,13 +289,6 @@ get_isp() {
             awk -F\" '{c="";o="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="org")o=$(x+2)};if(c&&o)print c"-"o}' | \
             sed 's/ /_/g')
     fi
-    # api.ip.sb 常年会403挡数据中心/VPS的IP，ipapi.co 免费额度极易被同网段用户刷爆返回RateLimited，
-    # 两个都失败时再兜底试一次 ip-api.com(免费版无https，且不支持IPv6，仅在flag为-4时可用)
-    if [ -z "$result" ] && [ "$flag" = "-4" ]; then
-        result=$(curl -4 -sm 3 "http://ip-api.com/json/?fields=countryCode,isp" 2>/dev/null | \
-            jq -r 'if (.countryCode!=null and .isp!=null) then (.countryCode+"-"+.isp) else empty end' 2>/dev/null | \
-            sed 's/ /_/g')
-    fi
     [ -z "$result" ] && return 1
     echo "$result"
     return 0
@@ -1140,7 +1133,7 @@ get_info() {
     yellow "\nip检测中,请稍等...\n"
     server_ip=$(get_realip)
     clear
-    isp=$(get_isp || echo "$(hostname)")
+    isp=$(get_isp || echo "$hostname")
 
 
     if [ -f "${work_dir}/argo.log" ]; then
@@ -1616,7 +1609,7 @@ change_config() {
             restart_singbox
             sed -i -E 's/(vless:\/\/|hysteria2:\/\/|anytls:\/\/)[^@]*(@.*)/\1'"$new_uuid"'\2/' $client_dir
             sed -i -E "s#tuic://[0-9a-f-]{36}:[0-9a-f-]{36}@#tuic://$new_uuid:$new_uuid@#g" $client_dir
-            isp=$(get_isp || echo "$(hostname)")
+            isp=$(get_isp || echo "$hostname")
             argodomain=$(grep -oE 'https://[[:alnum:]+\.-]+\.trycloudflare\.com' "${work_dir}/argo.log" | sed 's@https://@@')
             VMESS="{ \"v\": \"2\", \"ps\": \"${isp}-VMess-Argo\", \"add\": \"${CFIP}\", \"port\": \"443\", \"id\": \"${new_uuid}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"\", \"allowInsecure\": \"false\"}"
             encoded_vmess=$(echo "$VMESS" | base64 -w0)
@@ -1683,7 +1676,7 @@ IEOF
             fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
             uuid=$(sed -n 's/.*hysteria2:\/\/\([^@]*\)@.*/\1/p' $client_dir)
             line_number=$(grep -n 'hysteria2://' $client_dir | cut -d':' -f1)
-            isp=$(get_isp || echo "$(hostname)")
+            isp=$(get_isp || echo "$hostname")
             sed -i.bak "/hysteria2:/d" $client_dir
             sed -i "${line_number}i hysteria2://$uuid@$ip:$listen_port?peer=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none&mport=$listen_port,$min_port-$max_port#$isp-Hysteria2" $client_dir
             base64 -w0 $client_dir > /etc/sing-box/sub.txt
