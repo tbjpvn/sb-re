@@ -2951,6 +2951,31 @@ install_acme() {
     return 0
 }
 
+# 解析域名的A/AAAA记录，兼容glibc与musl(Alpine等)系统。
+# family=4 查A记录，family=6 查AAAA记录。
+# getent的ahostsv4/ahostsv6是glibc专属扩展，musl系统(如Alpine)的getent不支持，
+# 会直接返回空而不是报错，导致明明CF上解析正常，脚本却误判为"未检测到解析记录"。
+# 这里在getent失败时，回退到Cloudflare的DNS over HTTPS接口再查一次。
+resolve_dns_record() {
+    local domain="$1" family="$2" ip=""
+    if command_exists getent; then
+        if [ "$family" = "4" ]; then
+            ip=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | head -1)
+        else
+            ip=$(getent ahostsv6 "$domain" 2>/dev/null | awk '{print $1}' | head -1)
+        fi
+    fi
+    if [ -z "$ip" ]; then
+        local qtype="A"
+        [ "$family" = "6" ] && qtype="AAAA"
+        # 不强制-4/-6，避免单栈主机（尤其是纯IPv6主机）访问受限导致查询本身失败
+        ip=$(curl -sm 5 -H "accept: application/dns-json" \
+            "https://cloudflare-dns.com/dns-query?name=${domain}&type=${qtype}" 2>/dev/null \
+            | grep -o '"data":"[^"]*"' | head -1 | cut -d'"' -f4)
+    fi
+    echo "$ip"
+}
+
 # 申请域名证书，成功后将替换hy2和tuic当前使用的bing.com自签证书
 apply_domain_cert() {
     check_singbox &>/dev/null
@@ -2974,8 +2999,8 @@ apply_domain_cert() {
     local server_ip4 server_ip6 resolved_ip4 resolved_ip6
     server_ip4=$(curl -4 -sm 5 ip.sb)
     server_ip6=$(curl -6 -sm 5 ip.sb)
-    resolved_ip4=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | head -1)
-    resolved_ip6=$(getent ahostsv6 "$domain" 2>/dev/null | awk '{print $1}' | head -1)
+    resolved_ip4=$(resolve_dns_record "$domain" 4)
+    resolved_ip6=$(resolve_dns_record "$domain" 6)
     if [ -n "$server_ip4" ] && [ -n "$resolved_ip4" ] && [ "$server_ip4" != "$resolved_ip4" ]; then
         red "警告：域名 ${domain} 的A记录(${resolved_ip4}) 与本机IPv4(${server_ip4}) 不一致！"
         reading "证书申请大概率会失败，是否仍然继续? (y/n，默认n): " force_continue
