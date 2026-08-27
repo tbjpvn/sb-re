@@ -399,7 +399,7 @@ generate_warp_endpoint() {
     local try=0 max_try=5
     while [ $try -lt $max_try ]; do
         try=$((try + 1))
-        reg_response=$(curl -4 -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
+        reg_response=$(curl -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
             -H "Content-Type: application/json" \
             -H "User-Agent: okhttp/3.12.1" \
             -H "CF-Client-Version: a-6.30-3596" \
@@ -577,7 +577,7 @@ cf_warp_register() {
 
     while [ $try -lt 5 ]; do
         try=$((try + 1))
-        reg_response=$(curl -4 -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
+        reg_response=$(curl -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
             -H "Content-Type: application/json" \
             -H "User-Agent: okhttp/3.12.1" \
             -H "CF-Client-Version: a-6.30-3596" \
@@ -812,40 +812,15 @@ install_singbox() {
     esac
 
     [ ! -d "${work_dir}" ] && mkdir -p "${work_dir}" && chmod 777 "${work_dir}" && mkdir -p "${conf_dir}"
-
-    # 改为从 sing-box 官方 GitHub Releases 下载二进制（原来的 ssss.nyc.mn 三方源已注释掉）
-    latest_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==false)][0].tag_name | sub("^v"; "")')
-    if [ -z "$latest_version" ] || [ "$latest_version" = "null" ]; then
-        red "获取 sing-box 最新版本号失败，请检查服务器是否能访问 api.github.com\n"
-        exit 1
-    fi
-    if ! curl -fsSLo "${work_dir}/${server_name}.tar.gz" "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${ARCH}.tar.gz"; then
-        red "从 GitHub 下载 sing-box 二进制失败，请检查服务器是否能访问 github.com\n"
-        exit 1
-    fi
-    tar -xzvf "${work_dir}/${server_name}.tar.gz" -C "${work_dir}/" && \
-    mv "${work_dir}/sing-box-${latest_version}-linux-${ARCH}/sing-box" "${work_dir}/" && \
-    rm -rf "${work_dir}/${server_name}.tar.gz" "${work_dir}/sing-box-${latest_version}-linux-${ARCH}"
-
-    # argo 改用 Cloudflare 官方 cloudflared 二进制（ssss.nyc.mn 已失效）
-    case "${ARCH}" in
-        'amd64') CF_ARCH='amd64' ;;
-        '386')   CF_ARCH='386' ;;
-        'arm64') CF_ARCH='arm64' ;;
-        'armv7') CF_ARCH='arm' ;;
-        *) CF_ARCH='' ;;
-    esac
-    if [ -z "$CF_ARCH" ]; then
-        yellow "架构 ${ARCH} 官方 cloudflared 不提供预编译包，argo 隧道功能将不可用\n"
-        : > "${work_dir}/argo"
-    elif ! curl -fsSLo "${work_dir}/argo" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"; then
-        red "从 GitHub 下载 cloudflared 失败，请检查服务器是否能访问 github.com\n"
-        exit 1
-    fi
-
-    # qrencode 官方没有独立预编译二进制，暂时仍用 eooce/test 这个 GitHub 开源仓库的 release（比原来的裸域名至少可查看源码/校验），
-    # 如果你的服务器装了系统自带的 qrencode，也可以把下面这行换成: cp "$(command -v qrencode)" "${work_dir}/qrencode"
-    curl -sLo "${work_dir}/qrencode" "https://github.com/eooce/test/releases/download/${ARCH}/qrencode-linux-${ARCH}"
+    # latest_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==false)][0].tag_name | sub("^v"; "")')
+    # curl -sLo "${work_dir}/${server_name}.tar.gz" "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${ARCH}.tar.gz"
+    # curl -sLo "${work_dir}/qrencode" "https://github.com/eooce/test/releases/download/${ARCH}/qrencode-linux-${ARCH}"
+    curl -sLo "${work_dir}/qrencode" "https://$ARCH.ssss.nyc.mn/qrencode"
+    curl -sLo "${work_dir}/sing-box" "https://$ARCH.ssss.nyc.mn/sb"
+    curl -sLo "${work_dir}/argo" "https://$ARCH.ssss.nyc.mn/bot"
+    # tar -xzvf "${work_dir}/${server_name}.tar.gz" -C "${work_dir}/" && \
+    # mv "${work_dir}/sing-box-${latest_version}-linux-${ARCH}/sing-box" "${work_dir}/" && \
+    # rm -rf "${work_dir}/${server_name}.tar.gz" "${work_dir}/sing-box-${latest_version}-linux-${ARCH}"
     chown root:root ${work_dir} && chmod +x ${work_dir}/${server_name} ${work_dir}/argo ${work_dir}/qrencode
 
     # 确保vless_port本身也是空闲的（防止PORT环境变量或随机数刚好撞上已占用端口）
