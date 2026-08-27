@@ -2951,27 +2951,35 @@ install_acme() {
     return 0
 }
 
-# 解析域名的A/AAAA记录，兼容glibc与musl(Alpine等)系统。
+# 解析域名的A/AAAA记录。
 # family=4 查A记录，family=6 查AAAA记录。
-# getent的ahostsv4/ahostsv6是glibc专属扩展，musl系统(如Alpine)的getent不支持，
-# 会直接返回空而不是报错，导致明明CF上解析正常，脚本却误判为"未检测到解析记录"。
-# 这里在getent失败时，回退到Cloudflare的DNS over HTTPS接口再查一次。
+# 优先使用Cloudflare的DNS over HTTPS查询：绕开本机/运营商/机房出口的本地DNS，
+# 避免部分网络在NXDOMAIN(查无记录)时做"兜底劫持"、返回一个不存在的假IP，
+# 导致明明CF没配A记录，脚本却报"A记录与本机IPv4不一致"这种误报。
+# getent仅作为DoH完全不可用(比如无法访问cloudflare-dns.com)时的兜底方案，
+# 且getent的ahostsv4/ahostsv6是glibc专属扩展，musl(如Alpine)系统本就不支持。
 resolve_dns_record() {
-    local domain="$1" family="$2" ip=""
+    local domain="$1" family="$2" ip="" qtype="A" resp
+    [ "$family" = "6" ] && qtype="AAAA"
+
+    resp=$(curl -sm 5 -H "accept: application/dns-json" \
+        "https://cloudflare-dns.com/dns-query?name=${domain}&type=${qtype}" 2>/dev/null)
+    if [ -n "$resp" ]; then
+        # 明确判断有没有Answer段，没有就代表确实没有这条记录，不再往下兜底成别的结果
+        if printf '%s' "$resp" | grep -q '"Answer"'; then
+            ip=$(printf '%s' "$resp" | grep -o '"data":"[^"]*"' | tail -1 | cut -d'"' -f4)
+        fi
+        echo "$ip"
+        return
+    fi
+
+    # 走到这里说明DoH查询本身失败(比如无法访问外网DoH接口)，退回本地getent兜底
     if command_exists getent; then
         if [ "$family" = "4" ]; then
             ip=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | head -1)
         else
             ip=$(getent ahostsv6 "$domain" 2>/dev/null | awk '{print $1}' | head -1)
         fi
-    fi
-    if [ -z "$ip" ]; then
-        local qtype="A"
-        [ "$family" = "6" ] && qtype="AAAA"
-        # 不强制-4/-6，避免单栈主机（尤其是纯IPv6主机）访问受限导致查询本身失败
-        ip=$(curl -sm 5 -H "accept: application/dns-json" \
-            "https://cloudflare-dns.com/dns-query?name=${domain}&type=${qtype}" 2>/dev/null \
-            | grep -o '"data":"[^"]*"' | head -1 | cut -d'"' -f4)
     fi
     echo "$ip"
 }
