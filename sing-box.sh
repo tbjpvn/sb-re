@@ -812,15 +812,24 @@ install_singbox() {
     esac
 
     [ ! -d "${work_dir}" ] && mkdir -p "${work_dir}" && chmod 777 "${work_dir}" && mkdir -p "${conf_dir}"
-    # latest_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==false)][0].tag_name | sub("^v"; "")')
-    # curl -sLo "${work_dir}/${server_name}.tar.gz" "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${ARCH}.tar.gz"
-    # curl -sLo "${work_dir}/qrencode" "https://github.com/eooce/test/releases/download/${ARCH}/qrencode-linux-${ARCH}"
+
+    # 改为从 sing-box 官方 GitHub Releases 下载二进制（原来的 ssss.nyc.mn 三方源已注释掉）
+    latest_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==false)][0].tag_name | sub("^v"; "")')
+    if [ -z "$latest_version" ] || [ "$latest_version" = "null" ]; then
+        red "获取 sing-box 最新版本号失败，请检查服务器是否能访问 api.github.com\n"
+        exit 1
+    fi
+    if ! curl -fsSLo "${work_dir}/${server_name}.tar.gz" "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${ARCH}.tar.gz"; then
+        red "从 GitHub 下载 sing-box 二进制失败，请检查服务器是否能访问 github.com\n"
+        exit 1
+    fi
+    tar -xzvf "${work_dir}/${server_name}.tar.gz" -C "${work_dir}/" && \
+    mv "${work_dir}/sing-box-${latest_version}-linux-${ARCH}/sing-box" "${work_dir}/" && \
+    rm -rf "${work_dir}/${server_name}.tar.gz" "${work_dir}/sing-box-${latest_version}-linux-${ARCH}"
+
+    # qrencode / argo(cloudflared) 暂时保留原三方源，如需也换成官方源告诉我
     curl -sLo "${work_dir}/qrencode" "https://$ARCH.ssss.nyc.mn/qrencode"
-    curl -sLo "${work_dir}/sing-box" "https://$ARCH.ssss.nyc.mn/sb"
     curl -sLo "${work_dir}/argo" "https://$ARCH.ssss.nyc.mn/bot"
-    # tar -xzvf "${work_dir}/${server_name}.tar.gz" -C "${work_dir}/" && \
-    # mv "${work_dir}/sing-box-${latest_version}-linux-${ARCH}/sing-box" "${work_dir}/" && \
-    # rm -rf "${work_dir}/${server_name}.tar.gz" "${work_dir}/sing-box-${latest_version}-linux-${ARCH}"
     chown root:root ${work_dir} && chmod +x ${work_dir}/${server_name} ${work_dir}/argo ${work_dir}/qrencode
 
     # 确保vless_port本身也是空闲的（防止PORT环境变量或随机数刚好撞上已占用端口）
