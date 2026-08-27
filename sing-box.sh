@@ -289,6 +289,13 @@ get_isp() {
             awk -F\" '{c="";o="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="org")o=$(x+2)};if(c&&o)print c"-"o}' | \
             sed 's/ /_/g')
     fi
+    # api.ip.sb 常年会403挡数据中心/VPS的IP，ipapi.co 免费额度极易被同网段用户刷爆返回RateLimited，
+    # 两个都失败时再兜底试一次 ip-api.com(免费版无https，且不支持IPv6，仅在flag为-4时可用)
+    if [ -z "$result" ] && [ "$flag" = "-4" ]; then
+        result=$(curl -4 -sm 3 "http://ip-api.com/json/?fields=countryCode,isp" 2>/dev/null | \
+            jq -r 'if (.countryCode!=null and .isp!=null) then (.countryCode+"-"+.isp) else empty end' 2>/dev/null | \
+            sed 's/ /_/g')
+    fi
     [ -z "$result" ] && return 1
     echo "$result"
     return 0
