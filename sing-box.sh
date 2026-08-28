@@ -454,6 +454,7 @@ generate_warp_endpoint() {
     fi
 
     # 4. 写入 endpoints.json
+    # 使用 IP 而非域名作为 peer 地址 + keepalive，提升服务端场景稳定性（不写 detour，避免 direct 缺失时报错）
     if [ -n "$v6" ]; then
         cat > "$endpoints_file" << EOF
 {
@@ -469,10 +470,11 @@ generate_warp_endpoint() {
       "private_key": "$private_key",
       "peers": [
         {
-          "address": "engage.cloudflareclient.com",
+          "address": "162.159.192.1",
           "port": 2408,
           "public_key": "$peer_pub",
           "allowed_ips": ["0.0.0.0/0", "::/0"],
+          "persistent_keepalive_interval": 25,
           "reserved": $reserved_json
         }
       ]
@@ -494,10 +496,11 @@ EOF
       "private_key": "$private_key",
       "peers": [
         {
-          "address": "engage.cloudflareclient.com",
+          "address": "162.159.192.1",
           "port": 2408,
           "public_key": "$peer_pub",
           "allowed_ips": ["0.0.0.0/0", "::/0"],
+          "persistent_keepalive_interval": 25,
           "reserved": $reserved_json
         }
       ]
@@ -531,10 +534,11 @@ write_fallback_warp_endpoint() {
       "private_key": "YFYOAdbw1bKTHlNNi+aEjBM3BO7unuFC5rOkMRAz9XY=",
       "peers": [
         {
-          "address": "engage.cloudflareclient.com",
+          "address": "162.159.192.1",
           "port": 2408,
           "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
           "allowed_ips": ["0.0.0.0/0", "::/0"],
+          "persistent_keepalive_interval": 25,
           "reserved": [78, 135, 76]
         }
       ]
@@ -915,7 +919,7 @@ install_singbox() {
 {
   "log": {
     "disabled": false,
-    "level": "error",
+    "level": "warn",
     "output": "$work_dir/sb.log",
     "timestamp": true
   }
@@ -1056,8 +1060,8 @@ EOF
 {
   "route": {
     "rule_set": [
-      {"tag":"gemini","type":"remote","format":"binary","url":"https://github.com/vernette/rulesets/raw/master/srs/gemini.srs","download_detour":"direct"},
-      {"tag":"claude","type":"remote","format":"binary","url":"https://github.com/vernette/rulesets/raw/master/srs/claude.srs","download_detour":"direct"},
+      {"tag":"gemini","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/google.srs","download_detour":"direct"},
+      {"tag":"claude","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/anthropic.srs","download_detour":"direct"},
       {"tag":"openai","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/openai.srs","download_detour":"direct"},
       {"tag":"tiktok","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/tiktok.srs","download_detour":"direct"},
       {"tag":"twitter","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/twitter.srs","download_detour":"direct"},
@@ -2092,6 +2096,96 @@ change_cfip() {
     purple "$new_vmess_url\n"
 }
 
+# 一键测试 WARP 连通性（临时添加本地 socks + 全局走 WARP，测完自动恢复）
+test_warp_connectivity() {
+    local inbounds_file="${conf_dir}/inbounds.json"
+    local route_file="${conf_dir}/route.json"
+    local test_port=10808
+    local had_socks=0
+    local route_bak="${route_file}.bak.warptest"
+    local inbounds_bak="${inbounds_file}.bak.warptest"
+
+    clear
+    green "=== 测试 WARP 连通性 ===\n"
+    yellow "说明：服务器本机直接 curl 不会经过 sing-box，因此会临时："
+    yellow "  1. 添加 127.0.0.1:${test_port} 的 socks 入站"
+    yellow "  2. 把路由临时改为全局走 wireguard-out"
+    yellow "  3. 用 curl 通过 socks 测试出口"
+    yellow "  4. 测试结束后自动恢复原配置\n"
+
+    # 备份
+    cp "$route_file" "$route_bak"
+    cp "$inbounds_file" "$inbounds_bak"
+
+    # 确保有本地 socks 入站
+    if jq -e --argjson p "$test_port" '.inbounds[] | select(.type=="socks" and .listen_port==$p)' "$inbounds_file" >/dev/null 2>&1; then
+        had_socks=1
+    else
+        jq --argjson p "$test_port" '.inbounds += [{
+            "type": "socks",
+            "tag": "socks-warptest",
+            "listen": "127.0.0.1",
+            "listen_port": $p
+        }]' "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+    fi
+
+    # 临时全局 WARP
+    cat > "$route_file" << EOF
+{
+  "route": {
+    "rules": [{"outbound": "wireguard-out"}],
+    "final": "wireguard-out",
+    "default_domain_resolver": {
+      "server": "local",
+      "strategy": "prefer_ipv4"
+    }
+  }
+}
+EOF
+
+    restart_singbox
+    sleep 2
+
+    green "正在通过 socks5://127.0.0.1:${test_port} 测试 WARP 出口...\n"
+    local ip_result warp_result
+    ip_result=$(curl -4 -x "socks5h://127.0.0.1:${test_port}" -sm 12 https://ip.sb 2>/dev/null)
+    warp_result=$(curl -4 -x "socks5h://127.0.0.1:${test_port}" -sm 12 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E '^(ip|warp|colo)=')
+
+    echo ""
+    if [ -n "$ip_result" ]; then
+        green "出口 IP: ${purple}${ip_result}${re}"
+    else
+        red "获取出口 IP 失败（超时或连接失败）"
+    fi
+    if [ -n "$warp_result" ]; then
+        echo "$warp_result" | while read line; do
+            if echo "$line" | grep -q "warp=on"; then
+                green "$line"
+            else
+                yellow "$line"
+            fi
+        done
+    fi
+
+    if echo "$warp_result" | grep -q "warp=on"; then
+        green "\n✅ WARP 连通正常！"
+    else
+        red "\n❌ WARP 未生效。请检查："
+        yellow "  - 是否已重新生成独立 WARP 密钥"
+        yellow "  - /etc/sing-box/sb.log 中是否有 handshake 错误"
+        yellow "  - endpoints.json 中 peer 地址是否为 162.159.192.1"
+    fi
+
+    # 恢复
+    yellow "\n正在恢复原配置..."
+    mv "$route_bak" "$route_file"
+    mv "$inbounds_bak" "$inbounds_file"
+    restart_singbox
+    green "配置已恢复。\n"
+    read -n 1 -s -r -p $'\033[1;91m按任意键返回...\033[0m\n'
+    warp_manage
+}
+
 # WARP 分流管理
 warp_manage() {
     check_singbox &>/dev/null
@@ -2123,6 +2217,8 @@ warp_manage() {
     skyblue "----------------------"
     green "5. 重新生成独立 WARP 密钥"
     skyblue "----------------------"
+    green "6. 测试 WARP 连通性（推荐）"
+    skyblue "----------------------"
     purple "0. 返回主菜单"
     skyblue "------------"
     purple "00. 退出脚本"
@@ -2134,6 +2230,7 @@ warp_manage() {
         3)  add_socks5_proxy ;;
         4)  delete_socks5_proxy ;;
         5)  regenerate_warp_keys; warp_manage ;;
+        6)  test_warp_connectivity ;;
         0)  menu ;;
         00) exit 0 ;;
         *)  red "无效选项"; sleep 1; warp_manage ;;
@@ -2248,7 +2345,10 @@ add_rule_menu() {
     else
         green "'${rule_tag}' 已分流至出站 '${selected_out}'"
     fi
-    sleep 1; warp_manage
+    if [ "$selected_out" = "wireguard-out" ]; then
+        yellow "提示：请用客户端连接节点后访问对应网站验证；也可到「6. 测试 WARP 连通性」一键检测。"
+    fi
+    sleep 2; warp_manage
 }
 
 # 设置全局代理出站
@@ -2309,8 +2409,8 @@ restore_direct_outbound() {
 {
   "route": {
     "rule_set": [
-      {"tag":"gemini","type":"remote","format":"binary","url":"https://github.com/vernette/rulesets/raw/master/srs/gemini.srs","download_detour":"direct"},
-      {"tag":"claude","type":"remote","format":"binary","url":"https://github.com/vernette/rulesets/raw/master/srs/claude.srs","download_detour":"direct"},
+      {"tag":"gemini","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/google.srs","download_detour":"direct"},
+      {"tag":"claude","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/anthropic.srs","download_detour":"direct"},
       {"tag":"openai","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/openai.srs","download_detour":"direct"},
       {"tag":"tiktok","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/tiktok.srs","download_detour":"direct"},
       {"tag":"twitter","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/twitter.srs","download_detour":"direct"},
