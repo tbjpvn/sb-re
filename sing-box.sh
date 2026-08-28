@@ -2234,7 +2234,7 @@ add_rule_menu() {
             else
                 (first(.route.rules[] | select(.outbound == $out)) | .rule_set) as $existing
                 | if $existing then
-                    .route.rules = [.route.rules[] | select(.outbound == $out).rule_set += [$tag]]
+                    .route.rules = [.route.rules[] | if .outbound == $out then .rule_set += [$tag] else . end]
                   else
                     .route.rules += [{"rule_set": [$tag], "outbound": $out}]
                   end
@@ -2511,11 +2511,9 @@ add_socks5_proxy() {
            "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
     fi
 
-    if jq -e '.route.rules | length > 0' "$route_file" >/dev/null 2>&1; then
-        jq --arg tag "$tag" '.route.rules[].outbound = $tag' "$route_file" > "${route_file}.tmp" \
-            && mv "${route_file}.tmp" "$route_file"
-        yellow "已将现有分流规则出站切换为 '${tag}'。"
-    fi
+    # 注意：新增代理出站不应自动接管已有的分流规则，
+    # 否则会把之前所有服务(如gemini/openai等)的出站全部覆盖成这个新加的代理，
+    # 请到「1. 设置分流服务」里手动为需要的服务选择这个新出站。
 
     restart_singbox
     green "\n${tag} 代理出站已添加\n"
