@@ -1056,8 +1056,8 @@ EOF
 {
   "route": {
     "rule_set": [
-      {"tag":"gemini","type":"remote","format":"binary","url":"https://main.ssss.nyc.mn/gemini.srs","download_detour":"direct"},
-      {"tag":"claude","type":"remote","format":"binary","url":"https://main.ssss.nyc.mn/claude.srs","download_detour":"direct"},
+      {"tag":"gemini","type":"remote","format":"binary","url":"https://github.com/vernette/rulesets/raw/master/srs/gemini.srs","download_detour":"direct"},
+      {"tag":"claude","type":"remote","format":"binary","url":"https://github.com/vernette/rulesets/raw/master/srs/claude.srs","download_detour":"direct"},
       {"tag":"openai","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/openai.srs","download_detour":"direct"},
       {"tag":"tiktok","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/tiktok.srs","download_detour":"direct"},
       {"tag":"twitter","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/twitter.srs","download_detour":"direct"},
@@ -2309,8 +2309,8 @@ restore_direct_outbound() {
 {
   "route": {
     "rule_set": [
-      {"tag":"gemini","type":"remote","format":"binary","url":"https://main.ssss.nyc.mn/gemini.srs","download_detour":"direct"},
-      {"tag":"claude","type":"remote","format":"binary","url":"https://main.ssss.nyc.mn/claude.srs","download_detour":"direct"},
+      {"tag":"gemini","type":"remote","format":"binary","url":"https://github.com/vernette/rulesets/raw/master/srs/gemini.srs","download_detour":"direct"},
+      {"tag":"claude","type":"remote","format":"binary","url":"https://github.com/vernette/rulesets/raw/master/srs/claude.srs","download_detour":"direct"},
       {"tag":"openai","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/openai.srs","download_detour":"direct"},
       {"tag":"tiktok","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/tiktok.srs","download_detour":"direct"},
       {"tag":"twitter","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/twitter.srs","download_detour":"direct"},
