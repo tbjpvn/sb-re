@@ -834,6 +834,20 @@ install_singbox() {
     mv "${work_dir}/sing-box-${latest_version}-linux-${ARCH}/sing-box" "${work_dir}/" && \
     rm -rf "${work_dir}/${server_name}.tar.gz" "${work_dir}/sing-box-${latest_version}-linux-${ARCH}"
 
+    # Alpine (musl libc) 系统需要额外安装 gcompat 兼容层，
+    # 否则官方 GitHub 发行的 glibc 二进制文件在 Alpine 上会直接无法执行（shell报"not found"，容易误判为文件不存在或安装失败），
+    # 导致后面 generate reality-keypair 拿到空输出，装完sing-box却起不来。
+    if [ -f /etc/alpine-release ]; then
+        if ! apk info -e gcompat >/dev/null 2>&1; then
+            yellow "\n检测到 Alpine (musl) 系统，正在安装 glibc 兼容层 gcompat...\n"
+            apk add --no-cache gcompat >/dev/null 2>&1
+            if ! apk info -e gcompat >/dev/null 2>&1; then
+                red "gcompat 安装失败，官方sing-box二进制在Alpine上大概率无法运行，请手动执行: apk add gcompat 后重新运行本脚本安装\n"
+                exit 1
+            fi
+        fi
+    fi
+
     # argo 改用 Cloudflare 官方 cloudflared 二进制（ssss.nyc.mn 已失效）
     case "${ARCH}" in
         'amd64') CF_ARCH='amd64' ;;
@@ -877,6 +891,15 @@ install_singbox() {
     output=$(/etc/sing-box/sing-box generate reality-keypair)
     private_key=$(echo "${output}" | awk '/PrivateKey:/ {print $2}')
     public_key=$(echo "${output}" | awk '/PublicKey:/ {print $2}')
+
+    # 校验密钥是否生成成功。若sing-box二进制本身无法执行(比如上面gcompat没装成功)，
+    # 这里会拿到空字符串，之前会被原样写进配置文件，导致装完了但服务因invalid private key起不来，
+    # 且现象是"看起来装完了"，很难排查，这里直接提前终止并报错。
+    if [ -z "$private_key" ] || [ -z "$public_key" ]; then
+        red "生成 reality 密钥对失败！/etc/sing-box/sing-box 二进制可能无法在本机正常执行。\n"
+        yellow "请先手动执行 /etc/sing-box/sing-box version 排查(Alpine系统常见原因是缺少gcompat，可执行 apk add gcompat 后重试)。\n"
+        exit 1
+    fi
 
     allow_port $vless_port/tcp $nginx_port/tcp $tuic_port/udp $hy2_port/udp > /dev/null 2>&1
 
