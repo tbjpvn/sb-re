@@ -3,7 +3,7 @@
 # =========================
 # 老王sing-box四合一安装脚本
 # vless-version-reality|vmess-ws-tls(tunnel)|hysteria2|tuic5|[可额外添加Anytls，socks5，ss2022等协议] 
-# 最后更新时间: 2026.6.7[添加hy2证书, 添加ipv4和ipv6切换]
+# 最后更新时间: 2026.8.29[默认启用 route sniff，修复分流规则增删逻辑]
 # =========================
 
 export LANG=en_US.UTF-8
@@ -1071,7 +1071,9 @@ EOF
       {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
       {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
     ],
-    "rules": [{"rule_set": []}],
+    "rules": [
+      {"action": "sniff"}
+    ],
     "final": "direct",
     "default_domain_resolver": {
       "server": "local",
@@ -2129,11 +2131,14 @@ test_warp_connectivity() {
         }]' "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
     fi
 
-    # 临时全局 WARP
+    # 临时全局 WARP（保留 sniff，避免域名类检测异常）
     cat > "$route_file" << EOF
 {
   "route": {
-    "rules": [{"outbound": "wireguard-out"}],
+    "rules": [
+      {"action": "sniff"},
+      {"outbound": "wireguard-out"}
+    ],
     "final": "wireguard-out",
     "default_domain_resolver": {
       "server": "local",
@@ -2283,10 +2288,23 @@ add_rule_menu() {
         yellow "规则集 '${rule_tag}' 已启用。"; sleep 1; warp_manage; return
     fi
 
-    jq 'if (.route.rules | length) == 1 and (.route.rules[0].rule_set | length) == 0
-        then .route.rules = []
-        else . end' \
-        "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    # 清理旧版空哨兵规则 {"rule_set": []}，同时确保首位始终有 sniff
+    # （旧逻辑依赖 length==1 的空 rule_set，加了 sniff 后必须改写，否则会把规则清空导致节点全挂）
+    jq '
+      .route.rules = (
+        [{"action":"sniff"}]
+        + [
+            .route.rules[]?
+            | select(
+                (.action != "sniff")
+                and (
+                  (.rule_set | type) != "array"
+                  or (.rule_set | length) > 0
+                )
+              )
+          ]
+      )
+    ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
 
     local out_tags=($(jq -r '.outbounds[] | select(.tag != "direct") | .tag' "$outbound_file" 2>/dev/null))
     if [ ${#out_tags[@]} -eq 0 ]; then
@@ -2325,17 +2343,19 @@ add_rule_menu() {
             "$route_file" >/dev/null 2>&1; then
             continue
         fi
+        # 始终保持 sniff 在第一位；分流规则追加在其后
         jq --arg tag "$tag" --arg out "$selected_out" '
-            if (.route.rules | length) == 0 then
-                .route.rules = [{"rule_set": [$tag], "outbound": $out}]
-            else
-                (first(.route.rules[] | select(.outbound == $out)) | .rule_set) as $existing
-                | if $existing then
-                    .route.rules = [.route.rules[] | if .outbound == $out then .rule_set += [$tag] else . end]
-                  else
-                    .route.rules += [{"rule_set": [$tag], "outbound": $out}]
-                  end
-            end
+            .route.rules = (
+              [{"action":"sniff"}]
+              + (
+                  [ .route.rules[]? | select(.action != "sniff") ]
+                  | if (map(select(.outbound == $out)) | length) > 0 then
+                      map(if .outbound == $out then .rule_set += [$tag] else . end)
+                    else
+                      . + [{"rule_set": [$tag], "outbound": $out}]
+                    end
+                )
+            )
         ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
     done
 
@@ -2420,7 +2440,9 @@ restore_direct_outbound() {
       {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
       {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
     ],
-    "rules": [{"rule_set": []}],
+    "rules": [
+      {"action": "sniff"}
+    ],
     "final": "direct",
     "default_domain_resolver": {
       "server": "local",
@@ -2460,10 +2482,24 @@ delete_rule_menu() {
         tags_to_del=("telegram" "telegram-ip")
     fi
     for t in "${tags_to_del[@]}"; do
-        jq --arg tag "$t" \
-           'del(.route.rules[] | select(.rule_set != null) | .rule_set[] | select(. == $tag)) |
-            .route.rules = [.route.rules[] | select(.rule_set != null and (.rule_set | length) > 0)]' \
-           "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+        # 删除指定 rule_set 标签后，始终保留首位 sniff，并去掉空 rule_set 规则
+        jq --arg tag "$t" '
+          .route.rules = (
+            [{"action":"sniff"}]
+            + [
+                .route.rules[]?
+                | select(.action != "sniff")
+                | if .rule_set != null then
+                    .rule_set = [.rule_set[] | select(. != $tag)]
+                  else . end
+                | select(
+                    (.rule_set | type) != "array"
+                    or (.rule_set | length) > 0
+                    or .outbound != null
+                  )
+              ]
+          )
+        ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
     done
     restart_singbox
     if [ "$tag" = "telegram" ] || [ "$tag" = "telegram-ip" ]; then
