@@ -1071,7 +1071,7 @@ EOF
       {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
       {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
     ],
-    "rules": [{"action": "sniff"}, {"rule_set": []}],
+    "rules": [{"inbound": ["vless-reality"], "invert": true, "action": "sniff"}, {"rule_set": []}],
     "final": "direct",
     "default_domain_resolver": {
       "server": "local",
@@ -2418,7 +2418,7 @@ restore_direct_outbound() {
       {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
       {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
     ],
-    "rules": [{"action": "sniff"}, {"rule_set": []}],
+    "rules": [{"inbound": ["vless-reality"], "invert": true, "action": "sniff"}, {"rule_set": []}],
     "final": "direct",
     "default_domain_resolver": {
       "server": "local",
