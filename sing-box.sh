@@ -1071,7 +1071,7 @@ EOF
       {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
       {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
     ],
-    "rules": [{"rule_set": []}],
+    "rules": [{"action": "sniff"}, {"rule_set": []}],
     "final": "direct",
     "default_domain_resolver": {
       "server": "local",
@@ -2283,9 +2283,7 @@ add_rule_menu() {
         yellow "规则集 '${rule_tag}' 已启用。"; sleep 1; warp_manage; return
     fi
 
-    jq 'if (.route.rules | length) == 1 and (.route.rules[0].rule_set | length) == 0
-        then .route.rules = []
-        else . end' \
+    jq '.route.rules = [.route.rules[] | select(.rule_set == null or (.rule_set | length) > 0)]' \
         "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
 
     local out_tags=($(jq -r '.outbounds[] | select(.tag != "direct") | .tag' "$outbound_file" 2>/dev/null))
@@ -2420,7 +2418,7 @@ restore_direct_outbound() {
       {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
       {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
     ],
-    "rules": [{"rule_set": []}],
+    "rules": [{"action": "sniff"}, {"rule_set": []}],
     "final": "direct",
     "default_domain_resolver": {
       "server": "local",
@@ -2462,7 +2460,7 @@ delete_rule_menu() {
     for t in "${tags_to_del[@]}"; do
         jq --arg tag "$t" \
            'del(.route.rules[] | select(.rule_set != null) | .rule_set[] | select(. == $tag)) |
-            .route.rules = [.route.rules[] | select(.rule_set != null and (.rule_set | length) > 0)]' \
+            .route.rules = [.route.rules[] | select(.rule_set == null or (.rule_set | length) > 0)]' \
            "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
     done
     restart_singbox
