@@ -1475,6 +1475,10 @@ auto_uninstall() {
     rm -rf "${work_dir}"
     rm -f /usr/bin/sb
 
+    # 清理系统级 WARP 出站（关闭接口、取消开机自启、删除 crontab 与配置文件，静默执行）
+    sys_warp_remove 4 >/dev/null 2>&1
+    sys_warp_remove 6 >/dev/null 2>&1
+
     if command_exists nginx; then
         if command_exists rc-service; then
             rc-service nginx stop   > /dev/null 2>&1
