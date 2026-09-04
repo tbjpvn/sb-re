@@ -141,11 +141,11 @@ check_dualstack() {
     ip4=$(cat "$tmp4" 2>/dev/null); ip6=$(cat "$tmp6" 2>/dev/null)
     rm -f "$tmp4" "$tmp6"
     if [ -n "$ip4" ] && [ -n "$ip6" ]; then
-        green "双栈 (IPv4+IPv6)"
+        green "IPv4: ${ip4}  IPv6: ${ip6}"
     elif [ -n "$ip4" ]; then
-        yellow "仅IPv4 (${ip4})"
+        yellow "IPv4: ${ip4}  IPv6: 无"
     elif [ -n "$ip6" ]; then
-        yellow "仅IPv6 (${ip6})"
+        yellow "IPv4: 无  IPv6: ${ip6}"
     else
         red "无法获取"
     fi
