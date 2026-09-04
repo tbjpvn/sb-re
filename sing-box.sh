@@ -2975,6 +2975,46 @@ resolve_dns_record() {
 }
 
 # 申请域名证书，成功后将替换hy2和tuic当前使用的bing.com自签证书
+# 生成80端口"临时腾出/续期后恢复"的钩子脚本
+# 供acme.sh的--pre-hook/--post-hook调用：无论是手动申请/更换证书，还是acme.sh到期后自动续期，
+# 都会先记录当前占用80端口的服务并强制停掉，验证完成后再把之前记录的服务原样启动回去。
+write_port80_hooks() {
+    mkdir -p "${work_dir}"
+    cat > "${work_dir}/port80-prehook.sh" << 'EOF'
+#!/bin/bash
+STATE_FILE="/etc/sing-box/.port80_state"
+: > "$STATE_FILE"
+for svc in nginx apache2 httpd caddy reality-80; do
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$svc" 2>/dev/null; then
+        echo "systemctl:$svc" >> "$STATE_FILE"
+        systemctl stop "$svc" >/dev/null 2>&1
+    elif command -v rc-service >/dev/null 2>&1 && rc-service "$svc" status 2>/dev/null | grep -q started; then
+        echo "rc-service:$svc" >> "$STATE_FILE"
+        rc-service "$svc" stop >/dev/null 2>&1
+    fi
+done
+fuser -k -9 80/tcp >/dev/null 2>&1
+exit 0
+EOF
+
+    cat > "${work_dir}/port80-posthook.sh" << 'EOF'
+#!/bin/bash
+STATE_FILE="/etc/sing-box/.port80_state"
+[ -f "$STATE_FILE" ] || exit 0
+while IFS=: read -r mgr svc; do
+    [ -z "$svc" ] && continue
+    if [ "$mgr" = "systemctl" ]; then
+        systemctl start "$svc" >/dev/null 2>&1
+    elif [ "$mgr" = "rc-service" ]; then
+        rc-service "$svc" start >/dev/null 2>&1
+    fi
+done < "$STATE_FILE"
+rm -f "$STATE_FILE"
+exit 0
+EOF
+    chmod +x "${work_dir}/port80-prehook.sh" "${work_dir}/port80-posthook.sh"
+}
+
 apply_domain_cert() {
     check_singbox &>/dev/null
     if [ $? -eq 2 ]; then
@@ -2985,7 +3025,7 @@ apply_domain_cert() {
     green "=== 申请域名证书 (用于 Hysteria2 / TUIC5) ===\n"
     yellow "申请前请确保："
     yellow "1. 域名已经解析到本机IP"
-    yellow "2. 80端口未被其他程序占用（脚本会临时用80端口完成验证）\n"
+    yellow "2. 脚本会在验证期间临时强制释放80端口(自动停掉nginx/apache/caddy等)，验证完成后自动恢复\n"
     reading "请输入你要申请证书的域名: " domain
     if [ -z "$domain" ]; then
         red "域名不能为空！"; sleep 1; return
@@ -3024,22 +3064,15 @@ apply_domain_cert() {
     manage_packages install socat >/dev/null 2>&1
     install_acme "$cert_email" || { sleep 2; return; }
     allow_port 80/tcp >/dev/null 2>&1
+    write_port80_hooks
 
     local acme="${HOME}/.acme.sh/acme.sh"
-
-    # 尽量彻底释放80端口，避免被其他残留服务(apache/caddy/其他面板等)占用导致验证失败
-    for svc in apache2 httpd caddy reality-80; do
-        command_exists systemctl && systemctl stop "$svc" >/dev/null 2>&1
-        command_exists rc-service && rc-service "$svc" stop >/dev/null 2>&1
-    done
-    fuser -k -9 80/tcp >/dev/null 2>&1
-    sleep 1
 
     yellow "\n正在申请证书，请稍候...\n"
     local issue_log
     issue_log=$("$acme" --issue -d "$domain" --standalone --listen-v6 --local-address :: -k ec-256 --force \
-        --pre-hook "fuser -k -9 80/tcp >/dev/null 2>&1; true" \
-        --post-hook "true" 2>&1)
+        --pre-hook "${work_dir}/port80-prehook.sh" \
+        --post-hook "${work_dir}/port80-posthook.sh" 2>&1)
     local issue_result=$?
     echo "$issue_log" | tail -20
 
@@ -3076,7 +3109,8 @@ apply_domain_cert() {
 
     green "\n域名证书申请成功！原bing.com自签证书已失效，hysteria2和tuic现已使用域名证书: ${purple}${domain}${re}"
     yellow "证书路径: ${work_dir}/cert.pem  密钥路径: ${work_dir}/private.key"
-    yellow "acme.sh 已配置自动续期任务，到期前会自动续签证书并重启sing-box。\n"
+    yellow "acme.sh 已配置自动续期任务，到期前会自动续签证书并重启sing-box；"
+    yellow "如果续期时80端口被其他服务占用，会自动临时停掉并在续期完成后恢复。\n"
     if [ -f "$client_dir" ]; then
         while IFS= read -r line; do [ -n "$line" ] && yellow "$line"; done < "$client_dir"
     fi
