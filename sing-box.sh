@@ -573,6 +573,7 @@ sys_warp_iface() {
 # 向 Cloudflare 注册一个新的 WARP 账号，结果写入全局变量:
 # REG_PRIV / REG_V4 / REG_V6 / REG_PEER
 cf_warp_register() {
+    local family="${1:-4}"
     local sb_bin="${work_dir}/sing-box"
     local priv="" pub="" key_output
 
@@ -595,36 +596,38 @@ cf_warp_register() {
         return 1
     fi
 
-    local install_id fcm_token tos_date reg_response try=0 curl_flag=""
+    local install_id fcm_token tos_date reg_response try=0 curl_family
     install_id=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 22)
     fcm_token="${install_id}:APA91b$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 134)"
     tos_date=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-    # 不再强制使用 IPv4。主菜单 12 的目标就是支持纯 IPv6/纯 IPv4 VPS，
-    # 因此注册 API 必须自动选择当前主机实际可用的协议栈。
-    if curl -6 -sS -m 5 -o /dev/null https://api.cloudflareclient.com/ 2>/dev/null; then
-        curl_flag="-6"
-    elif curl -4 -sS -m 5 -o /dev/null https://api.cloudflareclient.com/ 2>/dev/null; then
-        curl_flag="-4"
+    # 主菜单12是“给单栈VPS补齐缺失协议栈”：
+    # family=4：VPS本身只有IPv6，需要通过IPv6访问Cloudflare注册API；
+    # family=6：VPS本身只有IPv4，需要通过IPv4访问Cloudflare注册API。
+    if [ "$family" = "4" ]; then
+        curl_family="-6"
     else
-        red "无法连接 Cloudflare WARP 注册 API（IPv4/IPv6 均不可达）\n"
-        return 1
+        curl_family="-4"
     fi
 
     while [ $try -lt 5 ]; do
         try=$((try + 1))
-        reg_response=$(curl "$curl_flag" -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
+        reg_response=$(curl "$curl_family" -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
             -H "Content-Type: application/json" \
             -H "User-Agent: okhttp/3.12.1" \
             -H "CF-Client-Version: a-6.30-3596" \
             -d "{\"key\":\"${pub}\",\"install_id\":\"${install_id}\",\"fcm_token\":\"${fcm_token}\",\"tos\":\"${tos_date}\",\"model\":\"PC\",\"serial_number\":\"${install_id}\",\"locale\":\"en_US\"}" 2>/dev/null)
-        echo "$reg_response" | jq -e '.config' >/dev/null 2>&1 && break
+
+        if echo "$reg_response" | jq -e '.config.interface.addresses.v4 // .config.client_id' >/dev/null 2>&1; then
+            break
+        fi
         yellow "第 ${try}/5 次注册未成功，重试中...\n"
         sleep 2
     done
 
     if ! echo "$reg_response" | jq -e '.config' >/dev/null 2>&1; then
         red "Cloudflare WARP 注册失败（可能网络受限或 API 变更）\n"
+        echo "$reg_response" | head -c 300
         return 1
     fi
 
@@ -632,19 +635,16 @@ cf_warp_register() {
     REG_V4=$(echo "$reg_response" | jq -r '.config.interface.addresses.v4 // empty')
     REG_V6=$(echo "$reg_response" | jq -r '.config.interface.addresses.v6 // empty')
     REG_PEER=$(echo "$reg_response" | jq -r '.config.peers[0].public_key // "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="')
-
-    # 优先使用 Cloudflare 注册接口返回的实际 peer 地址，避免把固定的
-    # 2606:4700:d0::a29f:c001 / 162.159.192.1 写死。API 返回的 v4/v6
-    # 端点可能以 :0 结尾，WireGuard 实际连接统一使用 WARP 的 2408 端口。
-    local peer_v4 peer_v6
-    peer_v4=$(echo "$reg_response" | jq -r '.config.peers[0].endpoint.v4 // empty')
-    peer_v6=$(echo "$reg_response" | jq -r '.config.peers[0].endpoint.v6 // empty')
-    peer_v4=$(echo "$peer_v4" | sed 's/:0$//')
-    peer_v6=$(echo "$peer_v6" | sed 's/:0$//')
-    REG_ENDPOINT_V4="${peer_v4:+${peer_v4}:2408}"
-    REG_ENDPOINT_V6="${peer_v6:+${peer_v6}:2408}"
-
     [ -z "$REG_V4" ] && REG_V4="172.16.0.2"
+
+    # 不强依赖API返回的peer地址。主菜单12的两种单栈场景分别使用
+    # “已有协议栈”连接WARP Endpoint，避免把缺失协议栈错误地拿来连Endpoint。
+    if [ "$family" = "4" ]; then
+        REG_ENDPOINT="[2606:4700:d0::a29f:c001]:2408"
+    else
+        REG_ENDPOINT="162.159.192.1:2408"
+    fi
+
     return 0
 }
 
@@ -658,13 +658,15 @@ sys_warp_write_conf() {
     mkdir -p "$sys_warp_dir"
 
     if [ "$family" = "4" ]; then
-        endpoint="${REG_ENDPOINT_V6:-[2606:4700:d0::a29f:c001]:2408}"
+        endpoint="${REG_ENDPOINT:-[2606:4700:d0::a29f:c001]:2408}"
         allowed="0.0.0.0/0"
     else
-        endpoint="${REG_ENDPOINT_V4:-162.159.192.1:2408}"
+        endpoint="${REG_ENDPOINT:-162.159.192.1:2408}"
         allowed="::/0"
     fi
 
+    # 两个地址都写入WARP接口；缺失协议栈由AllowedIPs接管，
+    # 原有协议栈仍通过宿主机直连Endpoint。
     addr_line="${REG_V4}/32"
     [ -n "$REG_V6" ] && addr_line="${addr_line}, ${REG_V6}/128"
 
@@ -739,7 +741,7 @@ sys_warp_add() {
     command_exists jq || manage_packages install jq
 
     yellow "正在向 Cloudflare 注册独立 WARP 账号...\n"
-    if ! cf_warp_register; then
+    if ! cf_warp_register "$family"; then
         return 1
     fi
 
@@ -770,14 +772,14 @@ sys_warp_add() {
 sys_warp_remove() {
     local family="$1" iface
     iface=$(sys_warp_iface "$family")
-    if [ ! -f "${sys_warp_dir}/${iface}.conf" ]; then
-        yellow "${iface} 未安装，无需删除\n"
-        return
-    fi
-    wg-quick down "$iface" &>/dev/null
+    wg-quick down "$iface" &>/dev/null || true
     sys_warp_disable_boot "$iface"
-    rm -f "${sys_warp_dir}/${iface}.conf"
-    green "${iface} 出站已删除\n"
+    if [ -f "${sys_warp_dir}/${iface}.conf" ]; then
+        rm -f "${sys_warp_dir}/${iface}.conf"
+        green "${iface} 出站已删除\n"
+    else
+        yellow "${iface} 未安装，无需删除\n"
+    fi
 }
 
 sys_warp_delete_menu() {
@@ -971,9 +973,6 @@ EOF
 }
 EOF
 
-    # 显式配置 DNS：仅 type:local 在部分 VPS（无 resolv 配置 / 纯 IPv6）上会报
-    # "link has no DNS servers configured"，导致远程 rule-set 初始化直接 FATAL。
-    # 同时提供 IPv6 / IPv4 DNS，按 dns_strategy 优先。
     cat > "${conf_dir}/dns.json" << EOF
 {
   "dns": {
@@ -981,30 +980,12 @@ EOF
       {
         "tag": "local",
         "type": "local"
-      },
-      {
-        "tag": "dns-v6",
-        "type": "udp",
-        "server": "2606:4700:4700::1111",
-        "server_port": 53
-      },
-      {
-        "tag": "dns-v4",
-        "type": "udp",
-        "server": "1.1.1.1",
-        "server_port": 53
       }
     ],
-    "final": "dns-v6",
     "strategy": "$dns_strategy"
   }
 }
 EOF
-    # 若策略偏 IPv4，把 final 指到 dns-v4
-    if [ "$dns_strategy" = "prefer_ipv4" ] || [ "$dns_strategy" = "ipv4_only" ]; then
-        jq '.dns.final = "dns-v4"' "${conf_dir}/dns.json" > "${conf_dir}/dns.json.tmp" \
-            && mv "${conf_dir}/dns.json.tmp" "${conf_dir}/dns.json"
-    fi
 
     cat > "${conf_dir}/inbounds.json" << EOF
 {
@@ -1110,30 +1091,28 @@ EOF
         yellow "独立 WARP 注册失败，暂时使用共享密钥（可能不稳定，可稍后在「WARP分流管理」中重新生成）\n"
         write_fallback_warp_endpoint
     fi
-    local ep_pub
-    ep_pub=$(jq -r '.endpoints[0].peers[0].public_key // empty' "${conf_dir}/endpoints.json" 2>/dev/null)
-    if [ -z "$ep_pub" ] || [ "${#ep_pub}" -lt 40 ]; then
-        yellow "检测到 endpoints public_key 无效，写入共享密钥兜底\n"
-        write_fallback_warp_endpoint
-    fi
 
-    # 默认不预加载远程 rule-set：
-    # 启动时若 DNS 异常会因下载 github raw 直接 FATAL；分流时再按需添加定义。
-    # default_domain_resolver 优先用 dns-v6/dns-v4，避免仅依赖 local。
-    local resolver_tag="dns-v6"
-    if [ "$dns_strategy" = "prefer_ipv4" ] || [ "$dns_strategy" = "ipv4_only" ]; then
-        resolver_tag="dns-v4"
-    fi
     cat > "${conf_dir}/route.json" << EOF
 {
   "route": {
-    "rule_set": [],
+    "rule_set": [
+      {"tag":"gemini","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/google.srs","download_detour":"direct"},
+      {"tag":"claude","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/anthropic.srs","download_detour":"direct"},
+      {"tag":"openai","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/openai.srs","download_detour":"direct"},
+      {"tag":"tiktok","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/tiktok.srs","download_detour":"direct"},
+      {"tag":"twitter","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/twitter.srs","download_detour":"direct"},
+      {"tag":"google","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/google.srs","download_detour":"direct"},
+      {"tag":"telegram","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/telegram.srs","download_detour":"direct"},
+      {"tag":"telegram-ip","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/telegram.srs","download_detour":"direct"},
+      {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
+      {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
+    ],
     "rules": [
       {"action": "sniff"}
     ],
     "final": "direct",
     "default_domain_resolver": {
-      "server": "$resolver_tag",
+      "server": "local",
       "strategy": "$dns_strategy"
     }
   }
@@ -2176,12 +2155,12 @@ add_rule_menu() {
     local tags_to_add=("$rule_tag")
     if [ "$rule_tag" = "telegram" ]; then
         tags_to_add=("telegram" "telegram-ip")
+        # 确保 rule_set 定义里已有 telegram-ip（旧配置可能缺失）
+        if ! jq -e '.route.rule_set[]? | select(.tag == "telegram-ip")' "$route_file" >/dev/null 2>&1; then
+            jq '.route.rule_set += [{"tag":"telegram-ip","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/telegram.srs","download_detour":"direct"}]' \
+                "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+        fi
     fi
-
-    # 按需写入远程 rule_set 定义（安装时默认不预加载，避免 DNS 异常时启动 FATAL）
-    for tag in "${tags_to_add[@]}"; do
-        ensure_rule_set_def "$tag"
-    done
 
     for tag in "${tags_to_add[@]}"; do
         # 已存在则跳过
@@ -2256,51 +2235,14 @@ set_global_outbound() {
     sleep 2; warp_manage
 }
 
-# 按需向 route.json 追加远程 rule_set 定义（不存在才添加）
-ensure_rule_set_def() {
-    local tag="$1"
-    local route_file="${conf_dir}/route.json"
-    local url=""
-    case "$tag" in
-        gemini)       url="https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/google.srs" ;;
-        claude)       url="https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/anthropic.srs" ;;
-        openai)       url="https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/openai.srs" ;;
-        tiktok)       url="https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/tiktok.srs" ;;
-        twitter)      url="https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/twitter.srs" ;;
-        google)       url="https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/google.srs" ;;
-        telegram)     url="https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/telegram.srs" ;;
-        telegram-ip)  url="https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/telegram.srs" ;;
-        youtube)      url="https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs" ;;
-        netflix)      url="https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs" ;;
-        *) return 1 ;;
-    esac
-    if jq -e --arg tag "$tag" '.route.rule_set[]? | select(.tag == $tag)' "$route_file" >/dev/null 2>&1; then
-        return 0
-    fi
-    jq --arg tag "$tag" --arg url "$url" \
-        '.route.rule_set += [{"tag":$tag,"type":"remote","format":"binary","url":$url,"download_detour":"direct"}]' \
-        "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
-}
-
 # 恢复服务器原IP出站（恢复默认 route.json）
 restore_direct_outbound() {
     yellow "\n正在恢复默认路由配置...\n"
 
     # 读取当前IPv4/IPv6优先级策略，恢复时保持一致
-    local cur_dns_strategy resolver_tag="dns-v6"
+    local cur_dns_strategy
     cur_dns_strategy=$(jq -r '.dns.strategy // "prefer_ipv4"' "${conf_dir}/dns.json" 2>/dev/null)
     [ -z "$cur_dns_strategy" ] || [ "$cur_dns_strategy" = "null" ] && cur_dns_strategy="prefer_ipv4"
-    if [ "$cur_dns_strategy" = "prefer_ipv4" ] || [ "$cur_dns_strategy" = "ipv4_only" ]; then
-        resolver_tag="dns-v4"
-    fi
-    # 若 dns.json 里还没有 dns-v6/v4，补全，避免 default_domain_resolver 指向不存在的 server
-    if ! jq -e '.dns.servers[]? | select(.tag=="dns-v6" or .tag=="dns-v4")' "${conf_dir}/dns.json" >/dev/null 2>&1; then
-        jq '.dns.servers += [
-            {"tag":"dns-v6","type":"udp","server":"2606:4700:4700::1111","server_port":53},
-            {"tag":"dns-v4","type":"udp","server":"1.1.1.1","server_port":53}
-          ] | .dns.final = (if (.dns.final==null or .dns.final=="local") then "dns-v6" else .dns.final end)' \
-            "${conf_dir}/dns.json" > "${conf_dir}/dns.json.tmp" && mv "${conf_dir}/dns.json.tmp" "${conf_dir}/dns.json"
-    fi
 
     # 恢复 outbounds.json 中的 direct 出站（不存在则插入到数组最前面）
     if ! jq -e '.outbounds[] | select(.tag == "direct")' "$outbound_file" > /dev/null 2>&1; then
@@ -2308,17 +2250,28 @@ restore_direct_outbound() {
             "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
     fi
 
-    # 恢复默认 route.json（不预加载远程 rule-set，避免启动时强依赖 GitHub DNS）
+    # 恢复默认 route.json
     cat > "${route_file}" << EOF
 {
   "route": {
-    "rule_set": [],
+    "rule_set": [
+      {"tag":"gemini","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/google.srs","download_detour":"direct"},
+      {"tag":"claude","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/anthropic.srs","download_detour":"direct"},
+      {"tag":"openai","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/openai.srs","download_detour":"direct"},
+      {"tag":"tiktok","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/tiktok.srs","download_detour":"direct"},
+      {"tag":"twitter","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/twitter.srs","download_detour":"direct"},
+      {"tag":"google","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/google.srs","download_detour":"direct"},
+      {"tag":"telegram","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/telegram.srs","download_detour":"direct"},
+      {"tag":"telegram-ip","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/telegram.srs","download_detour":"direct"},
+      {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
+      {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
+    ],
     "rules": [
       {"action": "sniff"}
     ],
     "final": "direct",
     "default_domain_resolver": {
-      "server": "$resolver_tag",
+      "server": "local",
       "strategy": "$cur_dns_strategy"
     }
   }
