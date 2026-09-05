@@ -839,13 +839,17 @@ install_singbox() {
     [ ! -d "${work_dir}" ] && mkdir -p "${work_dir}" && chmod 777 "${work_dir}" && mkdir -p "${conf_dir}"
 
     # 改为从 sing-box 官方 GitHub Releases 下载二进制（原来的 ssss.nyc.mn 三方源已注释掉）
-    latest_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==false)][0].tag_name | sub("^v"; "")')
+    # 使用 gh_fetch_json/gh_download，纯IPv6服务器直连github.com/api.github.com失败时会自动走镜像代理重试
+    releases_json=$(gh_fetch_json "https://api.github.com/repos/SagerNet/sing-box/releases")
+    latest_version=$(echo "$releases_json" | jq -r '[.[] | select(.prerelease==false)][0].tag_name | sub("^v"; "")')
     if [ -z "$latest_version" ] || [ "$latest_version" = "null" ]; then
         red "获取 sing-box 最新版本号失败，请检查服务器是否能访问 api.github.com\n"
+        gh_ipv6_hint
         exit 1
     fi
-    if ! curl -fsSLo "${work_dir}/${server_name}.tar.gz" "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${ARCH}.tar.gz"; then
+    if ! gh_download "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${ARCH}.tar.gz" "${work_dir}/${server_name}.tar.gz"; then
         red "从 GitHub 下载 sing-box 二进制失败，请检查服务器是否能访问 github.com\n"
+        gh_ipv6_hint
         exit 1
     fi
     tar -xzvf "${work_dir}/${server_name}.tar.gz" -C "${work_dir}/" && \
@@ -877,14 +881,15 @@ install_singbox() {
     if [ -z "$CF_ARCH" ]; then
         yellow "架构 ${ARCH} 官方 cloudflared 不提供预编译包，argo 隧道功能将不可用\n"
         : > "${work_dir}/argo"
-    elif ! curl -fsSLo "${work_dir}/argo" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"; then
+    elif ! gh_download "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}" "${work_dir}/argo"; then
         red "从 GitHub 下载 cloudflared 失败，请检查服务器是否能访问 github.com\n"
+        gh_ipv6_hint
         exit 1
     fi
 
     # qrencode 官方没有独立预编译二进制，暂时仍用 eooce/test 这个 GitHub 开源仓库的 release（比原来的裸域名至少可查看源码/校验），
     # 如果你的服务器装了系统自带的 qrencode，也可以把下面这行换成: cp "$(command -v qrencode)" "${work_dir}/qrencode"
-    curl -sLo "${work_dir}/qrencode" "https://github.com/eooce/test/releases/download/${ARCH}/qrencode-linux-${ARCH}"
+    gh_download "https://github.com/eooce/test/releases/download/${ARCH}/qrencode-linux-${ARCH}" "${work_dir}/qrencode"
     chown root:root ${work_dir} && chmod +x ${work_dir}/${server_name} ${work_dir}/argo ${work_dir}/qrencode
 
     # 确保vless_port本身也是空闲的（防止PORT环境变量或随机数刚好撞上已占用端口）
