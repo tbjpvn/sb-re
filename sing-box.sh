@@ -294,10 +294,12 @@ ensure_ipv4_outbound() {
     curl -4 -sm 3 -o /dev/null https://api.ipify.org 2>/dev/null && return 0
 
     yellow "\n检测到本机直连+镜像都无法访问GitHub，尝试自动加装 WARP IPv4 出站以继续安装...\n"
-    local iface="wgcf-v4"
+    local iface="wgcf-v4" wg_ok
 
     if [ -f "${sys_warp_dir}/${iface}.conf" ]; then
-        if ! wg-quick up "$iface" 2>&1 | tail -5; then
+        wg-quick up "$iface" 2>&1 | tail -5
+        wg_ok=${PIPESTATUS[0]}
+        if [ "$wg_ok" -ne 0 ]; then
             yellow "（已存在配置但启动失败，尝试删除后重新注册...）\n"
             wg-quick down "$iface" &>/dev/null
             rm -f "${sys_warp_dir}/${iface}.conf"
@@ -317,7 +319,9 @@ ensure_ipv4_outbound() {
             return 1
         fi
         sys_warp_write_conf "4"
-        if ! wg-quick up "$iface" 2>&1 | tail -5; then
+        wg-quick up "$iface" 2>&1 | tail -5
+        wg_ok=${PIPESTATUS[0]}
+        if [ "$wg_ok" -ne 0 ]; then
             red "WireGuard接口启动失败，当前环境可能不支持内核WireGuard(常见于部分OpenVZ/LXC容器)\n"
             rm -f "${sys_warp_dir}/${iface}.conf"
             return 1
@@ -681,10 +685,17 @@ cf_warp_register() {
     fi
 
     REG_PRIV="$priv"
-    REG_V4=$(echo "$reg_response" | jq -r '.config.interface.addresses.v4 // empty')
-    REG_V6=$(echo "$reg_response" | jq -r '.config.interface.addresses.v6 // empty')
-    REG_PEER=$(echo "$reg_response" | jq -r '.config.peers[0].public_key // "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="')
+    REG_V4=$(echo "$reg_response" | jq -r '.config.interface.addresses.v4 // empty' 2>/dev/null)
+    REG_V6=$(echo "$reg_response" | jq -r '.config.interface.addresses.v6 // empty' 2>/dev/null)
+    REG_PEER=$(echo "$reg_response" | jq -r '.config.peers[0].public_key // empty' 2>/dev/null)
     [ -z "$REG_V4" ] && REG_V4="172.16.0.2"
+    # 防御性校验：正常的WireGuard公钥是base64编码的32字节，即44个字符且以=结尾。
+    # 如果API返回结构异常导致解析不到(而不是走上面jq的//默认值)，这里给个已知可用的Cloudflare WARP默认节点公钥兜底，
+    # 避免把一个空值/半截的PublicKey写进配置文件，导致wg-quick"Line unrecognized"这种很难定位的报错。
+    if ! [[ "$REG_PEER" =~ ^[A-Za-z0-9+/]{42,43}=$ ]]; then
+        yellow "警告：本次注册返回的节点公钥格式异常，已改用Cloudflare WARP默认节点公钥\n"
+        REG_PEER="bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+    fi
     return 0
 }
 
