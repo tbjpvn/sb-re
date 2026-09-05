@@ -297,8 +297,13 @@ ensure_ipv4_outbound() {
     local iface="wgcf-v4"
 
     if [ -f "${sys_warp_dir}/${iface}.conf" ]; then
-        wg-quick up "$iface" &>/dev/null
-    else
+        if ! wg-quick up "$iface" 2>&1 | tail -5; then
+            yellow "（已存在配置但启动失败，尝试删除后重新注册...）\n"
+            wg-quick down "$iface" &>/dev/null
+            rm -f "${sys_warp_dir}/${iface}.conf"
+        fi
+    fi
+    if [ ! -f "${sys_warp_dir}/${iface}.conf" ]; then
         command_exists wg || manage_packages install wireguard-tools
         command_exists wg-quick || manage_packages install wireguard-tools
         command_exists curl || manage_packages install curl
@@ -307,9 +312,15 @@ ensure_ipv4_outbound() {
             red "wireguard-tools 安装失败，无法加装WARP出站\n"
             return 1
         fi
-        if cf_warp_register; then
-            sys_warp_write_conf "4"
-            wg-quick up "$iface" 2>/dev/null
+        if ! cf_warp_register; then
+            red "WARP账号注册失败，无法加装IPv4出站\n"
+            return 1
+        fi
+        sys_warp_write_conf "4"
+        if ! wg-quick up "$iface" 2>&1 | tail -5; then
+            red "WireGuard接口启动失败，当前环境可能不支持内核WireGuard(常见于部分OpenVZ/LXC容器)\n"
+            rm -f "${sys_warp_dir}/${iface}.conf"
+            return 1
         fi
     fi
     sys_warp_enable_boot "$iface" 2>/dev/null
@@ -319,7 +330,7 @@ ensure_ipv4_outbound() {
         green "WARP IPv4 出站已加装成功(开机自启，不需要可到主菜单「单栈VPS加装WARP全局出站」删除)，继续安装...\n"
         return 0
     else
-        red "WARP IPv4 出站加装失败\n"
+        red "WARP接口已启动，但仍无法访问IPv4网络(可能是WARP节点暂时不可用)\n"
         return 1
     fi
 }
@@ -642,11 +653,23 @@ cf_warp_register() {
 
     while [ $try -lt 5 ]; do
         try=$((try + 1))
-        reg_response=$(curl -4 -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
+        # 不强制-4：WARP注册接口(api.cloudflareclient.com)本身是双栈的，
+        # 之前写死-4会导致纯IPv6主机(恰恰是最需要加装IPv4出站的场景)在这一步直接注册失败，
+        # 属于先有鸡还是先有蛋的问题。这里先用默认协议(有IPv6就走IPv6)，失败再显式retry一次-6/-4。
+        reg_response=$(curl -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
             -H "Content-Type: application/json" \
             -H "User-Agent: okhttp/3.12.1" \
             -H "CF-Client-Version: a-6.30-3596" \
             -d "{\"key\":\"${pub}\",\"install_id\":\"${install_id}\",\"fcm_token\":\"${fcm_token}\",\"tos\":\"${tos_date}\",\"model\":\"PC\",\"serial_number\":\"${install_id}\",\"locale\":\"en_US\"}" 2>/dev/null)
+        echo "$reg_response" | jq -e '.config' >/dev/null 2>&1 && break
+        for flag in -6 -4; do
+            reg_response=$(curl "$flag" -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
+                -H "Content-Type: application/json" \
+                -H "User-Agent: okhttp/3.12.1" \
+                -H "CF-Client-Version: a-6.30-3596" \
+                -d "{\"key\":\"${pub}\",\"install_id\":\"${install_id}\",\"fcm_token\":\"${fcm_token}\",\"tos\":\"${tos_date}\",\"model\":\"PC\",\"serial_number\":\"${install_id}\",\"locale\":\"en_US\"}" 2>/dev/null)
+            echo "$reg_response" | jq -e '.config' >/dev/null 2>&1 && break
+        done
         echo "$reg_response" | jq -e '.config' >/dev/null 2>&1 && break
         yellow "第 ${try}/5 次注册未成功，重试中...\n"
         sleep 2
