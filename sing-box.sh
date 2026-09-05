@@ -370,6 +370,72 @@ allow_port() {
 # ================== WARP 独立密钥生成 ==================
 # 向 Cloudflare 注册新设备，生成独立 WireGuard 密钥与 reserved
 # 成功返回 0 并写入 endpoints.json；失败返回 1（调用方可决定是否回退）
+# Cloudflare WARP 固定 peer 公钥（官方不变）
+WARP_PEER_PUB="bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+# WARP peer 地址：双栈/有 CLAT 用 IPv4；纯 IPv6 无可用 IPv4 时用 IPv6 anycast
+WARP_PEER_V4="162.159.192.1"
+WARP_PEER_V6="2606:4700:d0::a29f:c001"
+
+# 判断本机是否有可用的 IPv4 出口（含 CLAT/nclat）；有则返回 0
+has_usable_ipv4() {
+    # 真实公网 IPv4
+    if curl -4 -sm 2 ip.sb >/dev/null 2>&1; then
+        return 0
+    fi
+    # 存在非 loopback 的 IPv4 地址（CLAT 常见 192.0.0.1 等）
+    if ip -4 -o addr show scope global 2>/dev/null | grep -q .; then
+        return 0
+    fi
+    return 1
+}
+
+# 选择 WARP peer 地址（字面量 IP，避免依赖 DNS）
+pick_warp_peer_addr() {
+    if has_usable_ipv4; then
+        echo "$WARP_PEER_V4"
+    else
+        echo "$WARP_PEER_V6"
+    fi
+}
+
+# 向 Cloudflare 注册（不强制 -4，兼容纯 IPv6 + NAT64/CLAT）
+# 成功时把响应写入全局变量 CF_WARP_REG_RESPONSE
+cf_warp_api_register() {
+    local pub_key="$1"
+    local install_id fcm_token tos_date reg_response try=0 max_try=5
+    install_id=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 22)
+    fcm_token="${install_id}:APA91b$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 134)"
+    tos_date=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")
+    local payload
+    payload="{\"key\":\"${pub_key}\",\"install_id\":\"${install_id}\",\"fcm_token\":\"${fcm_token}\",\"tos\":\"${tos_date}\",\"model\":\"PC\",\"serial_number\":\"${install_id}\",\"locale\":\"en_US\"}"
+
+    while [ $try -lt $max_try ]; do
+        try=$((try + 1))
+        # 先默认栈（NAT64/DNS64 可走通），再尝试 -4（双栈/CLAT）
+        reg_response=$(curl -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: okhttp/3.12.1" \
+            -H "CF-Client-Version: a-6.30-3596" \
+            -d "$payload" 2>/dev/null)
+        if echo "$reg_response" | jq -e '.config' >/dev/null 2>&1; then
+            CF_WARP_REG_RESPONSE="$reg_response"
+            return 0
+        fi
+        reg_response=$(curl -4 -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: okhttp/3.12.1" \
+            -H "CF-Client-Version: a-6.30-3596" \
+            -d "$payload" 2>/dev/null)
+        if echo "$reg_response" | jq -e '.config' >/dev/null 2>&1; then
+            CF_WARP_REG_RESPONSE="$reg_response"
+            return 0
+        fi
+        sleep 2
+    done
+    CF_WARP_REG_RESPONSE="$reg_response"
+    return 1
+}
+
 generate_warp_endpoint() {
     local quiet="${1:-}"
     local sb_bin="${work_dir}/sing-box"
@@ -411,51 +477,40 @@ generate_warp_endpoint() {
         return 1
     fi
 
-    # 2. 向 Cloudflare 注册
-    local install_id fcm_token tos_date reg_response
-    install_id=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 22)
-    fcm_token="${install_id}:APA91b$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 134)"
-    tos_date=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-    local try=0 max_try=5
-    while [ $try -lt $max_try ]; do
-        try=$((try + 1))
-        reg_response=$(curl -4 -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
-            -H "Content-Type: application/json" \
-            -H "User-Agent: okhttp/3.12.1" \
-            -H "CF-Client-Version: a-6.30-3596" \
-            -d "{\"key\":\"${public_key}\",\"install_id\":\"${install_id}\",\"fcm_token\":\"${fcm_token}\",\"tos\":\"${tos_date}\",\"model\":\"PC\",\"serial_number\":\"${install_id}\",\"locale\":\"en_US\"}" 2>/dev/null)
-
-        if echo "$reg_response" | jq -e '.config.interface.addresses.v4 // .config.client_id' >/dev/null 2>&1; then
-            break
-        fi
-        [ -z "$quiet" ] && yellow "第 ${try}/${max_try} 次注册未成功，重试中..."
-        sleep 2
-    done
-
-    if ! echo "$reg_response" | jq -e '.config' >/dev/null 2>&1; then
+    # 2. 向 Cloudflare 注册（兼容纯 IPv6 / NAT64 / CLAT）
+    local reg_response
+    if ! cf_warp_api_register "$public_key"; then
         [ -z "$quiet" ] && red "Cloudflare WARP 注册失败（可能网络受限或 API 变更）"
-        [ -z "$quiet" ] && echo "$reg_response" | head -c 300
+        [ -z "$quiet" ] && echo "${CF_WARP_REG_RESPONSE}" | head -c 300
         return 1
     fi
+    reg_response="$CF_WARP_REG_RESPONSE"
 
-    # 3. 解析结果
+    # 3. 解析结果（空字符串视为无效，强制回退默认 peer 公钥，避免 public_key="" 导致 FATAL）
     local v4 v6 client_id peer_pub reserved_json device_id token
     v4=$(echo "$reg_response" | jq -r '.config.interface.addresses.v4 // empty')
     v6=$(echo "$reg_response" | jq -r '.config.interface.addresses.v6 // empty')
     client_id=$(echo "$reg_response" | jq -r '.config.client_id // empty')
-    peer_pub=$(echo "$reg_response" | jq -r '.config.peers[0].public_key // "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="')
+    peer_pub=$(echo "$reg_response" | jq -r '.config.peers[0].public_key // empty')
     device_id=$(echo "$reg_response" | jq -r '.id // empty')
     token=$(echo "$reg_response" | jq -r '.token // empty')
 
-    [ -z "$v4" ] && v4="172.16.0.2/32"
-    [[ "$v4" != */* ]] && v4="${v4}/32"
-    if [ -n "$v6" ] && [[ "$v6" != */* ]]; then
-        v6="${v6}/128"
+    # jq 的 // 对空字符串不会回退；这里必须再兜底，否则会写出 public_key="" 直接起不来
+    [ -z "$peer_pub" ] || [ "$peer_pub" = "null" ] && peer_pub="$WARP_PEER_PUB"
+    # 再校验长度（标准 WG base64 公钥 44 字符）
+    if [ "${#peer_pub}" -lt 40 ]; then
+        peer_pub="$WARP_PEER_PUB"
     fi
 
+    [ -z "$v4" ] || [ "$v4" = "null" ] && v4="172.16.0.2/32"
+    [[ "$v4" != */* ]] && v4="${v4}/32"
+    if [ -n "$v6" ] && [ "$v6" != "null" ] && [[ "$v6" != */* ]]; then
+        v6="${v6}/128"
+    fi
+    [ "$v6" = "null" ] && v6=""
+
     # reserved: client_id base64 解码后前 3 字节
-    if [ -n "$client_id" ]; then
+    if [ -n "$client_id" ] && [ "$client_id" != "null" ]; then
         local r_bytes
         r_bytes=$(printf '%s' "$client_id" | base64 -d 2>/dev/null | od -An -tu1 -N3 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//')
         if [ -n "$r_bytes" ]; then
@@ -467,8 +522,16 @@ generate_warp_endpoint() {
         reserved_json="[0, 0, 0]"
     fi
 
+    local peer_addr
+    peer_addr=$(pick_warp_peer_addr)
+
+    # 最终校验：私钥与 peer 公钥绝不能为空
+    if [ -z "$private_key" ] || [ -z "$peer_pub" ]; then
+        [ -z "$quiet" ] && red "WARP 密钥解析不完整（private_key 或 peer public_key 为空），放弃写入"
+        return 1
+    fi
+
     # 4. 写入 endpoints.json
-    # 使用 IP 而非域名作为 peer 地址 + keepalive，提升服务端场景稳定性（不写 detour，避免 direct 缺失时报错）
     if [ -n "$v6" ]; then
         cat > "$endpoints_file" << EOF
 {
@@ -484,7 +547,7 @@ generate_warp_endpoint() {
       "private_key": "$private_key",
       "peers": [
         {
-          "address": "162.159.192.1",
+          "address": "$peer_addr",
           "port": 2408,
           "public_key": "$peer_pub",
           "allowed_ips": ["0.0.0.0/0", "::/0"],
@@ -510,7 +573,7 @@ EOF
       "private_key": "$private_key",
       "peers": [
         {
-          "address": "162.159.192.1",
+          "address": "$peer_addr",
           "port": 2408,
           "public_key": "$peer_pub",
           "allowed_ips": ["0.0.0.0/0", "::/0"],
@@ -524,17 +587,28 @@ EOF
 EOF
     fi
 
+    # 写后校验：禁止空 public_key 留在磁盘上
+    local written_pub
+    written_pub=$(jq -r '.endpoints[0].peers[0].public_key // empty' "$endpoints_file" 2>/dev/null)
+    if [ -z "$written_pub" ] || [ "${#written_pub}" -lt 40 ]; then
+        [ -z "$quiet" ] && red "写入 endpoints.json 后 public_key 仍无效，放弃"
+        rm -f "$endpoints_file"
+        return 1
+    fi
+
     # 保存账户信息便于以后排查
-    printf '{"id":"%s","token":"%s","private_key":"%s","client_id":"%s","reserved":%s,"v4":"%s","v6":"%s"}\n' \
-        "$device_id" "$token" "$private_key" "$client_id" "$reserved_json" "$v4" "${v6:-}" > "$warp_info_file"
+    printf '{"id":"%s","token":"%s","private_key":"%s","client_id":"%s","reserved":%s,"v4":"%s","v6":"%s","peer":"%s"}\n' \
+        "$device_id" "$token" "$private_key" "$client_id" "$reserved_json" "$v4" "${v6:-}" "$peer_addr" > "$warp_info_file"
     chmod 600 "$warp_info_file" 2>/dev/null
-    [ -z "$quiet" ] && green "WARP 独立密钥注册成功！\n  IPv4: ${purple}${v4}${re}\n  reserved: ${purple}${reserved_json}${re}\n"
+    [ -z "$quiet" ] && green "WARP 独立密钥注册成功！\n  IPv4: ${purple}${v4}${re}\n  peer: ${purple}${peer_addr}${re}\n  reserved: ${purple}${reserved_json}${re}\n"
     return 0
 }
 
-# 写入默认（共享）WARP 配置作为回退
+# 写入默认（共享）WARP 配置作为回退；peer 地址按本机协议栈选择
 write_fallback_warp_endpoint() {
-    cat > "${conf_dir}/endpoints.json" << 'WARP_FALLBACK_EOF'
+    local peer_addr
+    peer_addr=$(pick_warp_peer_addr)
+    cat > "${conf_dir}/endpoints.json" << EOF
 {
   "endpoints": [
     {
@@ -548,9 +622,9 @@ write_fallback_warp_endpoint() {
       "private_key": "YFYOAdbw1bKTHlNNi+aEjBM3BO7unuFC5rOkMRAz9XY=",
       "peers": [
         {
-          "address": "162.159.192.1",
+          "address": "${peer_addr}",
           "port": 2408,
-          "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+          "public_key": "${WARP_PEER_PUB}",
           "allowed_ips": ["0.0.0.0/0", "::/0"],
           "persistent_keepalive_interval": 25,
           "reserved": [78, 135, 76]
@@ -559,7 +633,7 @@ write_fallback_warp_endpoint() {
     }
   ]
 }
-WARP_FALLBACK_EOF
+EOF
 }
 
 # ================== 单栈VPS加装WARP全局出站(系统级) ==================
@@ -595,33 +669,19 @@ cf_warp_register() {
         return 1
     fi
 
-    local install_id fcm_token tos_date reg_response try=0
-    install_id=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 22)
-    fcm_token="${install_id}:APA91b$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 134)"
-    tos_date=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-    while [ $try -lt 5 ]; do
-        try=$((try + 1))
-        reg_response=$(curl -4 -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
-            -H "Content-Type: application/json" \
-            -H "User-Agent: okhttp/3.12.1" \
-            -H "CF-Client-Version: a-6.30-3596" \
-            -d "{\"key\":\"${pub}\",\"install_id\":\"${install_id}\",\"fcm_token\":\"${fcm_token}\",\"tos\":\"${tos_date}\",\"model\":\"PC\",\"serial_number\":\"${install_id}\",\"locale\":\"en_US\"}" 2>/dev/null)
-        echo "$reg_response" | jq -e '.config' >/dev/null 2>&1 && break
-        yellow "第 ${try}/5 次注册未成功，重试中...\n"
-        sleep 2
-    done
-
-    if ! echo "$reg_response" | jq -e '.config' >/dev/null 2>&1; then
+    if ! cf_warp_api_register "$pub"; then
         red "Cloudflare WARP 注册失败（可能网络受限或 API 变更）\n"
         return 1
     fi
+    local reg_response="$CF_WARP_REG_RESPONSE"
 
     REG_PRIV="$priv"
     REG_V4=$(echo "$reg_response" | jq -r '.config.interface.addresses.v4 // empty')
     REG_V6=$(echo "$reg_response" | jq -r '.config.interface.addresses.v6 // empty')
-    REG_PEER=$(echo "$reg_response" | jq -r '.config.peers[0].public_key // "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="')
-    [ -z "$REG_V4" ] && REG_V4="172.16.0.2"
+    REG_PEER=$(echo "$reg_response" | jq -r '.config.peers[0].public_key // empty')
+    [ -z "$REG_PEER" ] || [ "$REG_PEER" = "null" ] && REG_PEER="$WARP_PEER_PUB"
+    [ "${#REG_PEER}" -lt 40 ] && REG_PEER="$WARP_PEER_PUB"
+    [ -z "$REG_V4" ] || [ "$REG_V4" = "null" ] && REG_V4="172.16.0.2"
     return 0
 }
 
@@ -838,14 +898,19 @@ install_singbox() {
 
     [ ! -d "${work_dir}" ] && mkdir -p "${work_dir}" && chmod 777 "${work_dir}" && mkdir -p "${conf_dir}"
 
-    # 改为从 sing-box 官方 GitHub Releases 下载二进制（原来的 ssss.nyc.mn 三方源已注释掉）
-    latest_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==false)][0].tag_name | sub("^v"; "")')
+    # 从 sing-box 官方 GitHub Releases 下载（走 gh_fetch_json/gh_download，兼容纯 IPv6）
+    local releases_json latest_version
+    if releases_json=$(gh_fetch_json "https://api.github.com/repos/SagerNet/sing-box/releases"); then
+        latest_version=$(echo "$releases_json" | jq -r '[.[] | select(.prerelease==false and .draft==false)][0].tag_name // empty' | sed 's/^v//')
+    fi
     if [ -z "$latest_version" ] || [ "$latest_version" = "null" ]; then
-        red "获取 sing-box 最新版本号失败，请检查服务器是否能访问 api.github.com\n"
+        red "获取 sing-box 最新版本号失败，请检查服务器是否能访问 api.github.com（纯IPv6可先加装WARP出站或确认NAT64可用）\n"
+        gh_ipv6_hint
         exit 1
     fi
-    if ! curl -fsSLo "${work_dir}/${server_name}.tar.gz" "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${ARCH}.tar.gz"; then
+    if ! gh_download "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${ARCH}.tar.gz" "${work_dir}/${server_name}.tar.gz"; then
         red "从 GitHub 下载 sing-box 二进制失败，请检查服务器是否能访问 github.com\n"
+        gh_ipv6_hint
         exit 1
     fi
     tar -xzvf "${work_dir}/${server_name}.tar.gz" -C "${work_dir}/" && \
@@ -877,14 +942,19 @@ install_singbox() {
     if [ -z "$CF_ARCH" ]; then
         yellow "架构 ${ARCH} 官方 cloudflared 不提供预编译包，argo 隧道功能将不可用\n"
         : > "${work_dir}/argo"
-    elif ! curl -fsSLo "${work_dir}/argo" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"; then
+    elif ! gh_download "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}" "${work_dir}/argo"; then
         red "从 GitHub 下载 cloudflared 失败，请检查服务器是否能访问 github.com\n"
+        gh_ipv6_hint
         exit 1
     fi
 
-    # qrencode 官方没有独立预编译二进制，暂时仍用 eooce/test 这个 GitHub 开源仓库的 release（比原来的裸域名至少可查看源码/校验），
-    # 如果你的服务器装了系统自带的 qrencode，也可以把下面这行换成: cp "$(command -v qrencode)" "${work_dir}/qrencode"
-    curl -sLo "${work_dir}/qrencode" "https://github.com/eooce/test/releases/download/${ARCH}/qrencode-linux-${ARCH}"
+    # qrencode：优先系统自带，否则从 eooce/test release 下载
+    if command_exists qrencode; then
+        cp "$(command -v qrencode)" "${work_dir}/qrencode" 2>/dev/null || true
+    fi
+    if [ ! -x "${work_dir}/qrencode" ]; then
+        gh_download "https://github.com/eooce/test/releases/download/${ARCH}/qrencode-linux-${ARCH}" "${work_dir}/qrencode" || true
+    fi
     chown root:root ${work_dir} && chmod +x ${work_dir}/${server_name} ${work_dir}/argo ${work_dir}/qrencode
 
     # 确保vless_port本身也是空闲的（防止PORT环境变量或随机数刚好撞上已占用端口）
@@ -923,8 +993,18 @@ install_singbox() {
     
     fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
     
-    dns_strategy=$(ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1 && echo "prefer_ipv4" || \
-        (ping -c 1 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && echo "prefer_ipv6" || echo "prefer_ipv4"))
+    # 用实际 HTTP 探测协议栈，避免 NAT64 下 ping 8.8.8.8 误判为 prefer_ipv4 导致纯 IPv6 出站异常
+    if curl -4 -sm 2 https://1.1.1.1 >/dev/null 2>&1; then
+        if curl -6 -sm 2 https://[2606:4700:4700::1111] >/dev/null 2>&1; then
+            dns_strategy="prefer_ipv4"
+        else
+            dns_strategy="ipv4_only"
+        fi
+    elif curl -6 -sm 2 https://[2606:4700:4700::1111] >/dev/null 2>&1 || curl -6 -sm 2 https://ip.sb >/dev/null 2>&1; then
+        dns_strategy="prefer_ipv6"
+    else
+        dns_strategy="prefer_ipv4"
+    fi
     
     cat > "${conf_dir}/log.json" << EOF
 {
@@ -1062,8 +1142,15 @@ EOF
 EOF
 
     # 优先注册独立 WARP 密钥；失败则回退到共享密钥并提示
+    # 写后强制校验 public_key，杜绝空公钥导致服务 FATAL 重启循环
     if ! generate_warp_endpoint; then
         yellow "独立 WARP 注册失败，暂时使用共享密钥（可能不稳定，可稍后在「WARP分流管理」中重新生成）\n"
+        write_fallback_warp_endpoint
+    fi
+    local ep_pub
+    ep_pub=$(jq -r '.endpoints[0].peers[0].public_key // empty' "${conf_dir}/endpoints.json" 2>/dev/null)
+    if [ -z "$ep_pub" ] || [ "${#ep_pub}" -lt 40 ]; then
+        yellow "检测到 endpoints public_key 无效，写入共享密钥兜底\n"
         write_fallback_warp_endpoint
     fi
 
