@@ -284,104 +284,6 @@ gh_ipv6_hint() {
     yellow "提示：GitHub官方(github.com/api.github.com)长期未提供IPv6解析，纯IPv6 VPS在未配置NAT64或WARP出站时通常无法直连，脚本已自动尝试镜像代理但仍失败（可能是网络波动或镜像暂时不可用）。可到主菜单「单栈VPS加装WARP全局出站」加装IPv4 WARP出站后重试，或稍后再试。\n"
 }
 
-# 检测本机是否具备可用的IPv4出站（能访问外网）
-has_working_ipv4() {
-    # 任一成功即认为有可用IPv4
-    curl -4 -sm 3 -o /dev/null https://1.1.1.1 >/dev/null 2>&1 && return 0
-    curl -4 -sm 3 -o /dev/null https://www.cloudflare.com >/dev/null 2>&1 && return 0
-    local ip
-    ip=$(curl -4 -sm 3 ip.sb 2>/dev/null)
-    [ -n "$ip" ] && echo "$ip" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && return 0
-    return 1
-}
-
-# 检测本机是否有全局IPv4地址（不含回环/私网也可，主要看有没有 v4 地址）
-has_local_ipv4() {
-    if command_exists ip; then
-        ip -4 -o addr show scope global 2>/dev/null | grep -q 'inet ' && return 0
-    fi
-    if command_exists ifconfig; then
-        ifconfig 2>/dev/null | grep -E 'inet (addr:)?' | grep -v '127.0.0.1' | grep -q . && return 0
-    fi
-    return 1
-}
-
-# 安装前确保有IPv4出站：纯IPv6/无可用IPv4时自动加装系统级WARP(IPv4)
-# 成功返回0；失败返回1（调用方仍可继续尝试镜像代理下载）
-ensure_ipv4_for_install() {
-    yellow "\n[网络检测] 正在检测IPv4出站..."
-    if has_working_ipv4; then
-        local got
-        got=$(curl -4 -sm 3 ip.sb 2>/dev/null)
-        green "[网络检测] 已有可用IPv4出站: ${purple}${got:-ok}${re}，无需加装WARP。\n"
-        return 0
-    fi
-
-    if has_local_ipv4; then
-        yellow "[网络检测] 本机有IPv4地址，但外网IPv4不通，尝试加装WARP IPv4出站...\n"
-    else
-        yellow "[网络检测] 未检测到本机全局IPv4（判定为纯IPv6或IPv4不可用）。"
-        yellow "GitHub官方长期无IPv6解析，将自动加装系统级WARP IPv4出站后再继续安装...\n"
-    fi
-
-    local iface
-    iface=$(sys_warp_iface 4)
-
-    # 若已有配置但接口未起，先尝试拉起
-    if [ -f "${sys_warp_dir}/${iface}.conf" ]; then
-        yellow "发现已有 ${iface} 配置，尝试启动..."
-        if ! ip link show "$iface" &>/dev/null; then
-            command_exists wg-quick && wg-quick up "$iface" 2>&1 || true
-            sleep 2
-        fi
-        if has_working_ipv4; then
-            green "已有WARP IPv4出站可用，继续安装。\n"
-            return 0
-        fi
-        yellow "已有配置仍无可用IPv4，将重建..."
-        command_exists wg-quick && wg-quick down "$iface" &>/dev/null
-        rm -f "${sys_warp_dir}/${iface}.conf"
-    fi
-
-    command_exists wg || manage_packages install wireguard-tools
-    command_exists wg-quick || manage_packages install wireguard-tools
-    command_exists curl || manage_packages install curl
-    command_exists jq || manage_packages install jq
-
-    if ! command_exists wg || ! command_exists wg-quick; then
-        red "[WARP] 无法安装 wireguard-tools，跳过自动加装，将依赖GitHub镜像代理下载。\n"
-        return 1
-    fi
-
-    yellow "[WARP] 正在向 Cloudflare 注册独立账号（走本机现有协议栈，兼容纯IPv6）...\n"
-    if ! cf_warp_register; then
-        red "[WARP] 注册失败，将继续尝试GitHub镜像代理下载。\n"
-        return 1
-    fi
-
-    sys_warp_write_conf 4
-
-    yellow "[WARP] 正在启动出站接口 ${iface}...\n"
-    if ! wg-quick up "$iface" 2>&1; then
-        red "[WARP] 接口启动失败（常见于不支持TUN/WireGuard的OpenVZ/LXC）。将继续尝试GitHub镜像代理下载。\n"
-        rm -f "${sys_warp_dir}/${iface}.conf"
-        return 1
-    fi
-
-    sys_warp_enable_boot "$iface"
-    sleep 3
-
-    if has_working_ipv4; then
-        local got_v4
-        got_v4=$(curl -4 -sm 5 ip.sb 2>/dev/null)
-        green "✅ [WARP] 已自动加装IPv4出站，出口: ${purple}${got_v4:-ok}${re}，继续安装...\n"
-        return 0
-    fi
-
-    yellow "[WARP] 接口已启动但仍测不到可用IPv4，安装将依赖GitHub镜像代理。\n"
-    return 1
-}
-
 # 获取ISP信息（国家码-运营商），固定使用与get_realip()判定出的连接协议栈一致的
 # 出口去查询，避免加装WARP出站(单栈VPS加装WARP全局出站功能)后，
 # 系统默认路由/DNS优先选择了WARP出口，导致isp被误判为"Cloudflare_Warp"
@@ -515,23 +417,18 @@ generate_warp_endpoint() {
     fcm_token="${install_id}:APA91b$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 134)"
     tos_date=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-    local try=0 max_try=5 curl_flags="-sS -m 15 --tlsv1.2"
-    local reg_body="{\"key\":\"${public_key}\",\"install_id\":\"${install_id}\",\"fcm_token\":\"${fcm_token}\",\"tos\":\"${tos_date}\",\"model\":\"PC\",\"serial_number\":\"${install_id}\",\"locale\":\"en_US\"}"
+    local try=0 max_try=5
     while [ $try -lt $max_try ]; do
         try=$((try + 1))
-        # 不强制 -4：纯IPv6只能走默认/IPv6；再分别试 -6、-4
-        reg_response=$(curl $curl_flags -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
-            -H "Content-Type: application/json" -H "User-Agent: okhttp/3.12.1" -H "CF-Client-Version: a-6.30-3596" \
-            -d "$reg_body" 2>/dev/null)
-        echo "$reg_response" | jq -e '.config.interface.addresses.v4 // .config.client_id' >/dev/null 2>&1 && break
-        reg_response=$(curl -6 $curl_flags -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
-            -H "Content-Type: application/json" -H "User-Agent: okhttp/3.12.1" -H "CF-Client-Version: a-6.30-3596" \
-            -d "$reg_body" 2>/dev/null)
-        echo "$reg_response" | jq -e '.config.interface.addresses.v4 // .config.client_id' >/dev/null 2>&1 && break
-        reg_response=$(curl -4 $curl_flags -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
-            -H "Content-Type: application/json" -H "User-Agent: okhttp/3.12.1" -H "CF-Client-Version: a-6.30-3596" \
-            -d "$reg_body" 2>/dev/null)
-        echo "$reg_response" | jq -e '.config.interface.addresses.v4 // .config.client_id' >/dev/null 2>&1 && break
+        reg_response=$(curl -4 -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: okhttp/3.12.1" \
+            -H "CF-Client-Version: a-6.30-3596" \
+            -d "{\"key\":\"${public_key}\",\"install_id\":\"${install_id}\",\"fcm_token\":\"${fcm_token}\",\"tos\":\"${tos_date}\",\"model\":\"PC\",\"serial_number\":\"${install_id}\",\"locale\":\"en_US\"}" 2>/dev/null)
+
+        if echo "$reg_response" | jq -e '.config.interface.addresses.v4 // .config.client_id' >/dev/null 2>&1; then
+            break
+        fi
         [ -z "$quiet" ] && yellow "第 ${try}/${max_try} 次注册未成功，重试中..."
         sleep 2
     done
@@ -703,22 +600,13 @@ cf_warp_register() {
     fcm_token="${install_id}:APA91b$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 134)"
     tos_date=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-    local curl_flags="-sS -m 15 --tlsv1.2"
-    local reg_body="{\"key\":\"${pub}\",\"install_id\":\"${install_id}\",\"fcm_token\":\"${fcm_token}\",\"tos\":\"${tos_date}\",\"model\":\"PC\",\"serial_number\":\"${install_id}\",\"locale\":\"en_US\"}"
     while [ $try -lt 5 ]; do
         try=$((try + 1))
-        # 不强制 -4：纯IPv6只能走默认/IPv6；再分别试 -6、-4
-        reg_response=$(curl $curl_flags -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
-            -H "Content-Type: application/json" -H "User-Agent: okhttp/3.12.1" -H "CF-Client-Version: a-6.30-3596" \
-            -d "$reg_body" 2>/dev/null)
-        echo "$reg_response" | jq -e '.config' >/dev/null 2>&1 && break
-        reg_response=$(curl -6 $curl_flags -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
-            -H "Content-Type: application/json" -H "User-Agent: okhttp/3.12.1" -H "CF-Client-Version: a-6.30-3596" \
-            -d "$reg_body" 2>/dev/null)
-        echo "$reg_response" | jq -e '.config' >/dev/null 2>&1 && break
-        reg_response=$(curl -4 $curl_flags -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
-            -H "Content-Type: application/json" -H "User-Agent: okhttp/3.12.1" -H "CF-Client-Version: a-6.30-3596" \
-            -d "$reg_body" 2>/dev/null)
+        reg_response=$(curl -4 -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: okhttp/3.12.1" \
+            -H "CF-Client-Version: a-6.30-3596" \
+            -d "{\"key\":\"${pub}\",\"install_id\":\"${install_id}\",\"fcm_token\":\"${fcm_token}\",\"tos\":\"${tos_date}\",\"model\":\"PC\",\"serial_number\":\"${install_id}\",\"locale\":\"en_US\"}" 2>/dev/null)
         echo "$reg_response" | jq -e '.config' >/dev/null 2>&1 && break
         yellow "第 ${try}/5 次注册未成功，重试中...\n"
         sleep 2
@@ -938,10 +826,6 @@ install_singbox() {
 
     clear
     purple "正在安装sing-box中，请稍后..."
-
-    # 纯IPv6/无可用IPv4时先自动加装系统级WARP IPv4出站，再访问GitHub
-    ensure_ipv4_for_install || true
-
     ARCH_RAW=$(uname -m)
     case "${ARCH_RAW}" in
         'x86_64' | 'amd64')  ARCH='amd64' ;;
@@ -954,22 +838,14 @@ install_singbox() {
 
     [ ! -d "${work_dir}" ] && mkdir -p "${work_dir}" && chmod 777 "${work_dir}" && mkdir -p "${conf_dir}"
 
-    # 从官方 GitHub Releases 下载（优先直连，失败自动走镜像代理，兼容纯IPv6）
-    local releases_json latest_version
-    if ! releases_json=$(gh_fetch_json "https://api.github.com/repos/SagerNet/sing-box/releases"); then
-        red "获取 sing-box 最新版本号失败，请检查网络或稍后重试\n"
-        gh_ipv6_hint
-        exit 1
-    fi
-    latest_version=$(echo "$releases_json" | jq -r '[.[] | select(.prerelease==false and .draft==false)][0].tag_name // empty' | sed 's/^v//')
+    # 改为从 sing-box 官方 GitHub Releases 下载二进制（原来的 ssss.nyc.mn 三方源已注释掉）
+    latest_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==false)][0].tag_name | sub("^v"; "")')
     if [ -z "$latest_version" ] || [ "$latest_version" = "null" ]; then
-        red "获取 sing-box 最新版本号失败（返回内容异常）\n"
+        red "获取 sing-box 最新版本号失败，请检查服务器是否能访问 api.github.com\n"
         exit 1
     fi
-    green "检测到 sing-box 最新稳定版: v${latest_version}\n"
-    if ! gh_download "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${ARCH}.tar.gz" "${work_dir}/${server_name}.tar.gz"; then
-        red "从 GitHub 下载 sing-box 二进制失败\n"
-        gh_ipv6_hint
+    if ! curl -fsSLo "${work_dir}/${server_name}.tar.gz" "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${ARCH}.tar.gz"; then
+        red "从 GitHub 下载 sing-box 二进制失败，请检查服务器是否能访问 github.com\n"
         exit 1
     fi
     tar -xzvf "${work_dir}/${server_name}.tar.gz" -C "${work_dir}/" && \
@@ -1001,15 +877,15 @@ install_singbox() {
     if [ -z "$CF_ARCH" ]; then
         yellow "架构 ${ARCH} 官方 cloudflared 不提供预编译包，argo 隧道功能将不可用\n"
         : > "${work_dir}/argo"
-    elif ! gh_download "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}" "${work_dir}/argo"; then
-        red "从 GitHub 下载 cloudflared 失败\n"
-        gh_ipv6_hint
+    elif ! curl -fsSLo "${work_dir}/argo" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"; then
+        red "从 GitHub 下载 cloudflared 失败，请检查服务器是否能访问 github.com\n"
         exit 1
     fi
 
-    # qrencode 官方没有独立预编译二进制，暂时仍用 eooce/test 这个 GitHub 开源仓库的 release
-    gh_download "https://github.com/eooce/test/releases/download/${ARCH}/qrencode-linux-${ARCH}" "${work_dir}/qrencode" || true
-    chown root:root ${work_dir} && chmod +x ${work_dir}/${server_name} ${work_dir}/argo ${work_dir}/qrencode 2>/dev/null
+    # qrencode 官方没有独立预编译二进制，暂时仍用 eooce/test 这个 GitHub 开源仓库的 release（比原来的裸域名至少可查看源码/校验），
+    # 如果你的服务器装了系统自带的 qrencode，也可以把下面这行换成: cp "$(command -v qrencode)" "${work_dir}/qrencode"
+    curl -sLo "${work_dir}/qrencode" "https://github.com/eooce/test/releases/download/${ARCH}/qrencode-linux-${ARCH}"
+    chown root:root ${work_dir} && chmod +x ${work_dir}/${server_name} ${work_dir}/argo ${work_dir}/qrencode
 
     # 确保vless_port本身也是空闲的（防止PORT环境变量或随机数刚好撞上已占用端口）
     while ! is_port_free "$vless_port"; do
@@ -1432,14 +1308,8 @@ uninstall_singbox() {
             fi
             rm -rf "${work_dir}" || true
             rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/argo.service
-            rm -f /usr/bin/sb
 
-            # 同步清理安装时可能自动加装的系统级 WARP 出站
-            yellow "正在清理系统级 WARP 出站（若有）..."
-            sys_warp_remove 4 >/dev/null 2>&1
-            sys_warp_remove 6 >/dev/null 2>&1
-
-            green "\nsing-box 卸载成功（含系统级WARP出站清理）\n\n" && exit 0
+            green "\nsing-box 卸载成功\n\n" && exit 0
             ;;
         *) purple "已取消卸载操作\n\n" ;;
     esac
@@ -1517,11 +1387,11 @@ auto_uninstall() {
     rm -rf "${work_dir}"
     rm -f /usr/bin/sb
 
-    # 同步清理安装时可能自动加装的系统级 WARP 出站（关闭接口、取消开机自启、删除配置）
+    # 清理系统级 WARP 出站（关闭接口、取消开机自启、删除 crontab 与配置文件，静默执行）
     sys_warp_remove 4 >/dev/null 2>&1
     sys_warp_remove 6 >/dev/null 2>&1
 
-    green "\nsing-box 已完全卸载（含系统级WARP出站清理）!\n"
+    green "\nsing-box 已完全卸载!\n"
 }
 
 # 变更配置
