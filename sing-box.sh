@@ -595,14 +595,25 @@ cf_warp_register() {
         return 1
     fi
 
-    local install_id fcm_token tos_date reg_response try=0
+    local install_id fcm_token tos_date reg_response try=0 curl_flag=""
     install_id=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 22)
     fcm_token="${install_id}:APA91b$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 134)"
     tos_date=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")
 
+    # 不再强制使用 IPv4。主菜单 12 的目标就是支持纯 IPv6/纯 IPv4 VPS，
+    # 因此注册 API 必须自动选择当前主机实际可用的协议栈。
+    if curl -6 -sS -m 5 -o /dev/null https://api.cloudflareclient.com/ 2>/dev/null; then
+        curl_flag="-6"
+    elif curl -4 -sS -m 5 -o /dev/null https://api.cloudflareclient.com/ 2>/dev/null; then
+        curl_flag="-4"
+    else
+        red "无法连接 Cloudflare WARP 注册 API（IPv4/IPv6 均不可达）\n"
+        return 1
+    fi
+
     while [ $try -lt 5 ]; do
         try=$((try + 1))
-        reg_response=$(curl -4 -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
+        reg_response=$(curl "$curl_flag" -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
             -H "Content-Type: application/json" \
             -H "User-Agent: okhttp/3.12.1" \
             -H "CF-Client-Version: a-6.30-3596" \
@@ -621,6 +632,18 @@ cf_warp_register() {
     REG_V4=$(echo "$reg_response" | jq -r '.config.interface.addresses.v4 // empty')
     REG_V6=$(echo "$reg_response" | jq -r '.config.interface.addresses.v6 // empty')
     REG_PEER=$(echo "$reg_response" | jq -r '.config.peers[0].public_key // "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="')
+
+    # 优先使用 Cloudflare 注册接口返回的实际 peer 地址，避免把固定的
+    # 2606:4700:d0::a29f:c001 / 162.159.192.1 写死。API 返回的 v4/v6
+    # 端点可能以 :0 结尾，WireGuard 实际连接统一使用 WARP 的 2408 端口。
+    local peer_v4 peer_v6
+    peer_v4=$(echo "$reg_response" | jq -r '.config.peers[0].endpoint.v4 // empty')
+    peer_v6=$(echo "$reg_response" | jq -r '.config.peers[0].endpoint.v6 // empty')
+    peer_v4=$(echo "$peer_v4" | sed 's/:0$//')
+    peer_v6=$(echo "$peer_v6" | sed 's/:0$//')
+    REG_ENDPOINT_V4="${peer_v4:+${peer_v4}:2408}"
+    REG_ENDPOINT_V6="${peer_v6:+${peer_v6}:2408}"
+
     [ -z "$REG_V4" ] && REG_V4="172.16.0.2"
     return 0
 }
@@ -635,10 +658,10 @@ sys_warp_write_conf() {
     mkdir -p "$sys_warp_dir"
 
     if [ "$family" = "4" ]; then
-        endpoint="[2606:4700:d0::a29f:c001]:2408"
+        endpoint="${REG_ENDPOINT_V6:-[2606:4700:d0::a29f:c001]:2408}"
         allowed="0.0.0.0/0"
     else
-        endpoint="162.159.192.1:2408"
+        endpoint="${REG_ENDPOINT_V4:-162.159.192.1:2408}"
         allowed="::/0"
     fi
 
