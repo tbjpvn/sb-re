@@ -281,7 +281,47 @@ gh_download() {
 
 # 提示纯IPv6直连GitHub失败时的通用引导文案
 gh_ipv6_hint() {
-    yellow "提示：GitHub官方(github.com/api.github.com)长期未提供IPv6解析，纯IPv6 VPS在未配置NAT64或WARP出站时通常无法直连，脚本已自动尝试镜像代理但仍失败（可能是网络波动或镜像暂时不可用）。可到主菜单「单栈VPS加装WARP全局出站」加装IPv4 WARP出站后重试，或稍后再试。\n"
+    yellow "提示：GitHub官方(github.com/api.github.com)长期未提供IPv6解析，纯IPv6 VPS在未配置NAT64或WARP出站时通常无法直连，脚本已自动尝试镜像代理和临时WARP出站但仍失败（可能是网络波动或WARP注册暂时受限）。可到主菜单「单栈VPS加装WARP全局出站」再手动重试，或稍后再试。\n"
+}
+
+# 确保本机有可用的IPv4出口；纯IPv6主机直连+镜像都拉不到GitHub时，
+# 自动加装系统级WARP IPv4出站(即「单栈VPS加装WARP全局出站」同一套逻辑)，
+# 加装后是持久生效的(开机自启)，不是装完就卸，方便以后所有出站都能用；
+# 不想保留的话，装完后可以到该菜单里手动删除。
+ensure_ipv4_outbound() {
+    # 已有可用IPv4出口(原生或早先已加装过WARP)，直接跳过
+    curl -4 -sm 3 -o /dev/null https://1.1.1.1 2>/dev/null && return 0
+    curl -4 -sm 3 -o /dev/null https://api.ipify.org 2>/dev/null && return 0
+
+    yellow "\n检测到本机直连+镜像都无法访问GitHub，尝试自动加装 WARP IPv4 出站以继续安装...\n"
+    local iface="wgcf-v4"
+
+    if [ -f "${sys_warp_dir}/${iface}.conf" ]; then
+        wg-quick up "$iface" &>/dev/null
+    else
+        command_exists wg || manage_packages install wireguard-tools
+        command_exists wg-quick || manage_packages install wireguard-tools
+        command_exists curl || manage_packages install curl
+        command_exists jq || manage_packages install jq
+        if ! command_exists wg-quick; then
+            red "wireguard-tools 安装失败，无法加装WARP出站\n"
+            return 1
+        fi
+        if cf_warp_register; then
+            sys_warp_write_conf "4"
+            wg-quick up "$iface" 2>/dev/null
+        fi
+    fi
+    sys_warp_enable_boot "$iface" 2>/dev/null
+
+    sleep 1
+    if curl -4 -sm 5 -o /dev/null https://1.1.1.1 2>/dev/null; then
+        green "WARP IPv4 出站已加装成功(开机自启，不需要可到主菜单「单栈VPS加装WARP全局出站」删除)，继续安装...\n"
+        return 0
+    else
+        red "WARP IPv4 出站加装失败\n"
+        return 1
+    fi
 }
 
 # 获取ISP信息（国家码-运营商），固定使用与get_realip()判定出的连接协议栈一致的
@@ -839,18 +879,27 @@ install_singbox() {
     [ ! -d "${work_dir}" ] && mkdir -p "${work_dir}" && chmod 777 "${work_dir}" && mkdir -p "${conf_dir}"
 
     # 改为从 sing-box 官方 GitHub Releases 下载二进制（原来的 ssss.nyc.mn 三方源已注释掉）
-    # 使用 gh_fetch_json/gh_download，纯IPv6服务器直连github.com/api.github.com失败时会自动走镜像代理重试
+    # 使用 gh_fetch_json/gh_download，纯IPv6服务器直连github.com/api.github.com失败时会自动走镜像代理重试，
+    # 镜像也失败的话再自动加装临时WARP IPv4出站兜底
     releases_json=$(gh_fetch_json "https://api.github.com/repos/SagerNet/sing-box/releases")
     latest_version=$(echo "$releases_json" | jq -r '[.[] | select(.prerelease==false)][0].tag_name | sub("^v"; "")')
+    if [ -z "$latest_version" ] || [ "$latest_version" = "null" ]; then
+        if ensure_ipv4_outbound; then
+            releases_json=$(gh_fetch_json "https://api.github.com/repos/SagerNet/sing-box/releases")
+            latest_version=$(echo "$releases_json" | jq -r '[.[] | select(.prerelease==false)][0].tag_name | sub("^v"; "")')
+        fi
+    fi
     if [ -z "$latest_version" ] || [ "$latest_version" = "null" ]; then
         red "获取 sing-box 最新版本号失败，请检查服务器是否能访问 api.github.com\n"
         gh_ipv6_hint
         exit 1
     fi
     if ! gh_download "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${ARCH}.tar.gz" "${work_dir}/${server_name}.tar.gz"; then
-        red "从 GitHub 下载 sing-box 二进制失败，请检查服务器是否能访问 github.com\n"
-        gh_ipv6_hint
-        exit 1
+        if ! ensure_ipv4_outbound || ! gh_download "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${ARCH}.tar.gz" "${work_dir}/${server_name}.tar.gz"; then
+            red "从 GitHub 下载 sing-box 二进制失败，请检查服务器是否能访问 github.com\n"
+            gh_ipv6_hint
+            exit 1
+        fi
     fi
     tar -xzvf "${work_dir}/${server_name}.tar.gz" -C "${work_dir}/" && \
     mv "${work_dir}/sing-box-${latest_version}-linux-${ARCH}/sing-box" "${work_dir}/" && \
@@ -882,14 +931,17 @@ install_singbox() {
         yellow "架构 ${ARCH} 官方 cloudflared 不提供预编译包，argo 隧道功能将不可用\n"
         : > "${work_dir}/argo"
     elif ! gh_download "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}" "${work_dir}/argo"; then
-        red "从 GitHub 下载 cloudflared 失败，请检查服务器是否能访问 github.com\n"
-        gh_ipv6_hint
-        exit 1
+        if ! ensure_ipv4_outbound || ! gh_download "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}" "${work_dir}/argo"; then
+            red "从 GitHub 下载 cloudflared 失败，请检查服务器是否能访问 github.com\n"
+            gh_ipv6_hint
+            exit 1
+        fi
     fi
 
     # qrencode 官方没有独立预编译二进制，暂时仍用 eooce/test 这个 GitHub 开源仓库的 release（比原来的裸域名至少可查看源码/校验），
     # 如果你的服务器装了系统自带的 qrencode，也可以把下面这行换成: cp "$(command -v qrencode)" "${work_dir}/qrencode"
-    gh_download "https://github.com/eooce/test/releases/download/${ARCH}/qrencode-linux-${ARCH}" "${work_dir}/qrencode"
+    gh_download "https://github.com/eooce/test/releases/download/${ARCH}/qrencode-linux-${ARCH}" "${work_dir}/qrencode" || \
+        { ensure_ipv4_outbound && gh_download "https://github.com/eooce/test/releases/download/${ARCH}/qrencode-linux-${ARCH}" "${work_dir}/qrencode"; }
     chown root:root ${work_dir} && chmod +x ${work_dir}/${server_name} ${work_dir}/argo ${work_dir}/qrencode
 
     # 确保vless_port本身也是空闲的（防止PORT环境变量或随机数刚好撞上已占用端口）
