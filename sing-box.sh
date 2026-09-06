@@ -951,12 +951,16 @@ install_singbox() {
     dns_strategy=$(ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1 && echo "prefer_ipv4" || \
         (ping -c 1 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && echo "prefer_ipv6" || echo "prefer_ipv4"))
 
-    # 读取系统当前实际生效的DNS服务器地址(可能是运营商/机房分配的，也可能是用户自己配置的
-    # NAT64/DNS64地址)，直接作为sing-box的udp DNS服务器使用。
-    # 不用sing-box的"local"类型，是因为"local"在多网卡环境(eth0+NAT64相关的nclat4h/nclat6h+
-    # 装了菜单12WARP后的wgcf-v4等接口并存)下，经常判断错该用哪张网卡的DNS，
+    # 默认优先用sing-box的"local"类型解析DNS——它会动态跟随系统DNS变化，
+    # 常规双栈/单栈机器只有一张网卡，这个类型完全没问题，优先保留这个更优的行为。
+    # 只有在检测到NAT64(clat类虚拟接口)/系统级WARP(wgcf-v4、wgcf-v6)这类多网卡并存的
+    # 复杂网络环境时，才切换成读取系统当前DNS地址、写死成固定udp服务器的兜底方案——
+    # "local"在这种多网卡环境下经常判断错该用哪张网卡的DNS，
     # 报"link has no DNS servers configured"直接FATAL退出，所有节点一起失效。
-    # 直接用具体地址可以绕开这个探测逻辑，同时保留用户自己配置的NAT64解析能力。
+    resolver_tag="local"
+    if ip link show 2>/dev/null | grep -qE '^[0-9]+: (wgcf-v[46]|[a-z]*clat[a-z0-9]*)[:@]'; then
+        resolver_tag="sys"
+    fi
     sys_dns_server=$(awk '/^nameserver[ \t]+/{print $2; exit}' /etc/resolv.conf 2>/dev/null)
     if [ -z "$sys_dns_server" ]; then
         case "$dns_strategy" in
@@ -1131,7 +1135,7 @@ EOF
     ],
     "final": "direct",
     "default_domain_resolver": {
-      "server": "sys",
+      "server": "$resolver_tag",
       "strategy": "$dns_strategy"
     }
   }
@@ -2299,6 +2303,14 @@ restore_direct_outbound() {
             "${conf_dir}/dns.json" > "${conf_dir}/dns.json.tmp" && mv "${conf_dir}/dns.json.tmp" "${conf_dir}/dns.json"
     fi
 
+    # 重新判断一次网络环境是否复杂（网络拓扑可能在装完sing-box后才变化，
+    # 比如后来才装了菜单12的WARP），复杂环境用固定地址"sys"更稳，
+    # 常规单网卡环境优先用能动态跟随系统DNS的"local"
+    local cur_resolver_tag="local"
+    if ip link show 2>/dev/null | grep -qE '^[0-9]+: (wgcf-v[46]|[a-z]*clat[a-z0-9]*)[:@]'; then
+        cur_resolver_tag="sys"
+    fi
+
     # 恢复 outbounds.json 中的 direct 出站（不存在则插入到数组最前面）
     if ! jq -e '.outbounds[] | select(.tag == "direct")' "$outbound_file" > /dev/null 2>&1; then
         jq '.outbounds = [{"type": "direct", "tag": "direct"}] + .outbounds' \
@@ -2326,7 +2338,7 @@ restore_direct_outbound() {
     ],
     "final": "direct",
     "default_domain_resolver": {
-      "server": "sys",
+      "server": "$cur_resolver_tag",
       "strategy": "$cur_dns_strategy"
     }
   }
@@ -3334,12 +3346,17 @@ manage_outbound_strategy() {
     fi
 
     # 3. 更新 route.json 中的 default_domain_resolver（sing-box 1.11+ 的正式出站解析机制，未废弃）
-    #    server 固定指向"sys"(读取系统当前DNS地址生成的固定udp解析器)，不用"local"——
-    #    "local"在多网卡环境(nclat4h/nclat6h/wgcf-v4等接口并存)下经常判断错该用哪张卡的DNS，
+    #    常规单网卡环境优先用能动态跟随系统DNS的"local"；只有检测到NAT64(clat类接口)/
+    #    系统级WARP(wgcf-v4、wgcf-v6)这类多网卡并存的复杂环境，才用固定地址的"sys"兜底——
+    #    "local"在这种复杂环境下经常判断错该用哪张网卡的DNS，
     #    报"link has no DNS servers configured"直接FATAL退出，所有节点一起失效。
+    local cur_resolver_tag="local"
+    if ip link show 2>/dev/null | grep -qE '^[0-9]+: (wgcf-v[46]|[a-z]*clat[a-z0-9]*)[:@]'; then
+        cur_resolver_tag="sys"
+    fi
     if [ -f "$route_file" ]; then
-        jq --arg s "$new_strategy" \
-            '.route.default_domain_resolver = {"server": "sys", "strategy": $s}' \
+        jq --arg s "$new_strategy" --arg srv "$cur_resolver_tag" \
+            '.route.default_domain_resolver = {"server": $srv, "strategy": $s}' \
             "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
     fi
 
