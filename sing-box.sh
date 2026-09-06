@@ -864,13 +864,22 @@ install_singbox() {
     [ ! -d "${work_dir}" ] && mkdir -p "${work_dir}" && chmod 777 "${work_dir}" && mkdir -p "${conf_dir}"
 
     # 改为从 sing-box 官方 GitHub Releases 下载二进制（原来的 ssss.nyc.mn 三方源已注释掉）
-    latest_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==false)][0].tag_name | sub("^v"; "")')
+    # 用 gh_fetch_json/gh_download 代替裸curl|jq：api.github.com 偶发超时/限流/网络抖动时
+    # 裸curl会返回空内容或非JSON片段，直接喂给jq就是「parse error: Invalid numeric literal...」
+    # 这种不知所云的报错；gh_fetch_json 会先校验JSON有效性，失败再自动重试几个镜像代理。
+    if ! releases_json=$(gh_fetch_json "https://api.github.com/repos/SagerNet/sing-box/releases"); then
+        red "获取 sing-box 最新版本号失败，请检查服务器是否能访问 api.github.com\n"
+        gh_ipv6_hint
+        exit 1
+    fi
+    latest_version=$(echo "$releases_json" | jq -r '[.[] | select(.prerelease==false)][0].tag_name // empty' | sed 's/^v//')
     if [ -z "$latest_version" ] || [ "$latest_version" = "null" ]; then
         red "获取 sing-box 最新版本号失败，请检查服务器是否能访问 api.github.com\n"
         exit 1
     fi
-    if ! curl -fsSLo "${work_dir}/${server_name}.tar.gz" "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${ARCH}.tar.gz"; then
+    if ! gh_download "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${ARCH}.tar.gz" "${work_dir}/${server_name}.tar.gz"; then
         red "从 GitHub 下载 sing-box 二进制失败，请检查服务器是否能访问 github.com\n"
+        gh_ipv6_hint
         exit 1
     fi
     tar -xzvf "${work_dir}/${server_name}.tar.gz" -C "${work_dir}/" && \
