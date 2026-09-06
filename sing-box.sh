@@ -951,6 +951,20 @@ install_singbox() {
     dns_strategy=$(ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1 && echo "prefer_ipv4" || \
         (ping -c 1 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && echo "prefer_ipv6" || echo "prefer_ipv4"))
 
+    # 读取系统当前实际生效的DNS服务器地址(可能是运营商/机房分配的，也可能是用户自己配置的
+    # NAT64/DNS64地址)，直接作为sing-box的udp DNS服务器使用。
+    # 不用sing-box的"local"类型，是因为"local"在多网卡环境(eth0+NAT64相关的nclat4h/nclat6h+
+    # 装了菜单12WARP后的wgcf-v4等接口并存)下，经常判断错该用哪张网卡的DNS，
+    # 报"link has no DNS servers configured"直接FATAL退出，所有节点一起失效。
+    # 直接用具体地址可以绕开这个探测逻辑，同时保留用户自己配置的NAT64解析能力。
+    sys_dns_server=$(awk '/^nameserver[ \t]+/{print $2; exit}' /etc/resolv.conf 2>/dev/null)
+    if [ -z "$sys_dns_server" ]; then
+        case "$dns_strategy" in
+            prefer_ipv6) sys_dns_server="2606:4700:4700::1111" ;;
+            *)           sys_dns_server="1.1.1.1" ;;
+        esac
+    fi
+
     cat > "${conf_dir}/log.json" << EOF
 {
   "log": {
@@ -977,6 +991,11 @@ EOF
 {
   "dns": {
     "servers": [
+      {
+        "tag": "sys",
+        "type": "udp",
+        "server": "$sys_dns_server"
+      },
       {
         "tag": "local",
         "type": "local"
@@ -1112,7 +1131,7 @@ EOF
     ],
     "final": "direct",
     "default_domain_resolver": {
-      "server": "local",
+      "server": "sys",
       "strategy": "$dns_strategy"
     }
   }
@@ -1993,7 +2012,7 @@ test_warp_connectivity() {
     ],
     "final": "wireguard-out",
     "default_domain_resolver": {
-      "server": "local",
+      "server": "sys",
       "strategy": "prefer_ipv4"
     }
   }
@@ -2270,6 +2289,16 @@ restore_direct_outbound() {
     cur_dns_strategy=$(jq -r '.dns.strategy // "prefer_ipv4"' "${conf_dir}/dns.json" 2>/dev/null)
     [ -z "$cur_dns_strategy" ] || [ "$cur_dns_strategy" = "null" ] && cur_dns_strategy="prefer_ipv4"
 
+    # 兼容旧配置：升级前生成的dns.json里没有"sys"这个固定地址解析器，这里补上，
+    # 避免下面route.json把default_domain_resolver指向一个不存在的tag导致FATAL。
+    if ! jq -e '.dns.servers[] | select(.tag=="sys")' "${conf_dir}/dns.json" >/dev/null 2>&1; then
+        local heal_dns
+        heal_dns=$(awk '/^nameserver[ \t]+/{print $2; exit}' /etc/resolv.conf 2>/dev/null)
+        [ -z "$heal_dns" ] && heal_dns="1.1.1.1"
+        jq --arg s "$heal_dns" '.dns.servers = [{"tag":"sys","type":"udp","server":$s}] + .dns.servers' \
+            "${conf_dir}/dns.json" > "${conf_dir}/dns.json.tmp" && mv "${conf_dir}/dns.json.tmp" "${conf_dir}/dns.json"
+    fi
+
     # 恢复 outbounds.json 中的 direct 出站（不存在则插入到数组最前面）
     if ! jq -e '.outbounds[] | select(.tag == "direct")' "$outbound_file" > /dev/null 2>&1; then
         jq '.outbounds = [{"type": "direct", "tag": "direct"}] + .outbounds' \
@@ -2297,7 +2326,7 @@ restore_direct_outbound() {
     ],
     "final": "direct",
     "default_domain_resolver": {
-      "server": "local",
+      "server": "sys",
       "strategy": "$cur_dns_strategy"
     }
   }
@@ -3284,6 +3313,16 @@ manage_outbound_strategy() {
     local route_file="${conf_dir}/route.json"
     local outbound_file="${conf_dir}/outbounds.json"
 
+    # 0. 兼容旧配置：升级前生成的dns.json里没有"sys"这个固定地址解析器，这里补上，
+    #    避免下面第3步把default_domain_resolver指向一个不存在的tag导致FATAL。
+    if ! jq -e '.dns.servers[] | select(.tag=="sys")' "$dns_file" >/dev/null 2>&1; then
+        local heal_dns
+        heal_dns=$(awk '/^nameserver[ \t]+/{print $2; exit}' /etc/resolv.conf 2>/dev/null)
+        [ -z "$heal_dns" ] && heal_dns="1.1.1.1"
+        jq --arg s "$heal_dns" '.dns.servers = [{"tag":"sys","type":"udp","server":$s}] + .dns.servers' \
+            "$dns_file" > "${dns_file}.tmp" && mv "${dns_file}.tmp" "$dns_file"
+    fi
+
     # 1. 更新 dns.json 中的默认策略（供dns模块内部解析使用）
     jq --arg s "$new_strategy" '.dns.strategy = $s' "$dns_file" > "${dns_file}.tmp" && mv "${dns_file}.tmp" "$dns_file"
 
@@ -3295,9 +3334,12 @@ manage_outbound_strategy() {
     fi
 
     # 3. 更新 route.json 中的 default_domain_resolver（sing-box 1.11+ 的正式出站解析机制，未废弃）
+    #    server 固定指向"sys"(读取系统当前DNS地址生成的固定udp解析器)，不用"local"——
+    #    "local"在多网卡环境(nclat4h/nclat6h/wgcf-v4等接口并存)下经常判断错该用哪张卡的DNS，
+    #    报"link has no DNS servers configured"直接FATAL退出，所有节点一起失效。
     if [ -f "$route_file" ]; then
         jq --arg s "$new_strategy" \
-            '.route.default_domain_resolver = {"server": "local", "strategy": $s}' \
+            '.route.default_domain_resolver = {"server": "sys", "strategy": $s}' \
             "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
     fi
 
