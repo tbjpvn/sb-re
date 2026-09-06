@@ -950,6 +950,14 @@ install_singbox() {
     
     dns_strategy=$(ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1 && echo "prefer_ipv4" || \
         (ping -c 1 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && echo "prefer_ipv6" || echo "prefer_ipv4"))
+    # 默认DNS解析走固定IP的公共DNS(cf4/cf6)，不依赖系统"local"按网卡自动探测DNS——
+    # 纯IPv6机/装过系统级WARP(菜单12)的机器上，"local"探测偶尔会拿到
+    # "link has no DNS servers configured"直接导致sing-box FATAL退出、所有节点一起失效，
+    # 固定IP的udp resolver不依赖这个探测过程，更稳。
+    case "$dns_strategy" in
+        prefer_ipv6) dns_default_server="cf6" ;;
+        *)           dns_default_server="cf4" ;;
+    esac
     
     cat > "${conf_dir}/log.json" << EOF
 {
@@ -977,6 +985,16 @@ EOF
 {
   "dns": {
     "servers": [
+      {
+        "tag": "cf4",
+        "type": "udp",
+        "server": "1.1.1.1"
+      },
+      {
+        "tag": "cf6",
+        "type": "udp",
+        "server": "2606:4700:4700::1111"
+      },
       {
         "tag": "local",
         "type": "local"
@@ -1112,7 +1130,7 @@ EOF
     ],
     "final": "direct",
     "default_domain_resolver": {
-      "server": "local",
+      "server": "$dns_default_server",
       "strategy": "$dns_strategy"
     }
   }
@@ -1126,7 +1144,8 @@ main_systemd_services() {
 [Unit]
 Description=sing-box service
 Documentation=https://sing-box.sagernet.org
-After=network.target nss-lookup.target
+Wants=network-online.target
+After=network-online.target nss-lookup.target
 
 [Service]
 User=root
@@ -1146,7 +1165,8 @@ EOF
     cat > /etc/systemd/system/argo.service << EOF
 [Unit]
 Description=Cloudflare Tunnel
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
@@ -1183,6 +1203,11 @@ command="/etc/sing-box/sing-box"
 command_args="run -C /etc/sing-box/conf"
 command_background=true
 pidfile="/var/run/sing-box.pid"
+
+depend() {
+    need net
+    after firewall
+}
 EOF
 
     cat > /etc/init.d/argo << 'EOF'
@@ -1192,6 +1217,11 @@ command="/bin/sh"
 command_args="-c '/etc/sing-box/argo tunnel --url http://localhost:8001 --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1'"
 command_background=true
 pidfile="/var/run/argo.pid"
+
+depend() {
+    need net
+    after firewall
+}
 EOF
 
     chmod +x /etc/init.d/sing-box
@@ -1333,6 +1363,20 @@ uninstall_singbox() {
             fi
             rm -rf "${work_dir}" || true
             rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/argo.service
+
+            # 卸载sing-box不会连带卸载「12.单栈VPS加装WARP全局出站」加装的系统级WARP，
+            # 二者是独立功能；这里额外询问一下，避免卸载后WARP的wg-quick接口/开机自启一直残留
+            if [ -f "${sys_warp_dir}/$(sys_warp_iface 4).conf" ] || [ -f "${sys_warp_dir}/$(sys_warp_iface 6).conf" ]; then
+                reading "检测到「单栈VPS加装WARP全局出站」(菜单12)仍在使用，是否一并卸载？(y/n): " warp_choice
+                case "${warp_choice}" in
+                    y|Y)
+                        sys_warp_remove 4 >/dev/null 2>&1
+                        sys_warp_remove 6 >/dev/null 2>&1
+                        green "系统级WARP出站已一并卸载\n"
+                        ;;
+                    *) yellow "已保留系统级WARP出站，如需手动卸载可重新运行脚本进入菜单12\n" ;;
+                esac
+            fi
 
             green "\nsing-box 卸载成功\n\n" && exit 0
             ;;
@@ -1967,7 +2011,7 @@ test_warp_connectivity() {
     ],
     "final": "wireguard-out",
     "default_domain_resolver": {
-      "server": "local",
+      "server": "cf4",
       "strategy": "prefer_ipv4"
     }
   }
@@ -2240,9 +2284,22 @@ restore_direct_outbound() {
     yellow "\n正在恢复默认路由配置...\n"
 
     # 读取当前IPv4/IPv6优先级策略，恢复时保持一致
-    local cur_dns_strategy
+    local cur_dns_strategy cur_dns_server
     cur_dns_strategy=$(jq -r '.dns.strategy // "prefer_ipv4"' "${conf_dir}/dns.json" 2>/dev/null)
     [ -z "$cur_dns_strategy" ] || [ "$cur_dns_strategy" = "null" ] && cur_dns_strategy="prefer_ipv4"
+    case "$cur_dns_strategy" in
+        prefer_ipv6|ipv6_only) cur_dns_server="cf6" ;;
+        *)                     cur_dns_server="cf4" ;;
+    esac
+    # 兼容旧配置：补上固定IP解析器tag，理由同 manage_outbound_strategy
+    if ! jq -e '.dns.servers[] | select(.tag=="cf4")' "${conf_dir}/dns.json" >/dev/null 2>&1; then
+        jq '.dns.servers += [{"tag":"cf4","type":"udp","server":"1.1.1.1"}]' \
+            "${conf_dir}/dns.json" > "${conf_dir}/dns.json.tmp" && mv "${conf_dir}/dns.json.tmp" "${conf_dir}/dns.json"
+    fi
+    if ! jq -e '.dns.servers[] | select(.tag=="cf6")' "${conf_dir}/dns.json" >/dev/null 2>&1; then
+        jq '.dns.servers += [{"tag":"cf6","type":"udp","server":"2606:4700:4700::1111"}]' \
+            "${conf_dir}/dns.json" > "${conf_dir}/dns.json.tmp" && mv "${conf_dir}/dns.json.tmp" "${conf_dir}/dns.json"
+    fi
 
     # 恢复 outbounds.json 中的 direct 出站（不存在则插入到数组最前面）
     if ! jq -e '.outbounds[] | select(.tag == "direct")' "$outbound_file" > /dev/null 2>&1; then
@@ -2271,7 +2328,7 @@ restore_direct_outbound() {
     ],
     "final": "direct",
     "default_domain_resolver": {
-      "server": "local",
+      "server": "$cur_dns_server",
       "strategy": "$cur_dns_strategy"
     }
   }
@@ -3257,6 +3314,23 @@ manage_outbound_strategy() {
 
     local route_file="${conf_dir}/route.json"
     local outbound_file="${conf_dir}/outbounds.json"
+    local new_dns_server
+    case "${new_strategy}" in
+        prefer_ipv6|ipv6_only) new_dns_server="cf6" ;;
+        *)                     new_dns_server="cf4" ;;
+    esac
+
+    # 0. 兼容旧配置：如果 dns.json 是升级前生成的、servers 里还没有固定IP的
+    #    cf4/cf6 解析器(只有一个"local"标签)，这里补上，否则下面第3步把
+    #    default_domain_resolver 指向 cf4/cf6 会因为找不到该tag直接FATAL退出。
+    if ! jq -e '.dns.servers[] | select(.tag=="cf4")' "$dns_file" >/dev/null 2>&1; then
+        jq '.dns.servers += [{"tag":"cf4","type":"udp","server":"1.1.1.1"}]' \
+            "$dns_file" > "${dns_file}.tmp" && mv "${dns_file}.tmp" "$dns_file"
+    fi
+    if ! jq -e '.dns.servers[] | select(.tag=="cf6")' "$dns_file" >/dev/null 2>&1; then
+        jq '.dns.servers += [{"tag":"cf6","type":"udp","server":"2606:4700:4700::1111"}]' \
+            "$dns_file" > "${dns_file}.tmp" && mv "${dns_file}.tmp" "$dns_file"
+    fi
 
     # 1. 更新 dns.json 中的默认策略（供dns模块内部解析使用）
     jq --arg s "$new_strategy" '.dns.strategy = $s' "$dns_file" > "${dns_file}.tmp" && mv "${dns_file}.tmp" "$dns_file"
@@ -3269,9 +3343,13 @@ manage_outbound_strategy() {
     fi
 
     # 3. 关键：更新 route.json 中的 default_domain_resolver（sing-box 1.11+ 的正式出站解析机制，未废弃）
+    #    server 固定指向上面确保存在的 cf4/cf6(直连固定IP解析)，不再用"local"——
+    #    "local"依赖系统按网卡自动探测DNS，纯IPv6机/装了菜单12系统级WARP的机器上
+    #    这个探测偶尔会失败(FATAL: link has no DNS servers configured)，导致切换策略后
+    #    sing-box 整个进程起不来、所有节点一起失效。
     if [ -f "$route_file" ]; then
-        jq --arg s "$new_strategy" \
-            '.route.default_domain_resolver = {"server": "local", "strategy": $s}' \
+        jq --arg s "$new_strategy" --arg srv "$new_dns_server" \
+            '.route.default_domain_resolver = {"server": $srv, "strategy": $s}' \
             "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
     fi
 
