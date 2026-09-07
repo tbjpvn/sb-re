@@ -1375,8 +1375,11 @@ uninstall_singbox() {
                 systemctl disable "${server_name}"; systemctl disable argo
                 systemctl daemon-reload || true
             fi
+            # 清理自定义分流等配置（conf 在 work_dir 下，一并删除；此处显式处理更清晰）
+            rm -f "${conf_dir}/custom_route.json" 2>/dev/null
             rm -rf "${work_dir}" || true
             rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/argo.service
+            rm -f /usr/bin/sb
 
             # 卸载sing-box不会连带卸载「12.单栈VPS加装WARP全局出站」加装的系统级WARP，
             # 二者是独立功能；这里额外询问一下，避免卸载后WARP的wg-quick接口/开机自启一直残留
@@ -1392,7 +1395,7 @@ uninstall_singbox() {
                 esac
             fi
 
-            green "\nsing-box 卸载成功\n\n" && exit 0
+            green "\nsing-box 卸载成功（含自定义分流配置）\n\n" && exit 0
             ;;
         *) purple "已取消卸载操作\n\n" ;;
     esac
@@ -1467,6 +1470,8 @@ auto_uninstall() {
               /etc/systemd/system/argo.service
     fi
 
+    # 清理自定义分流等配置（conf 在 work_dir 下，一并删除）
+    rm -f "${conf_dir}/custom_route.json" 2>/dev/null
     rm -rf "${work_dir}"
     rm -f /usr/bin/sb
 
@@ -1474,7 +1479,7 @@ auto_uninstall() {
     sys_warp_remove 4 >/dev/null 2>&1
     sys_warp_remove 6 >/dev/null 2>&1
 
-    green "\nsing-box 已完全卸载!\n"
+    green "\nsing-box 已完全卸载（含自定义分流配置）!\n"
 }
 
 # 变更配置
@@ -2076,6 +2081,119 @@ EOF
 }
 
 # WARP 分流管理
+# ================== 自定义分流（仅一条） ==================
+# 持久化: ${conf_dir}/custom_route.json  {"name","domain","outbound"}
+# 卸载时随 work_dir 删除，并在 uninstall/auto_uninstall 中显式 rm
+
+get_custom_domain() {
+    local f="${conf_dir}/custom_route.json"
+    [ -f "$f" ] || return 1
+    jq -r '.domain // empty' "$f" 2>/dev/null
+}
+
+get_custom_name() {
+    local f="${conf_dir}/custom_route.json"
+    [ -f "$f" ] || return 1
+    jq -r '.name // empty' "$f" 2>/dev/null
+}
+
+apply_custom_route() {
+    local f="${conf_dir}/custom_route.json" domain outbound
+    [ -f "$f" ] || return 1
+    [ -f "$route_file" ] || return 1
+    domain=$(jq -r '.domain // empty' "$f" 2>/dev/null)
+    outbound=$(jq -r '.outbound // "wireguard-out"' "$f" 2>/dev/null)
+    [ -z "$domain" ] && return 1
+    [ -z "$outbound" ] && outbound="wireguard-out"
+    # domain_suffix 覆盖该域名及所有下级
+    jq --arg domain "$domain" --arg out "$outbound" '
+      .route.rules = (
+        [{"action":"sniff"}]
+        + [ .route.rules[]? | select(.action != "sniff") | select(.domain_suffix == null) ]
+        + [{"domain_suffix": [$domain], "outbound": $out}]
+      )
+    ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+}
+
+clear_custom_route_from_json() {
+    [ -f "$route_file" ] || return 0
+    jq '
+      .route.rules = (
+        [{"action":"sniff"}]
+        + [ .route.rules[]? | select(.action != "sniff") | select(.domain_suffix == null) ]
+      )
+    ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+}
+
+# 22: 添加自定义。出站与 1–9 相同：无菜单3代理则 WARP，有则可选
+add_custom_route() {
+    local custom_route_file="${conf_dir}/custom_route.json"
+    if [ -f "$custom_route_file" ]; then
+        yellow "已存在自定义分流：${purple}$(get_custom_name)${re} ($(get_custom_domain))"
+        yellow "请先用菜单 23 删除后再添加新的。\n"
+        sleep 2; add_rule_menu; return
+    fi
+
+    reading "请输入自定义名称（用于菜单显示，如 myblog）: " custom_name
+    custom_name=$(echo "$custom_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    if [ -z "$custom_name" ]; then
+        red "名称不能为空。\n"
+        sleep 2; add_rule_menu; return
+    fi
+
+    reading "请输入要分流的域名（如 example.com，将匹配该域名及所有下级）: " custom_domain
+    custom_domain=$(echo "$custom_domain" | sed 's|^https\?://||; s|/.*||; s|^\*\.||; s/\.$//' | tr '[:upper:]' '[:lower:]')
+    if [ -z "$custom_domain" ] || ! echo "$custom_domain" | grep -Eq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'; then
+        red "域名格式无效，请输入类似 example.com 的域名。\n"
+        sleep 2; add_rule_menu; return
+    fi
+
+    local out_tags=($(jq -r '.outbounds[] | select(.tag != "direct") | .tag' "$outbound_file" 2>/dev/null))
+    local selected_out
+    if [ ${#out_tags[@]} -eq 0 ]; then
+        selected_out="wireguard-out"
+        yellow "未找到其他出站，将自动使用 wireguard-out。"
+    else
+        echo ""
+        green "请选择分流流量要走的出站:"
+        for i in "${!out_tags[@]}"; do
+            echo -e "  ${green}$((i+1)). ${skyblue}${out_tags[$i]}${re}"
+        done
+        reading "请输入编号: " out_choice
+        if [[ ! "$out_choice" =~ ^[0-9]+$ ]] || \
+           [ "$out_choice" -lt 1 ] || \
+           [ "$out_choice" -gt "${#out_tags[@]}" ]; then
+            red "无效选择"; sleep 1; add_rule_menu; return
+        fi
+        selected_out="${out_tags[$((out_choice-1))]}"
+    fi
+
+    jq -n --arg name "$custom_name" --arg domain "$custom_domain" --arg out "$selected_out" \
+        '{name:$name, domain:$domain, outbound:$out}' > "$custom_route_file"
+    apply_custom_route
+    restart_singbox
+    green "\n自定义分流已添加：${purple}${custom_name}${re} (${custom_domain}) → 出站 ${purple}${selected_out}${re}"
+    yellow "已匹配该域名及所有下级（domain_suffix）。\n"
+    sleep 2; warp_manage
+}
+
+remove_custom_route() {
+    local custom_route_file="${conf_dir}/custom_route.json"
+    if [ ! -f "$custom_route_file" ]; then
+        yellow "当前没有自定义分流，无需删除。\n"
+        sleep 1; add_rule_menu; return
+    fi
+    reading "确认删除自定义分流 $(get_custom_name) ($(get_custom_domain))？(y/n): " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        yellow "已取消。\n"; sleep 1; add_rule_menu; return
+    fi
+    clear_custom_route_from_json
+    rm -f "$custom_route_file"
+    restart_singbox
+    green "\n自定义分流已删除。\n"
+    sleep 1; warp_manage
+}
+
 warp_manage() {
     check_singbox &>/dev/null
     if [ $? -eq 2 ]; then
@@ -2085,13 +2203,28 @@ warp_manage() {
     clear
     route_file="${conf_dir}/route.json"
     outbound_file="${conf_dir}/outbounds.json"
+    local custom_route_file="${conf_dir}/custom_route.json"
 
     echo ""
     green "=== WARP 分流管理 ===\n"
     green "当前已启用的分流规则集:"
-    jq -r '.route.rules[] | select(.rule_set != null) | .rule_set[]?' "$route_file" 2>/dev/null | sort -u | grep -v '^telegram-ip$' | while read tag; do
-        echo -e " - ${skyblue}$tag${re}"
-    done || echo "  无"
+    local _tags
+    _tags=$(jq -r '.route.rules[] | select(.rule_set != null) | .rule_set[]?' "$route_file" 2>/dev/null | sort -u | grep -v '^telegram-ip$' || true)
+    if [ -n "$_tags" ]; then
+        echo "$_tags" | while read tag; do
+            [ -n "$tag" ] && echo -e " - ${skyblue}$tag${re}"
+        done
+    fi
+    if [ -f "$custom_route_file" ]; then
+        local c_name c_domain c_out
+        c_name=$(jq -r '.name // empty' "$custom_route_file" 2>/dev/null)
+        c_domain=$(jq -r '.domain // empty' "$custom_route_file" 2>/dev/null)
+        c_out=$(jq -r '.outbound // empty' "$custom_route_file" 2>/dev/null)
+        [ -n "$c_domain" ] && echo -e " - ${skyblue}自定义: ${c_name} (${c_domain})${re} → ${c_out}"
+    fi
+    if [ -z "$_tags" ] && [ ! -f "$custom_route_file" ]; then
+        echo "  无"
+    fi
     green "\n已添加的代理出站(socks/http/ss2022):"
     jq -r '.outbounds[] | select(.tag != "direct") | " - \(.tag) [\(.type)]"' "$outbound_file" 2>/dev/null || echo "  无"
 
@@ -2128,6 +2261,10 @@ warp_manage() {
 
 add_rule_menu() {
     clear
+    route_file="${conf_dir}/route.json"
+    outbound_file="${conf_dir}/outbounds.json"
+    local custom_route_file="${conf_dir}/custom_route.json"
+
     green "选择要分流的服务:\n"
     green "1.  OpenAI"
     green "2.  Claude"
@@ -2139,8 +2276,19 @@ add_rule_menu() {
     green "8.  Netflix"
     green "9.  Telegram"
     skyblue "-----------------------------"
-    green "10. 设置全局代理出站 (所有流量走指定代理)"
-    green "11. 恢复服务器原IP出站 (所有流量走服务器ip)"
+    if [ -f "$custom_route_file" ]; then
+        local _cn _cd _co
+        _cn=$(jq -r '.name // empty' "$custom_route_file" 2>/dev/null)
+        _cd=$(jq -r '.domain // empty' "$custom_route_file" 2>/dev/null)
+        _co=$(jq -r '.outbound // empty' "$custom_route_file" 2>/dev/null)
+        green "10. ${_cn} (${_cd}) → ${_co}"
+        skyblue "-----------------------------"
+    fi
+    green "20. 设置全局代理出站 (所有流量走指定代理)"
+    green "21. 恢复服务器原IP出站 (所有流量走服务器ip，含自定义)"
+    skyblue "-----------------------------"
+    green "22. 添加自定义分流 (名称+域名，仅一条，覆盖下级域名)"
+    red   "23. 删除自定义分流"
     skyblue "-----------------------------"
     purple "0.  返回上级菜单"
     skyblue "-----------------------------"
@@ -2155,8 +2303,16 @@ add_rule_menu() {
         7)  rule_tag="youtube"  ;;
         8)  rule_tag="netflix"  ;;
         9)  rule_tag="telegram" ;;
-        10) set_global_outbound; return ;;
-        11) restore_direct_outbound; return ;;
+        10)
+            if [ ! -f "$custom_route_file" ]; then
+                red "当前没有自定义分流"; sleep 1; add_rule_menu; return
+            fi
+            yellow "自定义分流已启用：$(get_custom_name) ($(get_custom_domain))"; sleep 1; warp_manage; return
+            ;;
+        20) set_global_outbound; return ;;
+        21) restore_direct_outbound; return ;;
+        22) add_custom_route; return ;;
+        23) remove_custom_route; return ;;
         0)  warp_manage; return ;;
         *)  red "无效选项"; sleep 1; add_rule_menu; return ;;
     esac
@@ -2228,13 +2384,14 @@ add_rule_menu() {
             continue
         fi
         # 始终保持 sniff 在第一位；分流规则追加在其后
+        # 仅合并到已有 rule_set 的规则，避免把自定义 domain_suffix 规则污染成 rule_set
         jq --arg tag "$tag" --arg out "$selected_out" '
             .route.rules = (
               [{"action":"sniff"}]
               + (
                   [ .route.rules[]? | select(.action != "sniff") ]
-                  | if (map(select(.outbound == $out)) | length) > 0 then
-                      map(if .outbound == $out then .rule_set += [$tag] else . end)
+                  | if (map(select(.rule_set != null and .outbound == $out)) | length) > 0 then
+                      map(if (.rule_set != null and .outbound == $out) then .rule_set += [$tag] else . end)
                     else
                       . + [{"rule_set": [$tag], "outbound": $out}]
                     end
@@ -2360,8 +2517,12 @@ EOF
             write_fallback_warp_endpoint
         fi
     fi
+
+    # 21 恢复原IP：清空全部，包括自定义分流
+    rm -f "${conf_dir}/custom_route.json"
+
     restart_singbox
-    green "\n已恢复服务器原IP出站，所有流量走 direct。\n"
+    green "\n已恢复服务器原IP出站，所有流量走 direct（自定义分流已一并清除）。\n"
     sleep 2; warp_manage
 }
 
