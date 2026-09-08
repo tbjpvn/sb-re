@@ -2481,6 +2481,13 @@ delete_rule_menu() {
               ]
           )
         ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+
+        # 自定义分流规则（type=inline）为一次性专属定义，删除引用后一并移除定义，
+        # 避免名称被占用导致无法重新创建；内置服务的远程 rule_set 为共享定义，保留不动。
+        if jq -e --arg tag "$t" '.route.rule_set[]? | select(.tag == $tag and .type == "inline")' "$route_file" >/dev/null 2>&1; then
+            jq --arg tag "$t" '.route.rule_set = [.route.rule_set[] | select(.tag != $tag)]' \
+                "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+        fi
     done
     restart_singbox
     if [ "$tag" = "telegram" ] || [ "$tag" = "telegram-ip" ]; then
