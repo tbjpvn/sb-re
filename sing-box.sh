@@ -89,18 +89,50 @@ check_service() {
 # 安装完成后校验hy2/tuic的UDP端口是否真的绑定成功，
 # sing-box绑定失败时通常只是静默不监听，不会让脚本报错，
 # 用户只能等到客户端连不上才发现，这里提前把问题暴露出来。
+#
+# 采用轮询而非固定sleep一次性检查：route.json里配置了多个远程规则集
+# (raw.githubusercontent.com)，sing-box启动时会先同步下载这些规则集，
+# 之后才会走到inbound监听这一步；网络慢/GitHub连接不稳时这个过程可能
+# 远超几秒钟。固定睡几秒就检查一次，很容易在服务还没真正起来时就误报
+# "未监听"，因此这里改成最多等待 max_wait 秒、期间每秒轮询一次，端口
+# 一出现就立刻判定通过，只有等满超时仍未监听才真正报错。
 verify_udp_listening() {
     command_exists ss || return 0
+    local max_wait=30
+    local waited=0
+    local tuic_seen=0
+    local hy2_seen=0
+
+    # 没配置对应端口的协议，直接视为无需等待
+    [ -z "$tuic_port" ] && tuic_seen=1
+    [ -z "$hy2_port" ] && hy2_seen=1
+
+    while [ "$waited" -lt "$max_wait" ]; do
+        [ "$tuic_seen" -eq 0 ] && ss -H -uln 2>/dev/null | grep -q ":${tuic_port} " && tuic_seen=1
+        [ "$hy2_seen" -eq 0 ] && ss -H -uln 2>/dev/null | grep -q ":${hy2_port} " && hy2_seen=1
+        [ "$tuic_seen" -eq 1 ] && [ "$hy2_seen" -eq 1 ] && break
+        sleep 1
+        waited=$((waited+1))
+    done
+
     local ok=1
-    if [ -n "$tuic_port" ] && ! ss -H -uln 2>/dev/null | grep -q ":${tuic_port} "; then
-        red "警告：tuic端口 ${tuic_port}/udp 当前未监听，节点大概率不通，请到「6.修改节点配置->1.修改端口->3.修改tuic端口」重新分配。"
+    if [ "$tuic_seen" -eq 0 ]; then
+        red "警告：等待 ${max_wait} 秒后，tuic端口 ${tuic_port}/udp 仍未监听，节点大概率不通，请到「6.修改节点配置->1.修改端口->3.修改tuic端口」重新分配。"
         ok=0
     fi
-    if [ -n "$hy2_port" ] && ! ss -H -uln 2>/dev/null | grep -q ":${hy2_port} "; then
-        red "警告：hysteria2端口 ${hy2_port}/udp 当前未监听，节点大概率不通，请到「6.修改节点配置->1.修改端口->2.修改hysteria2端口」重新分配。"
+    if [ "$hy2_seen" -eq 0 ]; then
+        red "警告：等待 ${max_wait} 秒后，hysteria2端口 ${hy2_port}/udp 仍未监听，节点大概率不通，请到「6.修改节点配置->1.修改端口->2.修改hysteria2端口」重新分配。"
         ok=0
     fi
-    [ "$ok" -eq 1 ] && green "hysteria2/tuic 的UDP端口均已正常监听。"
+    if [ "$ok" -eq 1 ]; then
+        if [ "$waited" -gt 0 ]; then
+            green "hysteria2/tuic 的UDP端口均已正常监听（等待了约 ${waited} 秒，多为规则集下载耗时）。"
+        else
+            green "hysteria2/tuic 的UDP端口均已正常监听。"
+        fi
+    else
+        yellow "提示：以上是本机端口监听状态，若显示已监听但客户端仍连不上，也可能是该端口被服务商网络侧过滤，可尝试更换端口。"
+    fi
     return 0
 }
 
@@ -1440,7 +1472,6 @@ auto_install() {
         exit 1
     fi
 
-    sleep 5
     verify_udp_listening
     get_info
     create_shortcut
@@ -3771,7 +3802,6 @@ case "$1" in
                         else
                             echo "Unsupported init system"; exit 1
                         fi
-                        sleep 5
                         verify_udp_listening
                         get_info
                         create_shortcut
