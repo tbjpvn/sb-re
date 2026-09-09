@@ -449,6 +449,14 @@ generate_warp_endpoint() {
     fcm_token="${install_id}:APA91b$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 134)"
     tos_date=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")
 
+    # 注意：判断某次注册"是否成功"必须以真正拿到 config.interface.addresses.v4
+    # 为准。之前用 `.config.interface.addresses.v4 // .config.client_id` 做判断，
+    # 而 client_id 几乎在任何"看起来正常"的响应里都会存在(哪怕这次Cloudflare
+    # 没有下发v4地址)，导致循环在第1次就误判成功并直接break，根本不会重试；
+    # 后面又用 `[ -z "$v4" ] && v4="172.16.0.2/32"` 静默地拿一个假地址兜底，
+    # 于是脚本会提示"注册/申请成功"，但WireGuard接口实际用的是一个伪造的、
+    # 未经Cloudflare分配的地址，握手可能成功但edge侧不认这个源地址，流量出不去，
+    # 表现为"提示成功但WARP不能用"。这里改成只有真正拿到v4地址才算成功。
     local try=0 max_try=5
     while [ $try -lt $max_try ]; do
         try=$((try + 1))
@@ -458,15 +466,16 @@ generate_warp_endpoint() {
             -H "CF-Client-Version: a-6.30-3596" \
             -d "{\"key\":\"${public_key}\",\"install_id\":\"${install_id}\",\"fcm_token\":\"${fcm_token}\",\"tos\":\"${tos_date}\",\"model\":\"PC\",\"serial_number\":\"${install_id}\",\"locale\":\"en_US\"}" 2>/dev/null)
 
-        if echo "$reg_response" | jq -e '.config.interface.addresses.v4 // .config.client_id' >/dev/null 2>&1; then
+        if echo "$reg_response" | jq -e '.config.interface.addresses.v4' >/dev/null 2>&1; then
             break
         fi
-        [ -z "$quiet" ] && yellow "第 ${try}/${max_try} 次注册未成功，重试中..."
+        [ -z "$quiet" ] && yellow "第 ${try}/${max_try} 次注册未拿到有效IPv4地址，重试中..."
         sleep 2
     done
 
-    if ! echo "$reg_response" | jq -e '.config' >/dev/null 2>&1; then
-        [ -z "$quiet" ] && red "Cloudflare WARP 注册失败（可能网络受限或 API 变更）"
+    # 循环跑完仍未拿到v4地址：明确判定为失败，不再用假地址掩盖问题
+    if ! echo "$reg_response" | jq -e '.config.interface.addresses.v4' >/dev/null 2>&1; then
+        [ -z "$quiet" ] && red "Cloudflare WARP 注册失败：重试 ${max_try} 次均未拿到有效IPv4地址（可能网络受限、触发了Cloudflare限流，或 API 变更）"
         [ -z "$quiet" ] && echo "$reg_response" | head -c 300
         return 1
     fi
@@ -480,7 +489,6 @@ generate_warp_endpoint() {
     device_id=$(echo "$reg_response" | jq -r '.id // empty')
     token=$(echo "$reg_response" | jq -r '.token // empty')
 
-    [ -z "$v4" ] && v4="172.16.0.2/32"
     [[ "$v4" != */* ]] && v4="${v4}/32"
     if [ -n "$v6" ] && [[ "$v6" != */* ]]; then
         v6="${v6}/128"
@@ -642,6 +650,12 @@ cf_warp_register() {
         curl_family="-4"
     fi
 
+    # 同样地：判断"是否注册成功"必须以真正拿到 config.interface.addresses.v4 为准，
+    # 不能用 client_id 兜底判断成功——client_id 几乎总是存在，会导致漏掉"注册回包
+    # 里根本没分配IP"这种情况，进而让下面 REG_V4 兜底成假地址"172.16.0.2"，接口能
+    # wg-quick up成功、脚本也提示"加装成功"，但这地址不是Cloudflare真正分配的，
+    # edge侧不认，实际根本不通。这正是"提示已申请完成，但没有申请到IP，WARP不能用"
+    # 的根本原因，这里改成只有真正拿到v4地址才算这一次尝试成功。
     while [ $try -lt 5 ]; do
         try=$((try + 1))
         reg_response=$(curl "$curl_family" -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
@@ -650,15 +664,16 @@ cf_warp_register() {
             -H "CF-Client-Version: a-6.30-3596" \
             -d "{\"key\":\"${pub}\",\"install_id\":\"${install_id}\",\"fcm_token\":\"${fcm_token}\",\"tos\":\"${tos_date}\",\"model\":\"PC\",\"serial_number\":\"${install_id}\",\"locale\":\"en_US\"}" 2>/dev/null)
 
-        if echo "$reg_response" | jq -e '.config.interface.addresses.v4 // .config.client_id' >/dev/null 2>&1; then
+        if echo "$reg_response" | jq -e '.config.interface.addresses.v4' >/dev/null 2>&1; then
             break
         fi
-        yellow "第 ${try}/5 次注册未成功，重试中...\n"
+        yellow "第 ${try}/5 次注册未拿到有效IPv4地址，重试中...\n"
         sleep 2
     done
 
-    if ! echo "$reg_response" | jq -e '.config' >/dev/null 2>&1; then
-        red "Cloudflare WARP 注册失败（可能网络受限或 API 变更）\n"
+    # 5次都没拿到真实v4地址：明确判定失败，不再用假地址掩盖，让上层如实报错
+    if ! echo "$reg_response" | jq -e '.config.interface.addresses.v4' >/dev/null 2>&1; then
+        red "Cloudflare WARP 注册失败：重试5次均未拿到有效IPv4地址（可能网络受限、触发了Cloudflare限流，或 API 变更），本次不会继续加装\n"
         echo "$reg_response" | head -c 300
         return 1
     fi
@@ -667,7 +682,6 @@ cf_warp_register() {
     REG_V4=$(echo "$reg_response" | jq -r '.config.interface.addresses.v4 // empty')
     REG_V6=$(echo "$reg_response" | jq -r '.config.interface.addresses.v6 // empty')
     REG_PEER=$(echo "$reg_response" | jq -r '.config.peers[0].public_key // "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="')
-    [ -z "$REG_V4" ] && REG_V4="172.16.0.2"
 
     # 不强依赖API返回的peer地址。主菜单12的两种单栈场景分别使用
     # “已有协议栈”连接WARP Endpoint，避免把缺失协议栈错误地拿来连Endpoint。
