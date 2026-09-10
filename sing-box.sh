@@ -766,6 +766,49 @@ sys_warp_status() {
     done
 }
 
+# 校验WARP出站接口是否真正握手成功(收到过Cloudflare的回包)，
+# 而不是只看wg-quick命令有没有报错——部分VPS/机房会过滤某些UDP端口，
+# 导致接口"启动成功"但实际收不到任何回包，隧道根本不通。
+sys_warp_verify_handshake() {
+    local iface="$1" tries=0 rx
+    while [ $tries -lt 5 ]; do
+        rx=$(wg show "$iface" transfer 2>/dev/null | awk '{print $2}')
+        if [ -n "$rx" ] && [ "$rx" != "0" ]; then
+            return 0
+        fi
+        sleep 2
+        tries=$((tries + 1))
+    done
+    return 1
+}
+
+# 依次尝试Cloudflare WARP支持的几个UDP端口(2408/500/4500/1701)，
+# 挑一个能真正握手成功(收到回包)的端口写入配置。
+# 有些云服务商/机房会限制或过滤2408这类明显是VPN流量的端口，
+# 但500/4500(IPsec常用)、1701(L2TP常用)更容易被放通。
+sys_warp_find_working_port() {
+    local iface="$1" conf="$2" host="$3" ipv6_endpoint="$4" port
+    local ports=(2408 500 4500 1701)
+    for port in "${ports[@]}"; do
+        if [ "$ipv6_endpoint" = "1" ]; then
+            sed -i "s|^Endpoint = .*|Endpoint = [${host}]:${port}|" "$conf"
+        else
+            sed -i "s|^Endpoint = .*|Endpoint = ${host}:${port}|" "$conf"
+        fi
+        wg-quick down "$iface" &>/dev/null
+        if ! wg-quick up "$iface" &>/dev/null; then
+            continue
+        fi
+        yellow "  正在尝试端口 ${port}...\n"
+        if sys_warp_verify_handshake "$iface"; then
+            green "  端口 ${port} 握手成功，已收到Cloudflare回包\n"
+            return 0
+        fi
+        yellow "  端口 ${port} 未收到回包，尝试下一个端口\n"
+    done
+    return 1
+}
+
 # 加装WARP出站主流程
 sys_warp_add() {
     local family="$1" iface
@@ -800,16 +843,38 @@ sys_warp_add() {
         return 1
     fi
 
+    # 接口能起来不等于隧道真的通——部分VPS/机房会过滤2408这类端口，
+    # 导致wg-quick成功但一直收不到Cloudflare的回包。这里实际验证握手，
+    # 收不到回包就自动换端口重试，而不是直接报"加装成功"。
+    yellow "正在验证隧道是否真正握手成功...\n"
+    if sys_warp_verify_handshake "$iface"; then
+        :
+    else
+        yellow "默认端口(2408)未收到回包，自动尝试其他端口...\n"
+        local host_ip ipv6_flag
+        if [ "$family" = "4" ]; then
+            host_ip="2606:4700:d0::a29f:c001"; ipv6_flag=1
+        else
+            host_ip="162.159.192.1"; ipv6_flag=0
+        fi
+        if ! sys_warp_find_working_port "$iface" "${sys_warp_dir}/${iface}.conf" "$host_ip" "$ipv6_flag"; then
+            red "\n已尝试全部候选端口(2408/500/4500/1701)均未收到Cloudflare回包，当前网络很可能封锁了出站UDP，WARP出站暂时无法使用\n"
+            yellow "接口配置已保留在 ${sys_warp_dir}/${iface}.conf，网络环境变化后可重新进入本菜单覆盖重试\n"
+            sys_warp_enable_boot "$iface"
+            return 1
+        fi
+    fi
+
     sys_warp_enable_boot "$iface"
 
     green "\n✅ WARP 出站已加装成功！接口: ${purple}${iface}${re}，已设置开机自启\n"
     if [ "$family" = "4" ]; then
         local got_v4
-        got_v4=$(curl -4 -sm 5 ip.sb 2>/dev/null)
+        got_v4=$(curl -4 -sm 8 ip.sb 2>/dev/null)
         green "当前出口IPv4: ${purple}${got_v4:-获取失败，可稍后自行执行: curl -4 ip.sb 检查}${re}\n"
     else
         local got_v6
-        got_v6=$(curl -6 -sm 5 ip.sb 2>/dev/null)
+        got_v6=$(curl -6 -sm 8 ip.sb 2>/dev/null)
         green "当前出口IPv6: ${purple}${got_v6:-获取失败，可稍后自行执行: curl -6 ip.sb 检查}${re}\n"
     fi
 }
