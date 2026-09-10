@@ -602,6 +602,21 @@ write_fallback_warp_endpoint() {
 WARP_FALLBACK_EOF
 }
 
+# 确保 endpoints.json 中已存在可用的 wireguard-out 配置；
+# 仅在真正即将使用 WARP 出站时按需调用，避免安装阶段/不需要WARP的场景
+# 也强制向Cloudflare申请密钥。已存在则直接跳过，不会重复申请。
+ensure_warp_endpoint() {
+    local endpoints_file="${conf_dir}/endpoints.json"
+    if [ -f "$endpoints_file" ] && jq -e '.endpoints[]? | select(.tag=="wireguard-out")' "$endpoints_file" >/dev/null 2>&1; then
+        return 0
+    fi
+    yellow "检测到尚未申请 WARP 出站密钥，正在按需向 Cloudflare 注册...\n"
+    if ! generate_warp_endpoint; then
+        yellow "独立 WARP 注册失败，暂时使用共享密钥（可能不稳定，可稍后在「WARP分流管理」中重新生成）\n"
+        write_fallback_warp_endpoint
+    fi
+}
+
 # ================== 单栈VPS加装WARP全局出站(系统级) ==================
 # 与上面 sing-box 内部 wireguard-out(仅用于sing-box分流)不同，
 # 这里通过系统级 WireGuard(wg-quick) 为纯IPv4/纯IPv6主机加装缺失协议栈的
@@ -1229,11 +1244,9 @@ EOF
 }
 EOF
 
-    # 优先注册独立 WARP 密钥；失败则回退到共享密钥并提示
-    if ! generate_warp_endpoint; then
-        yellow "独立 WARP 注册失败，暂时使用共享密钥（可能不稳定，可稍后在「WARP分流管理」中重新生成）\n"
-        write_fallback_warp_endpoint
-    fi
+    # 不在安装阶段申请WARP密钥：并非所有机器都需要WARP分流出站，
+    # 这里先不生成 endpoints.json，留到「WARP分流管理 → 1.设置分流服务」
+    # 真正需要把某项服务走 wireguard-out 时（ensure_warp_endpoint）再按需申请。
 
     cat > "${conf_dir}/route.json" << EOF
 {
@@ -2109,6 +2122,9 @@ test_warp_connectivity() {
     yellow "  3. 用 curl 通过 socks 测试出口"
     yellow "  4. 测试结束后自动恢复原配置\n"
 
+    # 若此前从未使用过WARP（尚无endpoints.json/独立密钥），这里按需申请一次
+    ensure_warp_endpoint
+
     # 备份
     cp "$route_file" "$route_bak"
     cp "$inbounds_file" "$inbounds_bak"
@@ -2381,6 +2397,7 @@ finalize_rule_add() {
 
     local out_tags=($(jq -r '.outbounds[] | select(.tag != "direct") | .tag' "$outbound_file" 2>/dev/null))
     if [ ${#out_tags[@]} -eq 0 ]; then
+        ensure_warp_endpoint
         selected_out="wireguard-out"
         yellow "未找到其他出站，将自动使用 wireguard-out。"
     else
@@ -2543,12 +2560,8 @@ restore_direct_outbound() {
 }
 EOF
 
-    # 恢复 endpoints：优先保留已有独立密钥；若文件缺失则重新注册/回退
-    if [ ! -f "${conf_dir}/endpoints.json" ]; then
-        if ! generate_warp_endpoint quiet; then
-            write_fallback_warp_endpoint
-        fi
-    fi
+    # 恢复为 direct 出站不会用到 wireguard-out，因此这里不再强制申请/保留WARP密钥；
+    # 若之前已经申请过，endpoints.json会原样保留，不受影响。
     restart_singbox
     green "\n已恢复服务器原IP出站，所有流量走 direct。\n"
     sleep 2; warp_manage
