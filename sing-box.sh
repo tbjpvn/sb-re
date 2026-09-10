@@ -3795,7 +3795,7 @@ menu() {
     purple "---Argo 状态: ${argo_status}"
     purple "singbox 状态: ${singbox_status}"
     purple "拥塞控制算法: ${congestion_status}"
-    purple "--双栈IP状态: ${dualstack_status}\n"
+    purple "双栈IP 状态: ${dualstack_status}\n"
     green "1. 安装sing-box"
     red   "2. 卸载sing-box"
     echo "==============="
