@@ -400,53 +400,76 @@ allow_port() {
 }
 
 # ================== WARP 独立密钥生成 ==================
-# 静默功能性探测：临时把路由切到 wireguard-out，通过本地一次性 socks
-# 入站实际发起一次请求，判断 endpoints.json 里当前端口是否真的可用
-# (收得到Cloudflare回包、数据能进能出)，而不是仅凭注册接口返回200
-# 就当作成功——用于在多个候选UDP端口间挑出真正能用的一个。
-warp_probe_endpoint() {
-    local route_file="${conf_dir}/route.json"
-    local inbounds_file="${conf_dir}/inbounds.json"
-    local probe_port=10809
-    local route_bak inbounds_bak
-    route_bak=$(mktemp) && cp "$route_file" "$route_bak" 2>/dev/null
-    inbounds_bak=$(mktemp) && cp "$inbounds_file" "$inbounds_bak" 2>/dev/null
-
-    if ! jq -e --argjson p "$probe_port" '.inbounds[]? | select(.type=="socks" and .listen_port==$p)' "$inbounds_file" >/dev/null 2>&1; then
-        jq --argjson p "$probe_port" '.inbounds += [{
-            "type": "socks",
-            "tag": "socks-warpprobe",
-            "listen": "127.0.0.1",
-            "listen_port": $p
-        }]' "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+# 判断本机对外真正可用的协议栈：优先探测IPv4，探测不到再探测IPv6。
+# 用于纯IPv6单栈机器——这类机器如果沿用写死的IPv4注册/IPv4 Endpoint，
+# 注册接口连不上、或者即使注册上了WireGuard握手包也根本发不出去，
+# 表现为“不管试哪个端口都不行”。
+detect_warp_out_family() {
+    if curl -4 -sm 5 -o /dev/null https://www.cloudflare.com 2>/dev/null; then
+        echo 4
+    elif curl -6 -sm 5 -o /dev/null https://www.cloudflare.com 2>/dev/null; then
+        echo 6
+    else
+        echo 4
     fi
+}
 
-    cat > "$route_file" << EOF
+# 用一个独立的、临时的 sing-box 子进程探测某个候选端口是否真的可用，
+# 完全不碰正在跑的 sing-box 服务/配置——避免像之前那样为了试4个端口反复
+# systemctl restart，短时间内触发过多次而被systemd判定为"start-limit-hit"
+# 直接把服务打成失败/停止状态。探测完直接kill掉这个临时进程即可。
+warp_probe_endpoint() {
+    local port="$1" v4="$2" v6="$3" private_key="$4" peer_pub="$5" reserved_json="$6" peer_addr="$7"
+    local sb_bin="${work_dir}/sing-box"
+    local probe_dir probe_port pid result=1
+    probe_dir=$(mktemp -d /tmp/singbox-warpprobe.XXXXXX) || return 1
+    probe_port=$((20000 + RANDOM % 10000))
+
+    local addr_json="[\"$v4\"]"
+    [ -n "$v6" ] && addr_json="[\"$v4\", \"$v6\"]"
+
+    cat > "${probe_dir}/config.json" << EOF
 {
-  "route": {
-    "rules": [
-      {"action": "sniff"},
-      {"outbound": "wireguard-out"}
-    ],
-    "final": "wireguard-out",
-    "default_domain_resolver": {
-      "server": "sys",
-      "strategy": "prefer_ipv4"
+  "log": {"disabled": true},
+  "inbounds": [
+    {"type": "socks", "tag": "in", "listen": "127.0.0.1", "listen_port": ${probe_port}}
+  ],
+  "endpoints": [
+    {
+      "type": "wireguard",
+      "tag": "wireguard-out",
+      "mtu": 1280,
+      "address": ${addr_json},
+      "private_key": "${private_key}",
+      "peers": [
+        {
+          "address": "${peer_addr}",
+          "port": ${port},
+          "public_key": "${peer_pub}",
+          "allowed_ips": ["0.0.0.0/0", "::/0"],
+          "persistent_keepalive_interval": 25,
+          "reserved": ${reserved_json}
+        }
+      ]
     }
-  }
+  ],
+  "route": {"final": "wireguard-out"}
 }
 EOF
-    restart_singbox
+
+    "$sb_bin" run -c "${probe_dir}/config.json" >/dev/null 2>&1 &
+    pid=$!
     sleep 2
 
-    local result=1
-    if curl -4 -x "socks5h://127.0.0.1:${probe_port}" -sm 8 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q '^warp=on'; then
-        result=0
+    if kill -0 "$pid" 2>/dev/null; then
+        if curl -x "socks5h://127.0.0.1:${probe_port}" -sm 8 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q '^warp=on'; then
+            result=0
+        fi
     fi
 
-    mv "$route_bak" "$route_file" 2>/dev/null
-    mv "$inbounds_bak" "$inbounds_file" 2>/dev/null
-    restart_singbox
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    rm -rf "$probe_dir"
     return $result
 }
 
@@ -499,6 +522,19 @@ generate_warp_endpoint() {
     fcm_token="${install_id}:APA91b$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 134)"
     tos_date=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")
 
+    # 先探测本机对外真正可用的协议栈：纯IPv6单栈机器如果硬用-4去请求
+    # 注册接口，永远连不上，重试几次全部超时，表现为"注册就没成功过"。
+    local out_family curl_family peer_addr
+    out_family=$(detect_warp_out_family)
+    if [ "$out_family" = "6" ]; then
+        curl_family="-6"
+        peer_addr="2606:4700:d0::a29f:c001"
+        [ -z "$quiet" ] && yellow "检测到本机为IPv6单栈，注册与WARP Endpoint均改用IPv6\n"
+    else
+        curl_family="-4"
+        peer_addr="162.159.192.1"
+    fi
+
     # 注意：判断某次注册"是否成功"必须以真正拿到 config.interface.addresses.v4
     # 为准。之前用 `.config.interface.addresses.v4 // .config.client_id` 做判断，
     # 而 client_id 几乎在任何"看起来正常"的响应里都会存在(哪怕这次Cloudflare
@@ -510,7 +546,7 @@ generate_warp_endpoint() {
     local try=0 max_try=5
     while [ $try -lt $max_try ]; do
         try=$((try + 1))
-        reg_response=$(curl -4 -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
+        reg_response=$(curl "$curl_family" -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
             -H "Content-Type: application/json" \
             -H "User-Agent: okhttp/3.12.1" \
             -H "CF-Client-Version: a-6.30-3596" \
@@ -557,15 +593,30 @@ generate_warp_endpoint() {
         reserved_json="[0, 0, 0]"
     fi
 
-    # 4. 依次尝试Cloudflare WARP常用的几个UDP端口，挑一个真正可用的写入配置。
-    # 部分VPS/机房会封锁2408这种明显是VPN流量的端口，仅凭注册接口返回
-    # 200不能说明隧道真的能收发数据，这里实际探测一次才能确认。
+    # 4. 依次用独立子进程探测Cloudflare WARP常用的几个UDP端口，挑一个
+    # 真正可用的写入配置。部分VPS/机房会封锁2408这种明显是VPN流量的端口，
+    # 仅凭注册接口返回200不能说明隧道真的能收发数据，这里实际探测一次才能确认；
+    # 探测过程用独立子进程完成，不会碰正在跑的sing-box服务本身。
     local candidate_ports=(2408 4500 1701 500)
     local port ok_port=""
     for port in "${candidate_ports[@]}"; do
-        [ -z "$quiet" ] && yellow "正在写入并探测端口 ${port}...\n"
-        if [ -n "$v6" ]; then
-            cat > "$endpoints_file" << EOF
+        [ -z "$quiet" ] && yellow "正在探测端口 ${port}...\n"
+        if warp_probe_endpoint "$port" "$v4" "$v6" "$private_key" "$peer_pub" "$reserved_json" "$peer_addr"; then
+            ok_port="$port"
+            [ -z "$quiet" ] && green "  端口 ${port} 探测成功，数据可正常经WARP转发\n"
+            break
+        fi
+        [ -z "$quiet" ] && yellow "  端口 ${port} 未探测成功，尝试下一个端口\n"
+    done
+
+    if [ -z "$ok_port" ]; then
+        [ -z "$quiet" ] && red "已尝试全部候选端口(${candidate_ports[*]})均未探测成功，当前网络很可能封锁了出站UDP，WARP出站暂时无法使用\n"
+        [ -z "$quiet" ] && yellow "配置已保留(端口 ${candidate_ports[0]})，网络环境变化后可到「5. 重新生成独立 WARP 密钥」重试\n"
+    fi
+
+    local final_port="${ok_port:-${candidate_ports[0]}}"
+    if [ -n "$v6" ]; then
+        cat > "$endpoints_file" << EOF
 {
   "endpoints": [
     {
@@ -579,8 +630,8 @@ generate_warp_endpoint() {
       "private_key": "$private_key",
       "peers": [
         {
-          "address": "162.159.192.1",
-          "port": $port,
+          "address": "$peer_addr",
+          "port": $final_port,
           "public_key": "$peer_pub",
           "allowed_ips": ["0.0.0.0/0", "::/0"],
           "persistent_keepalive_interval": 25,
@@ -591,8 +642,8 @@ generate_warp_endpoint() {
   ]
 }
 EOF
-        else
-            cat > "$endpoints_file" << EOF
+    else
+        cat > "$endpoints_file" << EOF
 {
   "endpoints": [
     {
@@ -605,8 +656,8 @@ EOF
       "private_key": "$private_key",
       "peers": [
         {
-          "address": "162.159.192.1",
-          "port": $port,
+          "address": "$peer_addr",
+          "port": $final_port,
           "public_key": "$peer_pub",
           "allowed_ips": ["0.0.0.0/0", "::/0"],
           "persistent_keepalive_interval": 25,
@@ -617,24 +668,11 @@ EOF
   ]
 }
 EOF
-        fi
-
-        if warp_probe_endpoint; then
-            ok_port="$port"
-            [ -z "$quiet" ] && green "  端口 ${port} 探测成功，数据可正常经WARP转发\n"
-            break
-        fi
-        [ -z "$quiet" ] && yellow "  端口 ${port} 未探测成功，尝试下一个端口\n"
-    done
-
-    if [ -z "$ok_port" ]; then
-        [ -z "$quiet" ] && red "已尝试全部候选端口(${candidate_ports[*]})均未探测成功，当前网络很可能封锁了出站UDP，WARP出站暂时无法使用\n"
-        [ -z "$quiet" ] && yellow "配置已保留(端口 ${candidate_ports[0]})，网络环境变化后可到「5. 重新生成独立 WARP 密钥」重试\n"
     fi
 
     # 保存账户信息便于以后排查
     printf '{"id":"%s","token":"%s","private_key":"%s","client_id":"%s","reserved":%s,"v4":"%s","v6":"%s","port":"%s"}\n' \
-        "$device_id" "$token" "$private_key" "$client_id" "$reserved_json" "$v4" "${v6:-}" "${ok_port:-${candidate_ports[0]}}" > "$warp_info_file"
+        "$device_id" "$token" "$private_key" "$client_id" "$reserved_json" "$v4" "${v6:-}" "$final_port" > "$warp_info_file"
     chmod 600 "$warp_info_file" 2>/dev/null
 
     if [ -n "$ok_port" ]; then
@@ -645,7 +683,6 @@ EOF
     fi
 }
 
-# ================== WARP 分流管理菜单 ==================
 # ================== WARP 分流管理菜单 ==================
 
 # 确保 endpoints.json 中已存在可用的 wireguard-out 配置；
