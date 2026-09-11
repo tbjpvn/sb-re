@@ -400,6 +400,56 @@ allow_port() {
 }
 
 # ================== WARP 独立密钥生成 ==================
+# 静默功能性探测：临时把路由切到 wireguard-out，通过本地一次性 socks
+# 入站实际发起一次请求，判断 endpoints.json 里当前端口是否真的可用
+# (收得到Cloudflare回包、数据能进能出)，而不是仅凭注册接口返回200
+# 就当作成功——用于在多个候选UDP端口间挑出真正能用的一个。
+warp_probe_endpoint() {
+    local route_file="${conf_dir}/route.json"
+    local inbounds_file="${conf_dir}/inbounds.json"
+    local probe_port=10809
+    local route_bak inbounds_bak
+    route_bak=$(mktemp) && cp "$route_file" "$route_bak" 2>/dev/null
+    inbounds_bak=$(mktemp) && cp "$inbounds_file" "$inbounds_bak" 2>/dev/null
+
+    if ! jq -e --argjson p "$probe_port" '.inbounds[]? | select(.type=="socks" and .listen_port==$p)' "$inbounds_file" >/dev/null 2>&1; then
+        jq --argjson p "$probe_port" '.inbounds += [{
+            "type": "socks",
+            "tag": "socks-warpprobe",
+            "listen": "127.0.0.1",
+            "listen_port": $p
+        }]' "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+    fi
+
+    cat > "$route_file" << EOF
+{
+  "route": {
+    "rules": [
+      {"action": "sniff"},
+      {"outbound": "wireguard-out"}
+    ],
+    "final": "wireguard-out",
+    "default_domain_resolver": {
+      "server": "sys",
+      "strategy": "prefer_ipv4"
+    }
+  }
+}
+EOF
+    restart_singbox
+    sleep 2
+
+    local result=1
+    if curl -4 -x "socks5h://127.0.0.1:${probe_port}" -sm 8 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q '^warp=on'; then
+        result=0
+    fi
+
+    mv "$route_bak" "$route_file" 2>/dev/null
+    mv "$inbounds_bak" "$inbounds_file" 2>/dev/null
+    restart_singbox
+    return $result
+}
+
 # 向 Cloudflare 注册新设备，生成独立 WireGuard 密钥与 reserved
 # 成功返回 0 并写入 endpoints.json；失败返回 1（调用方可决定是否回退）
 generate_warp_endpoint() {
@@ -507,10 +557,15 @@ generate_warp_endpoint() {
         reserved_json="[0, 0, 0]"
     fi
 
-    # 4. 写入 endpoints.json
-    # 使用 IP 而非域名作为 peer 地址 + keepalive，提升服务端场景稳定性（不写 detour，避免 direct 缺失时报错）
-    if [ -n "$v6" ]; then
-        cat > "$endpoints_file" << EOF
+    # 4. 依次尝试Cloudflare WARP常用的几个UDP端口，挑一个真正可用的写入配置。
+    # 部分VPS/机房会封锁2408这种明显是VPN流量的端口，仅凭注册接口返回
+    # 200不能说明隧道真的能收发数据，这里实际探测一次才能确认。
+    local candidate_ports=(2408 4500 1701 500)
+    local port ok_port=""
+    for port in "${candidate_ports[@]}"; do
+        [ -z "$quiet" ] && yellow "正在写入并探测端口 ${port}...\n"
+        if [ -n "$v6" ]; then
+            cat > "$endpoints_file" << EOF
 {
   "endpoints": [
     {
@@ -525,7 +580,7 @@ generate_warp_endpoint() {
       "peers": [
         {
           "address": "162.159.192.1",
-          "port": 2408,
+          "port": $port,
           "public_key": "$peer_pub",
           "allowed_ips": ["0.0.0.0/0", "::/0"],
           "persistent_keepalive_interval": 25,
@@ -536,8 +591,8 @@ generate_warp_endpoint() {
   ]
 }
 EOF
-    else
-        cat > "$endpoints_file" << EOF
+        else
+            cat > "$endpoints_file" << EOF
 {
   "endpoints": [
     {
@@ -551,7 +606,7 @@ EOF
       "peers": [
         {
           "address": "162.159.192.1",
-          "port": 2408,
+          "port": $port,
           "public_key": "$peer_pub",
           "allowed_ips": ["0.0.0.0/0", "::/0"],
           "persistent_keepalive_interval": 25,
@@ -562,59 +617,54 @@ EOF
   ]
 }
 EOF
+        fi
+
+        if warp_probe_endpoint; then
+            ok_port="$port"
+            [ -z "$quiet" ] && green "  端口 ${port} 探测成功，数据可正常经WARP转发\n"
+            break
+        fi
+        [ -z "$quiet" ] && yellow "  端口 ${port} 未探测成功，尝试下一个端口\n"
+    done
+
+    if [ -z "$ok_port" ]; then
+        [ -z "$quiet" ] && red "已尝试全部候选端口(${candidate_ports[*]})均未探测成功，当前网络很可能封锁了出站UDP，WARP出站暂时无法使用\n"
+        [ -z "$quiet" ] && yellow "配置已保留(端口 ${candidate_ports[0]})，网络环境变化后可到「5. 重新生成独立 WARP 密钥」重试\n"
     fi
 
     # 保存账户信息便于以后排查
-    printf '{"id":"%s","token":"%s","private_key":"%s","client_id":"%s","reserved":%s,"v4":"%s","v6":"%s"}\n' \
-        "$device_id" "$token" "$private_key" "$client_id" "$reserved_json" "$v4" "${v6:-}" > "$warp_info_file"
+    printf '{"id":"%s","token":"%s","private_key":"%s","client_id":"%s","reserved":%s,"v4":"%s","v6":"%s","port":"%s"}\n' \
+        "$device_id" "$token" "$private_key" "$client_id" "$reserved_json" "$v4" "${v6:-}" "${ok_port:-${candidate_ports[0]}}" > "$warp_info_file"
     chmod 600 "$warp_info_file" 2>/dev/null
-    [ -z "$quiet" ] && green "WARP 独立密钥注册成功！\n  IPv4: ${purple}${v4}${re}\n  reserved: ${purple}${reserved_json}${re}\n"
-    return 0
+
+    if [ -n "$ok_port" ]; then
+        [ -z "$quiet" ] && green "WARP 独立密钥注册成功！\n  IPv4: ${purple}${v4}${re}\n  端口: ${purple}${ok_port}${re}\n  reserved: ${purple}${reserved_json}${re}\n"
+        return 0
+    else
+        return 1
+    fi
 }
 
-# 写入默认（共享）WARP 配置作为回退
-write_fallback_warp_endpoint() {
-    cat > "${conf_dir}/endpoints.json" << 'WARP_FALLBACK_EOF'
-{
-  "endpoints": [
-    {
-      "type": "wireguard",
-      "tag": "wireguard-out",
-      "mtu": 1280,
-      "address": [
-        "172.16.0.2/32",
-        "2606:4700:110:8dfe:d141:69bb:6b80:925/128"
-      ],
-      "private_key": "YFYOAdbw1bKTHlNNi+aEjBM3BO7unuFC5rOkMRAz9XY=",
-      "peers": [
-        {
-          "address": "162.159.192.1",
-          "port": 2408,
-          "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-          "allowed_ips": ["0.0.0.0/0", "::/0"],
-          "persistent_keepalive_interval": 25,
-          "reserved": [78, 135, 76]
-        }
-      ]
-    }
-  ]
-}
-WARP_FALLBACK_EOF
-}
+# ================== WARP 分流管理菜单 ==================
+# ================== WARP 分流管理菜单 ==================
 
 # 确保 endpoints.json 中已存在可用的 wireguard-out 配置；
 # 仅在真正即将使用 WARP 出站时按需调用，避免安装阶段/不需要WARP的场景
 # 也强制向Cloudflare申请密钥。已存在则直接跳过，不会重复申请。
+# 若注册彻底失败(拿不到endpoints.json)返回1，调用方应放弃把路由指向
+# wireguard-out，避免sing-box因引用了不存在的出站标签而无法启动。
 ensure_warp_endpoint() {
     local endpoints_file="${conf_dir}/endpoints.json"
     if [ -f "$endpoints_file" ] && jq -e '.endpoints[]? | select(.tag=="wireguard-out")' "$endpoints_file" >/dev/null 2>&1; then
         return 0
     fi
     yellow "检测到尚未申请 WARP 出站密钥，正在按需向 Cloudflare 注册...\n"
-    if ! generate_warp_endpoint; then
-        yellow "独立 WARP 注册失败，暂时使用共享密钥（可能不稳定，可稍后在「WARP分流管理」中重新生成）\n"
-        write_fallback_warp_endpoint
+    generate_warp_endpoint
+    if [ -f "$endpoints_file" ] && jq -e '.endpoints[]? | select(.tag=="wireguard-out")' "$endpoints_file" >/dev/null 2>&1; then
+        return 0
     fi
+    red "WARP 密钥注册失败，未能生成 wireguard-out 出站\n"
+    return 1
 }
 
 # ================== 单栈VPS加装WARP全局出站(系统级) ==================
@@ -2123,7 +2173,9 @@ test_warp_connectivity() {
     yellow "  4. 测试结束后自动恢复原配置\n"
 
     # 若此前从未使用过WARP（尚无endpoints.json/独立密钥），这里按需申请一次
-    ensure_warp_endpoint
+    if ! ensure_warp_endpoint; then
+        red "WARP 密钥不可用，无法测试连通性\n"; sleep 2; return
+    fi
 
     # 备份
     cp "$route_file" "$route_bak"
@@ -2397,7 +2449,10 @@ finalize_rule_add() {
 
     local out_tags=($(jq -r '.outbounds[] | select(.tag != "direct") | .tag' "$outbound_file" 2>/dev/null))
     if [ ${#out_tags[@]} -eq 0 ]; then
-        ensure_warp_endpoint
+        if ! ensure_warp_endpoint; then
+            red "WARP 出站不可用，本次分流设置已取消，请检查网络后重试，或先添加其他代理出站。"
+            sleep 2; warp_manage; return
+        fi
         selected_out="wireguard-out"
         yellow "未找到其他出站，将自动使用 wireguard-out。"
     else
