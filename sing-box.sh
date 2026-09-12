@@ -2715,7 +2715,6 @@ delete_rule_menu() {
                 | select(
                     (.rule_set | type) != "array"
                     or (.rule_set | length) > 0
-                    or .outbound != null
                   )
               ]
           )
