@@ -1159,6 +1159,124 @@ regenerate_warp_keys() {
     sleep 2
 }
 
+
+# 默认远程规则集（安装与恢复 direct 共用，避免两处 heredoc 复制）
+default_route_rule_sets_json() {
+    jq -n '[
+      {"tag":"gemini","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/google.srs","download_detour":"direct"},
+      {"tag":"claude","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/anthropic.srs","download_detour":"direct"},
+      {"tag":"openai","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/openai.srs","download_detour":"direct"},
+      {"tag":"tiktok","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/tiktok.srs","download_detour":"direct"},
+      {"tag":"twitter","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/twitter.srs","download_detour":"direct"},
+      {"tag":"google","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/google.srs","download_detour":"direct"},
+      {"tag":"telegram","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/telegram.srs","download_detour":"direct"},
+      {"tag":"telegram-ip","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/telegram.srs","download_detour":"direct"},
+      {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
+      {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
+    ]'
+}
+
+# 写默认 route.json（final=direct + sniff）
+write_default_route_json() {
+    local resolver_tag=${1:-local}
+    local dns_strategy=${2:-prefer_ipv4}
+    local rule_sets
+    rule_sets=$(default_route_rule_sets_json) || return 1
+    jq -n \
+        --argjson rule_set "$rule_sets" \
+        --arg resolver "$resolver_tag" \
+        --arg strategy "$dns_strategy" \
+        '{
+          route: {
+            rule_set: $rule_set,
+            rules: [{"action":"sniff"}],
+            final: "direct",
+            default_domain_resolver: {server: $resolver, strategy: $strategy}
+          }
+        }' > "${conf_dir}/route.json"
+}
+
+# 用 jq 生成安装阶段核心配置（替代超长 heredoc）
+write_install_configs() {
+    local uuid=$1 private_key=$2
+    local vless_port=$3 hy2_port=$4 tuic_port=$5 argo_port=$6
+    local dns_strategy=$7 resolver_tag=$8 sys_dns_server=$9
+
+    jq -n \
+        --arg out "${work_dir}/sb.log" \
+        '{log:{disabled:false, level:"warn", output:$out, timestamp:true}}' \
+        > "${conf_dir}/log.json"
+
+    jq -n \
+        '{ntp:{enabled:true, server:"time.apple.com", server_port:123, interval:"60m"}}' \
+        > "${conf_dir}/ntp.json"
+
+    jq -n \
+        --arg sys "$sys_dns_server" \
+        --arg strategy "$dns_strategy" \
+        '{
+          dns: {
+            servers: [
+              {tag:"sys", type:"udp", server:$sys},
+              {tag:"local", type:"local"}
+            ],
+            strategy: $strategy
+          }
+        }' > "${conf_dir}/dns.json"
+
+    jq -n \
+        --arg uuid "$uuid" \
+        --arg pk "$private_key" \
+        --arg cert "${work_dir}/cert.pem" \
+        --arg key "${work_dir}/private.key" \
+        --argjson vless_port "$vless_port" \
+        --argjson hy2_port "$hy2_port" \
+        --argjson tuic_port "$tuic_port" \
+        --argjson argo_port "$argo_port" \
+        '{
+          inbounds: [
+            {
+              type: "vless", tag: "vless-reality", listen: "::", listen_port: $vless_port,
+              users: [{uuid: $uuid, flow: "xtls-rprx-vision"}],
+              tls: {
+                enabled: true, server_name: "www.iij.ad.jp",
+                reality: {
+                  enabled: true,
+                  handshake: {server: "www.iij.ad.jp", server_port: 443},
+                  private_key: $pk,
+                  short_id: [""]
+                }
+              }
+            },
+            {
+              type: "vmess", tag: "vmess-ws", listen: "::", listen_port: $argo_port,
+              users: [{uuid: $uuid}],
+              transport: {type: "ws", path: "/vmess-argo", early_data_header_name: "Sec-WebSocket-Protocol"}
+            },
+            {
+              type: "hysteria2", tag: "hysteria2", listen: "::", listen_port: $hy2_port,
+              users: [{password: $uuid}],
+              ignore_client_bandwidth: false,
+              masquerade: "https://bing.com",
+              tls: {
+                enabled: true, alpn: ["h3"], min_version: "1.3", max_version: "1.3",
+                certificate_path: $cert, key_path: $key
+              }
+            },
+            {
+              type: "tuic", tag: "tuic", listen: "::", listen_port: $tuic_port,
+              users: [{uuid: $uuid, password: $uuid}],
+              congestion_control: "bbr",
+              tls: {enabled: true, alpn: ["h3"], certificate_path: $cert, key_path: $key}
+            }
+          ]
+        }' > "${conf_dir}/inbounds.json"
+
+    jq -n '{outbounds:[{type:"direct", tag:"direct"}]}' > "${conf_dir}/outbounds.json"
+
+    write_default_route_json "$resolver_tag" "$dns_strategy"
+}
+
 install_singbox() {
     clear
     purple "正在安装sing-box中，请稍后..."
@@ -1287,175 +1405,8 @@ install_singbox() {
         esac
     fi
 
-    cat > "${conf_dir}/log.json" << EOF
-{
-  "log": {
-    "disabled": false,
-    "level": "warn",
-    "output": "$work_dir/sb.log",
-    "timestamp": true
-  }
-}
-EOF
+    write_install_configs "$uuid" "$private_key" "$vless_port" "$hy2_port" "$tuic_port" "${ARGO_PORT}" "$dns_strategy" "$resolver_tag" "$sys_dns_server"
 
-    cat > ${conf_dir}/ntp.json << EOF
-{
-    "ntp": {
-        "enabled": true,
-        "server": "time.apple.com",
-        "server_port": 123,
-        "interval": "60m"
-    }
-}
-EOF
-
-    cat > "${conf_dir}/dns.json" << EOF
-{
-  "dns": {
-    "servers": [
-      {
-        "tag": "sys",
-        "type": "udp",
-        "server": "$sys_dns_server"
-      },
-      {
-        "tag": "local",
-        "type": "local"
-      }
-    ],
-    "strategy": "$dns_strategy"
-  }
-}
-EOF
-
-    cat > "${conf_dir}/inbounds.json" << EOF
-{
-  "inbounds": [
-    {
-      "type": "vless",
-      "tag": "vless-reality",
-      "listen": "::",
-      "listen_port": $vless_port,
-      "users": [
-        {
-          "uuid": "$uuid",
-          "flow": "xtls-rprx-vision"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "www.iij.ad.jp",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "www.iij.ad.jp",
-            "server_port": 443
-          },
-          "private_key": "$private_key",
-          "short_id": [""]
-        }
-      }
-    },
-    {
-      "type": "vmess",
-      "tag": "vmess-ws",
-      "listen": "::",
-      "listen_port": ${ARGO_PORT},
-      "users": [
-        {
-          "uuid": "$uuid"
-        }
-      ],
-      "transport": {
-        "type": "ws",
-        "path": "/vmess-argo",
-        "early_data_header_name": "Sec-WebSocket-Protocol"
-      }
-    },
-    {
-      "type": "hysteria2",
-      "tag": "hysteria2",
-      "listen": "::",
-      "listen_port": $hy2_port,
-      "users": [
-        {
-          "password": "$uuid"
-        }
-      ],
-      "ignore_client_bandwidth": false,
-      "masquerade": "https://bing.com",
-      "tls": {
-        "enabled": true,
-        "alpn": ["h3"],
-        "min_version": "1.3",
-        "max_version": "1.3",
-        "certificate_path": "$work_dir/cert.pem",
-        "key_path": "$work_dir/private.key"
-      }
-    },
-    {
-      "type": "tuic",
-      "tag": "tuic",
-      "listen": "::",
-      "listen_port": $tuic_port,
-      "users": [
-        {
-          "uuid": "$uuid",
-          "password": "$uuid"
-        }
-      ],
-      "congestion_control": "bbr",
-      "tls": {
-        "enabled": true,
-        "alpn": ["h3"],
-        "certificate_path": "$work_dir/cert.pem",
-        "key_path": "$work_dir/private.key"
-      }
-    }
-  ]
-}
-EOF
-
-    cat > "${conf_dir}/outbounds.json" << EOF
-{
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ]
-}
-EOF
-
-    # WARP 密钥按需申请，安装阶段不强制
-    # 这里先不生成 endpoints.json，留到「WARP分流管理 → 1.设置分流服务」
-
-    cat > "${conf_dir}/route.json" << EOF
-{
-  "route": {
-    "rule_set": [
-      {"tag":"gemini","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/google.srs","download_detour":"direct"},
-      {"tag":"claude","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/anthropic.srs","download_detour":"direct"},
-      {"tag":"openai","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/openai.srs","download_detour":"direct"},
-      {"tag":"tiktok","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/tiktok.srs","download_detour":"direct"},
-      {"tag":"twitter","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/twitter.srs","download_detour":"direct"},
-      {"tag":"google","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/google.srs","download_detour":"direct"},
-      {"tag":"telegram","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/telegram.srs","download_detour":"direct"},
-      {"tag":"telegram-ip","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/telegram.srs","download_detour":"direct"},
-      {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
-      {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
-    ],
-    "rules": [
-      {"action": "sniff"}
-    ],
-    "final": "direct",
-    "default_domain_resolver": {
-      "server": "$resolver_tag",
-      "strategy": "$dns_strategy"
-    }
-  }
-}
-EOF
 }
 
 main_systemd_services() {
@@ -1648,6 +1599,29 @@ manage_service() {
             elif command_exists systemctl; then systemctl daemon-reload && systemctl restart "$service_name"; fi
             [ $? -eq 0 ] && green "${service_name} 服务已成功重启\n" || red "${service_name} 服务重启失败\n"
             ;;
+        "reload")
+            [ "$status" == "not installed" ] && { yellow "${service_name} 尚未安装！\n"; return 1; }
+            yellow "正在重载 ${service_name} 配置\n"
+            if command_exists systemctl; then
+                if systemctl is-active --quiet "$service_name" 2>/dev/null && systemctl reload "$service_name" 2>/dev/null; then
+                    green "${service_name} 配置已重载\n"; return 0
+                fi
+                yellow "reload 不可用，改为 restart\n"
+                systemctl restart "$service_name" 2>/dev/null
+                [ $? -eq 0 ] && green "${service_name} 服务已重启\n" || red "${service_name} 服务重启失败\n"
+            elif command_exists rc-service; then
+                local pidfile="/var/run/${service_name}.pid" pid=""
+                [ -f "$pidfile" ] && pid=$(cat "$pidfile" 2>/dev/null)
+                if [ -n "$pid" ] && kill -HUP "$pid" 2>/dev/null; then
+                    green "${service_name} 配置已重载 (HUP)\n"; return 0
+                fi
+                yellow "HUP 不可用，改为 restart\n"
+                rc-service "$service_name" restart
+                [ $? -eq 0 ] && green "${service_name} 服务已重启\n" || red "${service_name} 服务重启失败\n"
+            else
+                manage_service "$service_name" "restart"
+            fi
+            ;;
         *)
             red "无效的操作: $action\n"; return 1 ;;
     esac
@@ -1656,6 +1630,8 @@ manage_service() {
 start_singbox()  { manage_service "sing-box" "start"; }
 stop_singbox()   { manage_service "sing-box" "stop"; }
 restart_singbox(){ manage_service "sing-box" "restart"; }
+# 改配置优先 reload（HUP），失败再 restart，减少断连
+reload_singbox() { manage_service "sing-box" "reload"; }
 start_argo()     { manage_service "argo" "start"; }
 stop_argo()      { manage_service "argo" "stop"; }
 restart_argo()   { manage_service "argo" "restart"; }
@@ -1821,7 +1797,7 @@ change_config() {
                     new_port=$(prompt_free_port "\n请输入vless-reality端口 (回车跳过将使用随机端口): ")
                     jq_write "$inbounds_file" --arg port "$new_port" \
                        '(.inbounds[] | select(.type == "vless").listen_port) = ($port | tonumber)'
-                    restart_singbox
+                    reload_singbox
                     allow_port $new_port/tcp > /dev/null 2>&1
                     sed -i -E 's#(vless://[^@]*@(\[[0-9a-fA-F:]+\]|[^:]*)):[0-9]+#\1:'"$new_port"'#' $client_dir
                     update_subscription
@@ -1832,7 +1808,7 @@ change_config() {
                     new_port=$(prompt_free_port "\n请输入hysteria2端口 (回车跳过将使用随机端口): ")
                     jq_write "$inbounds_file" --arg port "$new_port" \
                        '(.inbounds[] | select(.type == "hysteria2").listen_port) = ($port | tonumber)'
-                    restart_singbox
+                    reload_singbox
                     allow_port $new_port/udp > /dev/null 2>&1
                     sed -i -E 's#(hysteria2://[^@]*@(\[[0-9a-fA-F:]+\]|[^:]*)):[0-9]+#\1:'"$new_port"'#' $client_dir
                     update_subscription
@@ -1843,7 +1819,7 @@ change_config() {
                     new_port=$(prompt_free_port "\n请输入tuic端口 (回车跳过将使用随机端口): ")
                     jq_write "$inbounds_file" --arg port "$new_port" \
                        '(.inbounds[] | select(.type == "tuic").listen_port) = ($port | tonumber)'
-                    restart_singbox
+                    reload_singbox
                     allow_port $new_port/udp > /dev/null 2>&1
                     sed -i -E 's#(tuic://[^@]*@(\[[0-9a-fA-F:]+\]|[^:]*)):[0-9]+#\1:'"$new_port"'#' $client_dir
                     update_subscription
@@ -1864,7 +1840,7 @@ change_config() {
                             sed -i 's/localhost:[0-9]\{1,\}/localhost:'"$new_port"'/' /etc/systemd/system/argo.service && \
                             get_quick_tunnel && change_argo_domain
                     fi
-                    restart_singbox
+                    reload_singbox
                     green "\nvmess-argo端口已修改为：${purple}${new_port}${re}\n"
                     ;;
                 0) change_config ;;
@@ -1877,7 +1853,7 @@ change_config() {
             jq_write "${conf_dir}/inbounds.json" --arg uuid "$new_uuid" \
                '(.inbounds[] | select(.users != null) | .users[] | select(.uuid != null).uuid) = $uuid |
                 (.inbounds[] | select(.users != null) | .users[] | select(.password != null).password) = $uuid'
-            restart_singbox
+            reload_singbox
             sed -i -E 's/(vless:\/\/|hysteria2:\/\/|anytls:\/\/)[^@]*(@.*)/\1'"$new_uuid"'\2/' $client_dir
             sed -i -E "s#tuic://[0-9a-f-]{36}:[0-9a-f-]{36}@#tuic://$new_uuid:$new_uuid@#g" $client_dir
             isp=$(get_isp || echo "$(hostname)")
@@ -1903,7 +1879,7 @@ change_config() {
             jq_write "${conf_dir}/inbounds.json" --arg sni "$new_sni" \
                '(.inbounds[] | select(.type == "vless") | .tls.server_name) = $sni |
                 (.inbounds[] | select(.type == "vless") | .tls.reality.handshake.server) = $sni'
-            restart_singbox
+            reload_singbox
             sed -i "s/\(vless:\/\/[^\?]*\?\([^\&]*\&\)*sni=\)[^&]*/\1$new_sni/" $client_dir
             update_subscription
             print_client_urls
@@ -1941,7 +1917,7 @@ IEOF
                 command -v ip6tables &> /dev/null && service ip6tables save > /dev/null 2>&1
                 systemctl enable ip6tables > /dev/null 2>&1 && systemctl start ip6tables > /dev/null 2>&1
             fi
-            restart_singbox
+            reload_singbox
             ip=$(get_realip)
             fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
             uuid=$(sed -n 's/.*hysteria2:\/\/\([^@]*\)@.*/\1/p' $client_dir)
@@ -2567,7 +2543,7 @@ finalize_rule_add() {
         '
     done
 
-    restart_singbox
+    reload_singbox
     if [ "$rule_tag" = "telegram" ]; then
         green "'telegram' 已分流至出站 '${selected_out}'（已自动包含 IP 规则）"
     else
@@ -2608,7 +2584,7 @@ set_global_outbound() {
     # 去掉 direct，防止绕过全局代理
     jq_write "$outbound_file" 'del(.outbounds[] | select(.tag == "direct"))'
     rm -f "${route_file}"
-    restart_singbox
+    reload_singbox
     green "\n已设置全局代理出站：${purple}${selected_out}${re}"
     yellow "所有流量将通过 ${selected_out} 转发，如需恢复请选择「恢复服务器原IP出站」\n"
     sleep 2; warp_manage
@@ -2643,36 +2619,8 @@ restore_direct_outbound() {
         jq_write "$outbound_file" '.outbounds = [{"type": "direct", "tag": "direct"}] + .outbounds'
     fi
 
-    # 恢复默认 route.json
-    cat > "${route_file}" << EOF
-{
-  "route": {
-    "rule_set": [
-      {"tag":"gemini","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/google.srs","download_detour":"direct"},
-      {"tag":"claude","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/anthropic.srs","download_detour":"direct"},
-      {"tag":"openai","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/openai.srs","download_detour":"direct"},
-      {"tag":"tiktok","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/tiktok.srs","download_detour":"direct"},
-      {"tag":"twitter","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/twitter.srs","download_detour":"direct"},
-      {"tag":"google","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/google.srs","download_detour":"direct"},
-      {"tag":"telegram","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/telegram.srs","download_detour":"direct"},
-      {"tag":"telegram-ip","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/telegram.srs","download_detour":"direct"},
-      {"tag":"youtube","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/youtube.srs","download_detour":"direct"},
-      {"tag":"netflix","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/netflix.srs","download_detour":"direct"}
-    ],
-    "rules": [
-      {"action": "sniff"}
-    ],
-    "final": "direct",
-    "default_domain_resolver": {
-      "server": "$cur_resolver_tag",
-      "strategy": "$cur_dns_strategy"
-    }
-  }
-}
-EOF
-
-    # 若之前已经申请过，endpoints.json会原样保留，不受影响。
-    restart_singbox
+    write_default_route_json "$cur_resolver_tag" "$cur_dns_strategy"
+    reload_singbox
     green "\n已恢复服务器原IP出站，所有流量走 direct。\n"
     sleep 2; warp_manage
 }
@@ -2721,7 +2669,7 @@ delete_rule_menu() {
             jq_write "$route_file" --arg tag "$t" '.route.rule_set = [.route.rule_set[] | select(.tag != $tag)]'
         fi
     done
-    restart_singbox
+    reload_singbox
     if [ "$tag" = "telegram" ] || [ "$tag" = "telegram-ip" ]; then
         green "规则集 'telegram' 已禁用。"
     else
@@ -2863,7 +2811,7 @@ add_socks5_proxy() {
     # 新出站不自动接管已有分流，需手动指定
     # 否则会把之前所有服务(如gemini/openai等)的出站全部覆盖成这个新加的代理，
 
-    restart_singbox
+    reload_singbox
     green "\n${tag} 代理出站已添加\n"
     sleep 2; warp_manage
 }
@@ -2888,7 +2836,7 @@ delete_socks5_proxy() {
     jq_write "$outbound_file" --arg tag "$tag" 'del(.outbounds[] | select(.tag == $tag))'
     jq_write "$route_file" --arg tag "$tag" '.route.rules = [.route.rules[] | select(.outbound != $tag)]'
 
-    restart_singbox
+    reload_singbox
     green "${tag} 代理出站已删除。"
     sleep 1
 }
@@ -2980,7 +2928,7 @@ add_socks5_inbound() {
     echo "${url_line}" >> "${client_dir}"
     update_sub
 
-    restart_singbox
+    reload_singbox
 
     green "\nSocks5 协议已添加！"
     green "端口: ${purple}${sk_port}${re}"
@@ -3001,7 +2949,7 @@ remove_socks5_inbound() {
 
     remove_url_by_tag "socks"
     update_sub
-    restart_singbox
+    reload_singbox
     green "\nSocks5 协议已删除\n"
 }
 
@@ -3053,7 +3001,7 @@ add_anytls() {
     echo "${url_line}" >> "${client_dir}"
     update_sub
 
-    restart_singbox
+    reload_singbox
 
     green "\nAnyTLS 协议已添加！"
     green "密码(UUID): ${purple}${current_uuid}${re}"
@@ -3074,7 +3022,7 @@ remove_anytls() {
 
     remove_url_by_tag "anytls"
     update_sub
-    restart_singbox
+    reload_singbox
     green "\nAnyTLS 协议已删除\n"
 }
 
@@ -3133,7 +3081,7 @@ add_ss2022() {
     echo "${url_line}" >> "${client_dir}"
     update_sub
 
-    restart_singbox
+    reload_singbox
 
     green "\nShadowsocks-2022 协议已添加！"
     green "加密方式: ${purple}${ss_method}${re}"
@@ -3155,7 +3103,7 @@ remove_ss2022() {
 
     remove_url_by_tag "ss"
     update_sub
-    restart_singbox
+    reload_singbox
     green "\nShadowsocks-2022 协议已删除\n"
 }
 
@@ -3435,7 +3383,7 @@ apply_domain_cert() {
     chmod 600 "${work_dir}/private.key"
     echo "$domain" > "${work_dir}/cert_domain.txt"
 
-    restart_singbox
+    reload_singbox
 
     if [ -f "$client_dir" ]; then
         sed -i -E "s#(hysteria2://[^?]*\?)sni=[^&]*&insecure=1&pinSHA256=[^&]*#\1sni=${domain}\&insecure=0#" "$client_dir"
@@ -3477,7 +3425,7 @@ restore_selfsigned_cert() {
     [ -f "${HOME}/.acme.sh/acme.sh" ] && "${HOME}/.acme.sh/acme.sh" --remove -d "$old_domain" --ecc >/dev/null 2>&1
     rm -f "${work_dir}/cert_domain.txt"
 
-    restart_singbox
+    reload_singbox
 
     local fingerprint
     fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
@@ -3594,7 +3542,7 @@ manage_outbound_strategy() {
             '.route.default_domain_resolver = {"server": $srv, "strategy": $s}'
     fi
 
-    restart_singbox
+    reload_singbox
     green "\n出站IPv4/IPv6优先级已设置为：${purple}${new_strategy}${re}\n"
     read -n 1 -s -r -p $'\n\033[1;91m按任意键返回主菜单...\033[0m\n'
     menu
