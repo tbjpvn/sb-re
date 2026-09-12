@@ -243,15 +243,55 @@ check_argo() {
     check_service "argo" "${work_dir}/argo"
 }
 
+# ---------- IP/ISP 短缓存（减少重复 curl） ----------
+# 缓存目录与 TTL（秒）。同一次菜单操作内多次 get_realip/get_isp 会命中缓存。
+_SB_IP_CACHE_DIR="${TMPDIR:-/tmp}/sb-ip-cache"
+_SB_IP_CACHE_TTL=60
+
+_sb_cache_get() {
+    local key=$1
+    local file="${_SB_IP_CACHE_DIR}/${key}"
+    local now ts
+    [ -f "$file" ] || return 1
+    now=$(date +%s 2>/dev/null) || return 1
+    ts=$(head -1 "$file" 2>/dev/null) || return 1
+    case "$ts" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ $((now - ts)) -le "${_SB_IP_CACHE_TTL}" ] || return 1
+    tail -n +2 "$file" 2>/dev/null
+    return 0
+}
+
+_sb_cache_set() {
+    local key=$1
+    shift
+    mkdir -p "${_SB_IP_CACHE_DIR}" 2>/dev/null || return 0
+    {
+        date +%s 2>/dev/null || echo 0
+        # 每个参数写一行，便于 dualstack 等缓存多值
+        local _a
+        for _a in "$@"; do
+            printf '%s\n' "$_a"
+        done
+    } > "${_SB_IP_CACHE_DIR}/${key}" 2>/dev/null || true
+}
+
 # 检查双栈(IPv4/IPv6)IP状态
 check_dualstack() {
-    local ip4 ip6 tmp4 tmp6
-    tmp4=$(mktemp); tmp6=$(mktemp)
-    curl -4 -s -m 1.5 ip.sb > "$tmp4" 2>/dev/null &
-    curl -6 -s -m 1.5 ip.sb > "$tmp6" 2>/dev/null &
-    wait
-    ip4=$(cat "$tmp4" 2>/dev/null); ip6=$(cat "$tmp6" 2>/dev/null)
-    rm -f "$tmp4" "$tmp6"
+    local ip4 ip6 tmp4 tmp6 cached
+    if cached=$(_sb_cache_get dualstack); then
+        ip4=$(echo "$cached" | sed -n '1p')
+        ip6=$(echo "$cached" | sed -n '2p')
+    else
+        tmp4=$(mktemp); tmp6=$(mktemp)
+        curl -4 -s -m 1.5 ip.sb > "$tmp4" 2>/dev/null &
+        curl -6 -s -m 1.5 ip.sb > "$tmp6" 2>/dev/null &
+        wait
+        ip4=$(cat "$tmp4" 2>/dev/null); ip6=$(cat "$tmp6" 2>/dev/null)
+        rm -f "$tmp4" "$tmp6"
+        _sb_cache_set dualstack "${ip4}" "${ip6}"
+    fi
     if [ -n "$ip4" ] && [ -n "$ip6" ]; then
         green "IPv4: ${ip4}  IPv6: ${ip6}"
     elif [ -n "$ip4" ]; then
@@ -338,22 +378,36 @@ manage_packages() {
 
 # 获取ip
 get_realip() {
-    ip=$(curl -4 -sm 2 ip.sb)
-    ipv6() { curl -6 -sm 2 ip.sb; }
+    local cached ip v6 org
+    if cached=$(_sb_cache_get realip); then
+        echo "$cached"
+        return 0
+    fi
+    ip=$(curl -4 -sm 2 ip.sb 2>/dev/null)
+    _get_ipv6() { curl -6 -sm 2 ip.sb 2>/dev/null; }
     if [ -z "$ip" ]; then
-        echo "[$(ipv6)]"
-    else 
-        if curl -4 -sm 2 http://ipinfo.io/org | grep -qE 'Cloudflare|UnReal|AEZA|Andrei'; then
-            echo "[$(ipv6)]"
+        v6=$(_get_ipv6)
+        cached="[$v6]"
+    else
+        org=$(curl -4 -sm 2 http://ipinfo.io/org 2>/dev/null)
+        if echo "$org" | grep -qE 'Cloudflare|UnReal|AEZA|Andrei'; then
+            v6=$(_get_ipv6)
+            cached="[$v6]"
         else
             if grep -qE '^\s*precedence\s+::ffff:0:0/96\s+100' "/etc/gai.conf" 2>/dev/null; then
-                echo "$ip"
+                cached="$ip"
             else
-                v6=$(ipv6)
-                [ -n "$v6" ] && echo "[$v6]" || echo "$ip"
+                v6=$(_get_ipv6)
+                if [ -n "$v6" ]; then
+                    cached="[$v6]"
+                else
+                    cached="$ip"
+                fi
             fi
         fi
     fi
+    _sb_cache_set realip "$cached"
+    echo "$cached"
 }
 
 # 通过GitHub API/下载链接获取内容，自动兼容纯IPv6服务器。
@@ -401,7 +455,11 @@ gh_ipv6_hint() {
 # 系统默认路由/DNS优先选择了WARP出口，导致isp被误判为"Cloudflare_Warp"
 # 而覆盖了原本的真实ISP名称(如 Yuusei 等)。
 get_isp() {
-    local addr flag result
+    local addr flag result cached
+    if cached=$(_sb_cache_get isp); then
+        echo "$cached"
+        return 0
+    fi
     addr=$(get_realip)
     case "$addr" in
         \[*\]) flag="-6" ;;
@@ -423,6 +481,7 @@ get_isp() {
             sed 's/ /_/g')
     fi
     [ -z "$result" ] && return 1
+    _sb_cache_set isp "$result"
     echo "$result"
     return 0
 }
@@ -499,12 +558,67 @@ detect_warp_out_family() {
 # systemctl restart，短时间内触发过多次而被systemd判定为"start-limit-hit"
 # 直接把服务打成失败/停止状态。探测完直接kill掉这个临时进程即可。
 warp_probe_endpoint() {
+    # 只测 WireGuard 握手是否成功（收到对端回包），不再起 socks + curl 全链路探测，更快更轻。
+    # 优先内核 wg；无内核工具时回退到临时 sing-box 进程，通过 wg-style 不可用则用短超时判断进程存活+UDP。
     local port="$1" v4="$2" v6="$3" private_key="$4" peer_pub="$5" reserved_json="$6" peer_addr="$7"
+    local iface="sbwprobe$$"
+    local conf result=1 tries=0 hs
+
+    # ----- 路径1：内核 WireGuard 握手（与系统级 WARP 验证同一思路） -----
+    if command_exists wg && command_exists ip; then
+        # 清理可能残留
+        ip link del "$iface" 2>/dev/null || true
+        if ip link add dev "$iface" type wireguard 2>/dev/null; then
+            # 私钥写入临时文件供 wg set
+            local pkfile
+            pkfile=$(mktemp /tmp/sb-wg-pk.XXXXXX)
+            printf '%s\n' "$private_key" > "$pkfile"
+            chmod 600 "$pkfile"
+            if wg set "$iface" private-key "$pkfile" peer "$peer_pub" \
+                endpoint "${peer_addr}:${port}" \
+                allowed-ips "0.0.0.0/0,::/0" \
+                persistent-keepalive 25 2>/dev/null; then
+                # 地址（去掉 CIDR 再加回）
+                local a4="${v4%/*}"
+                ip -4 address add "${a4}/32" dev "$iface" 2>/dev/null || true
+                if [ -n "$v6" ]; then
+                    local a6="${v6%/*}"
+                    ip -6 address add "${a6}/128" dev "$iface" 2>/dev/null || true
+                fi
+                ip link set "$iface" up 2>/dev/null || true
+                # 触发握手：对隧道对端发一点流量（不依赖外网 HTTP）
+                ping -c 1 -W 1 -I "$iface" 1.1.1.1 >/dev/null 2>&1 || true
+                while [ $tries -lt 5 ]; do
+                    # latest-handshakes: 时间戳>0 即完成过握手
+                    hs=$(wg show "$iface" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
+                    if [ -n "$hs" ] && [ "$hs" != "0" ]; then
+                        result=0
+                        break
+                    fi
+                    # 或 transfer 已有收包
+                    local rx
+                    rx=$(wg show "$iface" transfer 2>/dev/null | awk '{print $2; exit}')
+                    if [ -n "$rx" ] && [ "$rx" != "0" ]; then
+                        result=0
+                        break
+                    fi
+                    sleep 1
+                    tries=$((tries + 1))
+                done
+            fi
+            rm -f "$pkfile"
+            ip link del "$iface" 2>/dev/null || true
+            return $result
+        fi
+    fi
+
+    # ----- 路径2：无内核 wg 时，用临时 sing-box 仅验证进程能绑定并维持（轻量回退） -----
+    # 无法直接读 handshake，缩短 sleep，用短超时 curl；仍比原先 2s+8s 更省
     local sb_bin="${work_dir}/sing-box"
-    local probe_dir probe_port pid result=1
+    local probe_dir probe_port pid
+    [ -x "$sb_bin" ] || return 1
     probe_dir=$(mktemp -d /tmp/singbox-warpprobe.XXXXXX) || return 1
     probe_port=$((20000 + RANDOM % 10000))
-
     local addr_json="[\"$v4\"]"
     [ -n "$v6" ] && addr_json="[\"$v4\", \"$v6\"]"
 
@@ -539,19 +653,19 @@ EOF
 
     "$sb_bin" run -c "${probe_dir}/config.json" >/dev/null 2>&1 &
     pid=$!
-    sleep 2
-
+    sleep 1
     if kill -0 "$pid" 2>/dev/null; then
-        if curl -x "socks5h://127.0.0.1:${probe_port}" -sm 8 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q '^warp=on'; then
+        # 触发握手并确认 warp=on（仅作无内核环境回退，超时缩短）
+        if curl -x "socks5h://127.0.0.1:${probe_port}" -sm 4 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q '^warp=on'; then
             result=0
         fi
     fi
-
     kill "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
     rm -rf "$probe_dir"
     return $result
 }
+
 
 # 向 Cloudflare 注册新设备，生成独立 WireGuard 密钥与 reserved
 # 成功返回 0 并写入 endpoints.json；失败返回 1（调用方可决定是否回退）
@@ -1141,7 +1255,9 @@ regenerate_warp_keys() {
 
 # 下载并安装 sing-box,cloudflared
 install_singbox() {
-
+    # 非交互安装关键路径：局部开启 set -e，函数返回时自动恢复
+    set -e
+    trap 'set +e' RETURN
     clear
     purple "正在安装sing-box中，请稍后..."
     ARCH_RAW=$(uname -m)
@@ -1716,7 +1832,9 @@ auto_install() {
     fi
 
     green "开始无交互式安装 sing-box..."
-    manage_packages install jq tar openssl lsof coreutils
+    set -e
+    trap 'set +e' RETURN
+    manage_packages install jq tar openssl lsof coreutils || { red "依赖安装失败"; exit 1; }
     install_singbox
 
     if command_exists systemctl; then
@@ -1731,8 +1849,10 @@ auto_install() {
         exit 1
     fi
 
+    # verify_udp_listening 仅告警不阻断安装（按设计保留）
+    set +e
     verify_udp_listening
-    get_info
+    get_info || yellow "节点信息生成出现问题，请稍后到菜单「查看节点信息」重试"
     create_shortcut
     green "\nsing-box 安装完成\n"
 }
@@ -3657,6 +3777,9 @@ update_singbox_core() {
     if [ -z "$target_version" ]; then
         red "未获取到有效的版本号！"; sleep 1; return 1
     fi
+
+    set -e
+    trap 'set +e' RETURN
 
     local ARCH_RAW ARCH
     ARCH_RAW=$(uname -m)
