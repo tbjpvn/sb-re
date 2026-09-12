@@ -71,6 +71,86 @@ get_free_port() {
     return 1
 }
 
+
+# ---------- 公共工具（减少重复逻辑） ----------
+
+# 安全写入 JSON：jq 成功后才覆盖原文件
+jq_write() {
+    local file=$1
+    shift
+    jq "$@" "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+}
+
+# 交互获取空闲端口（回车=随机；占用则循环重输）
+# 用法: new_port=$(prompt_free_port "请输入xxx端口 (回车跳过将使用随机端口): ")
+prompt_free_port() {
+    local prompt=$1
+    local min=${2:-10000}
+    local max=${3:-65000}
+    local new_port
+    reading "$prompt" new_port
+    if [ -z "$new_port" ]; then
+        get_free_port "$min" "$max"
+        return 0
+    fi
+    until is_port_free "$new_port"; do
+        # 提示走 stderr，避免污染 $(prompt_free_port ...) 的捕获结果
+        echo -e "${red}端口 $new_port 已被占用${re}" >&2
+        reading "$prompt" new_port
+        if [ -z "$new_port" ]; then
+            get_free_port "$min" "$max"
+            return 0
+        fi
+    done
+    echo "$new_port"
+}
+
+# 交互获取端口（仅校验 1-65535，回车=随机，不检测占用）
+# 用于新增协议；输出端口号，并打印绿色提示
+# 用法: sk_port=$(prompt_port_or_random "请输入 Socks5 监听端口 (回车随机生成): " "socks5监听端口")
+prompt_port_or_random() {
+    local prompt=$1
+    local label=${2:-端口}
+    local port
+    while true; do
+        reading "$prompt" port
+        if [ -z "$port" ]; then
+            port=$(shuf -i 10000-65000 -n 1)
+            # 提示走 stderr，仅把端口号输出到 stdout 供调用方捕获
+            green "${label}：${purple}${port}${re}" >&2
+            echo "$port"
+            return 0
+        fi
+        if [[ ! "$port" =~ ^[0-9]+$ ]] || [ "$port" -gt 65535 ] || [ "$port" -lt 1 ]; then
+            yellow "错误：端口必须是1-65535之间的数字！" >&2
+            continue
+        fi
+        green "${label}：${purple}${port}${re}" >&2
+        echo "$port"
+        return 0
+    done
+}
+
+# 根据 client_dir 刷新 base64 订阅文件
+update_subscription() {
+    [ -f "$client_dir" ] || return 0
+    if base64 -w0 "$client_dir" > "${work_dir}/sub.txt" 2>/dev/null; then
+        :
+    else
+        base64 "$client_dir" | tr -d '\n\r' > "${work_dir}/sub.txt"
+    fi
+    chmod 644 "${work_dir}/sub.txt" 2>/dev/null || true
+}
+
+# 打印 client_dir / url.txt 中的节点行
+print_client_urls() {
+    local f=${1:-$client_dir}
+    [ -f "$f" ] || return 0
+    while IFS= read -r line; do
+        [ -n "$line" ] && yellow "$line"
+    done < "$f"
+}
+
 # 检查服务状态通用函数
 check_service() {
     local service_name=$1
@@ -1735,82 +1815,42 @@ change_config() {
             local inbounds_file="${conf_dir}/inbounds.json"
             case "${choice}" in
                 1)
-                    reading "\n请输入vless-reality端口 (回车跳过将使用随机端口): " new_port
-                    if [ -z "$new_port" ]; then
-                        new_port=$(get_free_port 10000 65000)
-                    else
-                        until is_port_free "$new_port"; do
-                            echo -e "${red}端口 $new_port 已被占用${re}"
-                            reading "请输入vless-reality端口 (回车将使用随机端口): " new_port
-                            [ -z "$new_port" ] && { new_port=$(get_free_port 10000 65000); break; }
-                        done
-                    fi
-                    jq --arg port "$new_port" \
-                       '(.inbounds[] | select(.type == "vless").listen_port) = ($port | tonumber)' \
-                       "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+                    new_port=$(prompt_free_port "\n请输入vless-reality端口 (回车跳过将使用随机端口): ")
+                    jq_write "$inbounds_file" --arg port "$new_port" \
+                       '(.inbounds[] | select(.type == "vless").listen_port) = ($port | tonumber)'
                     restart_singbox
                     allow_port $new_port/tcp > /dev/null 2>&1
                     sed -i -E 's#(vless://[^@]*@(\[[0-9a-fA-F:]+\]|[^:]*)):[0-9]+#\1:'"$new_port"'#' $client_dir
-                    base64 -w0 /etc/sing-box/url.txt > /etc/sing-box/sub.txt
-                    while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
+                    update_subscription
+                    print_client_urls
                     green "\nvless-reality端口已修改成：${purple}$new_port${re}\n"
                     ;;
                 2)
-                    reading "\n请输入hysteria2端口 (回车跳过将使用随机端口): " new_port
-                    if [ -z "$new_port" ]; then
-                        new_port=$(get_free_port 10000 65000)
-                    else
-                        until is_port_free "$new_port"; do
-                            echo -e "${red}端口 $new_port 已被占用${re}"
-                            reading "请输入hysteria2端口 (回车将使用随机端口): " new_port
-                            [ -z "$new_port" ] && { new_port=$(get_free_port 10000 65000); break; }
-                        done
-                    fi
-                    jq --arg port "$new_port" \
-                       '(.inbounds[] | select(.type == "hysteria2").listen_port) = ($port | tonumber)' \
-                       "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+                    new_port=$(prompt_free_port "\n请输入hysteria2端口 (回车跳过将使用随机端口): ")
+                    jq_write "$inbounds_file" --arg port "$new_port" \
+                       '(.inbounds[] | select(.type == "hysteria2").listen_port) = ($port | tonumber)'
                     restart_singbox
                     allow_port $new_port/udp > /dev/null 2>&1
                     sed -i -E 's#(hysteria2://[^@]*@(\[[0-9a-fA-F:]+\]|[^:]*)):[0-9]+#\1:'"$new_port"'#' $client_dir
-                    base64 -w0 $client_dir > /etc/sing-box/sub.txt
-                    while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
+                    update_subscription
+                    print_client_urls
                     green "\nhysteria2端口已修改为：${purple}${new_port}${re}\n"
                     ;;
                 3)
-                    reading "\n请输入tuic端口 (回车跳过将使用随机端口): " new_port
-                    if [ -z "$new_port" ]; then
-                        new_port=$(get_free_port 10000 65000)
-                    else
-                        until is_port_free "$new_port"; do
-                            echo -e "${red}端口 $new_port 已被占用${re}"
-                            reading "请输入tuic端口 (回车将使用随机端口): " new_port
-                            [ -z "$new_port" ] && { new_port=$(get_free_port 10000 65000); break; }
-                        done
-                    fi
-                    jq --arg port "$new_port" \
-                       '(.inbounds[] | select(.type == "tuic").listen_port) = ($port | tonumber)' \
-                       "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+                    new_port=$(prompt_free_port "\n请输入tuic端口 (回车跳过将使用随机端口): ")
+                    jq_write "$inbounds_file" --arg port "$new_port" \
+                       '(.inbounds[] | select(.type == "tuic").listen_port) = ($port | tonumber)'
                     restart_singbox
                     allow_port $new_port/udp > /dev/null 2>&1
                     sed -i -E 's#(tuic://[^@]*@(\[[0-9a-fA-F:]+\]|[^:]*)):[0-9]+#\1:'"$new_port"'#' $client_dir
-                    base64 -w0 $client_dir > /etc/sing-box/sub.txt
-                    while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
+                    update_subscription
+                    print_client_urls
                     green "\ntuic端口已修改为：${purple}${new_port}${re}\n"
                     ;;
                 4)
-                    reading "\n请输入vmess-argo端口 (回车跳过将使用随机端口): " new_port
-                    if [ -z "$new_port" ]; then
-                        new_port=$(get_free_port 10000 65000)
-                    else
-                        until is_port_free "$new_port"; do
-                            echo -e "${red}端口 $new_port 已被占用${re}"
-                            reading "请输入vmess-argo端口 (回车将使用随机端口): " new_port
-                            [ -z "$new_port" ] && { new_port=$(get_free_port 10000 65000); break; }
-                        done
-                    fi
-                    jq --arg port "$new_port" \
-                       '(.inbounds[] | select(.type == "vmess").listen_port) = ($port | tonumber)' \
-                       "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+                    new_port=$(prompt_free_port "\n请输入vmess-argo端口 (回车跳过将使用随机端口): ")
+                    jq_write "$inbounds_file" --arg port "$new_port" \
+                       '(.inbounds[] | select(.type == "vmess").listen_port) = ($port | tonumber)'
                     allow_port $new_port/tcp > /dev/null 2>&1
                     if command_exists rc-service; then
                         grep -q "localhost:" /etc/init.d/argo && \
@@ -1831,10 +1871,9 @@ change_config() {
         2)
             reading "\n请输入新的UUID(直接回车随机生成UUID): " new_uuid
             [ -z "$new_uuid" ] && new_uuid=$(cat /proc/sys/kernel/random/uuid)
-            jq --arg uuid "$new_uuid" \
+            jq_write "${conf_dir}/inbounds.json" --arg uuid "$new_uuid" \
                '(.inbounds[] | select(.users != null) | .users[] | select(.uuid != null).uuid) = $uuid |
-                (.inbounds[] | select(.users != null) | .users[] | select(.password != null).password) = $uuid' \
-               "${conf_dir}/inbounds.json" > "${conf_dir}/inbounds.json.tmp" && mv "${conf_dir}/inbounds.json.tmp" "${conf_dir}/inbounds.json"
+                (.inbounds[] | select(.users != null) | .users[] | select(.password != null).password) = $uuid'
             restart_singbox
             sed -i -E 's/(vless:\/\/|hysteria2:\/\/|anytls:\/\/)[^@]*(@.*)/\1'"$new_uuid"'\2/' $client_dir
             sed -i -E "s#tuic://[0-9a-f-]{36}:[0-9a-f-]{36}@#tuic://$new_uuid:$new_uuid@#g" $client_dir
@@ -1843,8 +1882,8 @@ change_config() {
             VMESS="{ \"v\": \"2\", \"ps\": \"${isp}-VMess-Argo\", \"add\": \"${CFIP}\", \"port\": \"443\", \"id\": \"${new_uuid}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"\", \"allowInsecure\": \"false\"}"
             encoded_vmess=$(echo "$VMESS" | base64 -w0)
             sed -i -E '/vmess:\/\//{s@vmess://.*@vmess://'"$encoded_vmess"'@}' $client_dir
-            base64 -w0 $client_dir > /etc/sing-box/sub.txt
-            while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
+            update_subscription
+            print_client_urls
             green "\nUUID已修改为：${purple}${new_uuid}${re}\n"
             ;;
         3)
@@ -1858,14 +1897,13 @@ change_config() {
                 "4") new_sni="www.cerebrium.ai" ;;
                 "5") new_sni="www.nazhumi.com" ;;
             esac
-            jq --arg sni "$new_sni" \
+            jq_write "${conf_dir}/inbounds.json" --arg sni "$new_sni" \
                '(.inbounds[] | select(.type == "vless") | .tls.server_name) = $sni |
-                (.inbounds[] | select(.type == "vless") | .tls.reality.handshake.server) = $sni' \
-               "${conf_dir}/inbounds.json" > "${conf_dir}/inbounds.json.tmp" && mv "${conf_dir}/inbounds.json.tmp" "${conf_dir}/inbounds.json"
+                (.inbounds[] | select(.type == "vless") | .tls.reality.handshake.server) = $sni'
             restart_singbox
             sed -i "s/\(vless:\/\/[^\?]*\?\([^\&]*\&\)*sni=\)[^&]*/\1$new_sni/" $client_dir
-            base64 -w0 $client_dir > /etc/sing-box/sub.txt
-            while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
+            update_subscription
+            print_client_urls
             green "\nReality sni已修改为：${purple}${new_sni}${re}\n"
             ;;
         4)
@@ -1908,8 +1946,8 @@ IEOF
             isp=$(get_isp || echo "$(hostname)")
             sed -i.bak "/hysteria2:/d" $client_dir
             sed -i "${line_number}i hysteria2://$uuid@$ip:$listen_port?peer=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none&mport=$listen_port,$min_port-$max_port#$isp-Hysteria2" $client_dir
-            base64 -w0 $client_dir > /etc/sing-box/sub.txt
-            while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
+            update_subscription
+            print_client_urls
             green "\nhysteria2端口跳跃已开启：${purple}$min_port-$max_port${re}\n"
             ;;
         5)
@@ -1924,7 +1962,7 @@ IEOF
                 command -v ip6tables &> /dev/null && service ip6tables save > /dev/null 2>&1
             fi
             sed -i '/hysteria2/s/&mport=[^#&]*//g' /etc/sing-box/url.txt
-            base64 -w0 $client_dir > /etc/sing-box/sub.txt
+            update_subscription
             green "\n端口跳跃已删除\n"
             ;;
         6) change_cfip ;;
@@ -1950,7 +1988,7 @@ IEOF
             else
                 yellow "\n当前已是ipv4, 无需切换\n" && return 0
             fi
-            base64 -w 0 "$client_dir" > "${work_dir}/sub.txt" 2>/dev/null || base64 "$client_dir" | tr -d '\n' > "${work_dir}/sub.txt"
+            update_subscription
            ;;
         8) 
             local new_ipv6
@@ -1974,7 +2012,7 @@ IEOF
             else
                 yellow "\n当前已是ipv6, 无需切换\n" && return 0
             fi
-            base64 -w 0 "$client_dir" > "${work_dir}/sub.txt" 2>/dev/null || base64 "$client_dir" | tr -d '\n' > "${work_dir}/sub.txt"
+            update_subscription
            ;;
         0) menu ;;
         *) red "无效的选项！\n" ;;
@@ -2129,7 +2167,7 @@ change_argo_domain() {
     new_vmess_url="${vmess_prefix}${encoded_updated_vmess}"
     new_content=$(echo "$content" | sed "s|$vmess_url|$new_vmess_url|")
     echo "$new_content" > "$client_dir"
-    base64 -w0 ${work_dir}/url.txt > ${work_dir}/sub.txt
+    update_subscription
     green "vmess节点已更新\n"
     purple "$new_vmess_url\n"
 }
@@ -2150,7 +2188,7 @@ check_nodes() {
     done < "${work_dir}/url.txt"
 
     yellow "\n温馨提醒: 如果hysteria2或tuic不通，请尝试将节点里的 "跳过证书验证" 设置为 "true" 或切换内核\n"
-    base64 -w0 "${work_dir}/url.txt" > "${work_dir}/sub.txt" 2>/dev/null
+    update_subscription
     green "以上节点链接可直接复制导入客户端。"
     green "base64订阅内容已保存到: ${purple}${work_dir}/sub.txt${re}，如需以订阅方式导入，可复制该文件内容粘贴到客户端。\n"
 }
@@ -2187,7 +2225,7 @@ change_cfip() {
     new_vmess_url="vmess://$new_encoded_part"
     new_content=$(echo "$content" | sed "s|$vmess_url|$new_vmess_url|")
     echo "$new_content" > "$client_dir"
-    base64 -w0 "${work_dir}/url.txt" > "${work_dir}/sub.txt"
+    update_subscription
     green "\nvmess节点优选域名已更新为：${purple}${cfip}:${cfport}${re}\n"
     purple "$new_vmess_url\n"
 }
@@ -2222,12 +2260,12 @@ test_warp_connectivity() {
     if jq -e --argjson p "$test_port" '.inbounds[] | select(.type=="socks" and .listen_port==$p)' "$inbounds_file" >/dev/null 2>&1; then
         had_socks=1
     else
-        jq --argjson p "$test_port" '.inbounds += [{
+        jq_write "$inbounds_file" --argjson p "$test_port" '.inbounds += [{
             "type": "socks",
             "tag": "socks-warptest",
             "listen": "127.0.0.1",
             "listen_port": $p
-        }]' "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+        }]'
     fi
 
     # 临时全局 WARP（保留 sniff，避免域名类检测异常）
@@ -2442,9 +2480,8 @@ custom_rule_menu() {
     local domains_json
     domains_json=$(printf '%s\n' "${domains[@]}" | jq -R . | jq -s .)
 
-    jq --arg tag "$custom_tag" --argjson domains "$domains_json" \
-        '.route.rule_set += [{"tag": $tag, "type": "inline", "rules": [{"domain_suffix": $domains}]}]' \
-        "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    jq_write "$route_file" --arg tag "$custom_tag" --argjson domains "$domains_json" \
+        '.route.rule_set += [{"tag": $tag, "type": "inline", "rules": [{"domain_suffix": $domains}]}]'
 
     green "\n已创建自定义分流规则 '${custom_tag}'，包含域名: ${domains[*]}\n"
 
@@ -2468,7 +2505,7 @@ finalize_rule_add() {
 
     # 清理旧版空哨兵规则 {"rule_set": []}，同时确保首位始终有 sniff
     # （旧逻辑依赖 length==1 的空 rule_set，加了 sniff 后必须改写，否则会把规则清空导致节点全挂）
-    jq '
+    jq_write "$route_file" '
       .route.rules = (
         [{"action":"sniff"}]
         + [
@@ -2482,7 +2519,7 @@ finalize_rule_add() {
               )
           ]
       )
-    ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    '
 
     local out_tags=($(jq -r '.outbounds[] | select(.tag != "direct") | .tag' "$outbound_file" 2>/dev/null))
     if [ ${#out_tags[@]} -eq 0 ]; then
@@ -2513,8 +2550,7 @@ finalize_rule_add() {
         tags_to_add=("telegram" "telegram-ip")
         # 确保 rule_set 定义里已有 telegram-ip（旧配置可能缺失）
         if ! jq -e '.route.rule_set[]? | select(.tag == "telegram-ip")' "$route_file" >/dev/null 2>&1; then
-            jq '.route.rule_set += [{"tag":"telegram-ip","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/telegram.srs","download_detour":"direct"}]' \
-                "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+            jq_write "$route_file" '.route.rule_set += [{"tag":"telegram-ip","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/telegram.srs","download_detour":"direct"}]'
         fi
     fi
 
@@ -2526,7 +2562,7 @@ finalize_rule_add() {
             continue
         fi
         # 始终保持 sniff 在第一位；分流规则追加在其后
-        jq --arg tag "$tag" --arg out "$selected_out" '
+        jq_write "$route_file" --arg tag "$tag" --arg out "$selected_out" '
             .route.rules = (
               [{"action":"sniff"}]
               + (
@@ -2538,7 +2574,7 @@ finalize_rule_add() {
                     end
                 )
             )
-        ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+        '
     done
 
     restart_singbox
@@ -2581,8 +2617,7 @@ set_global_outbound() {
     local selected_out="${proxy_tags[$((out_choice-1))]}"
 
     # 从 outbounds.json 中删除 direct 出站，防止流量绕过代理
-    jq 'del(.outbounds[] | select(.tag == "direct"))' \
-        "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+    jq_write "$outbound_file" 'del(.outbounds[] | select(.tag == "direct"))'
     # 仅清空路由规则，保留 endpoints（WARP 密钥），避免丢失独立注册配置
     rm -f "${route_file}"
     restart_singbox
@@ -2606,8 +2641,7 @@ restore_direct_outbound() {
         local heal_dns
         heal_dns=$(awk '/^nameserver[ \t]+/{print $2; exit}' /etc/resolv.conf 2>/dev/null)
         [ -z "$heal_dns" ] && heal_dns="1.1.1.1"
-        jq --arg s "$heal_dns" '.dns.servers = [{"tag":"sys","type":"udp","server":$s}] + .dns.servers' \
-            "${conf_dir}/dns.json" > "${conf_dir}/dns.json.tmp" && mv "${conf_dir}/dns.json.tmp" "${conf_dir}/dns.json"
+        jq_write "${conf_dir}/dns.json" --arg s "$heal_dns" '.dns.servers = [{"tag":"sys","type":"udp","server":$s}] + .dns.servers'
     fi
 
     # 重新判断一次网络环境是否复杂（网络拓扑可能在装完sing-box后才变化，
@@ -2620,8 +2654,7 @@ restore_direct_outbound() {
 
     # 恢复 outbounds.json 中的 direct 出站（不存在则插入到数组最前面）
     if ! jq -e '.outbounds[] | select(.tag == "direct")' "$outbound_file" > /dev/null 2>&1; then
-        jq '.outbounds = [{"type": "direct", "tag": "direct"}] + .outbounds' \
-            "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+        jq_write "$outbound_file" '.outbounds = [{"type": "direct", "tag": "direct"}] + .outbounds'
     fi
 
     # 恢复默认 route.json
@@ -2679,7 +2712,7 @@ delete_rule_menu() {
     fi
     for t in "${tags_to_del[@]}"; do
         # 删除指定 rule_set 标签后，始终保留首位 sniff，并去掉空 rule_set 规则
-        jq --arg tag "$t" '
+        jq_write "$route_file" --arg tag "$t" '
           .route.rules = (
             [{"action":"sniff"}]
             + [
@@ -2695,13 +2728,12 @@ delete_rule_menu() {
                   )
               ]
           )
-        ' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+        '
 
         # 自定义分流规则（type=inline）为一次性专属定义，删除引用后一并移除定义，
         # 避免名称被占用导致无法重新创建；内置服务的远程 rule_set 为共享定义，保留不动。
         if jq -e --arg tag "$t" '.route.rule_set[]? | select(.tag == $tag and .type == "inline")' "$route_file" >/dev/null 2>&1; then
-            jq --arg tag "$t" '.route.rule_set = [.route.rule_set[] | select(.tag != $tag)]' \
-                "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+            jq_write "$route_file" --arg tag "$t" '.route.rule_set = [.route.rule_set[] | select(.tag != $tag)]'
         fi
     done
     restart_singbox
@@ -2833,21 +2865,18 @@ add_socks5_proxy() {
 
     # 根据出站类型和是否有账号密码，决定写入字段，避免空字符串导致 sing-box 报错
     if [ "$outbound_type" = "shadowsocks" ]; then
-        jq --arg tag "$tag" --arg server "$server" --arg port "$port" \
+        jq_write "$outbound_file" --arg tag "$tag" --arg server "$server" --arg port "$port" \
            --arg method "$method" --arg password "$password" \
-           '.outbounds += [{"type":"shadowsocks","tag":$tag,"server":$server,"server_port":($port|tonumber),"method":$method,"password":$password}]' \
-           "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+           '.outbounds += [{"type":"shadowsocks","tag":$tag,"server":$server,"server_port":($port|tonumber),"method":$method,"password":$password}]'
     elif [ -n "$user" ] && [ -n "$password" ]; then
-        jq --arg type "$outbound_type" --arg tag "$tag" --arg server "$server" \
+        jq_write "$outbound_file" --arg type "$outbound_type" --arg tag "$tag" --arg server "$server" \
            --arg port "$port" --arg user "$user" --arg password "$password" \
-           '.outbounds += [{"type":$type,"tag":$tag,"server":$server,"server_port":($port|tonumber),"username":$user,"password":$password}]' \
-           "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+           '.outbounds += [{"type":$type,"tag":$tag,"server":$server,"server_port":($port|tonumber),"username":$user,"password":$password}]'
     else
         # 无账号密码：不写 username/password 字段
-        jq --arg type "$outbound_type" --arg tag "$tag" --arg server "$server" \
+        jq_write "$outbound_file" --arg type "$outbound_type" --arg tag "$tag" --arg server "$server" \
            --arg port "$port" \
-           '.outbounds += [{"type":$type,"tag":$tag,"server":$server,"server_port":($port|tonumber)}]' \
-           "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+           '.outbounds += [{"type":$type,"tag":$tag,"server":$server,"server_port":($port|tonumber)}]'
     fi
 
     # 注意：新增代理出站不应自动接管已有的分流规则，
@@ -2876,8 +2905,8 @@ delete_socks5_proxy() {
     fi
     [ "$tag" == "wireguard-out" ] && { red "wireguard-out 为系统内置，不可删除！"; sleep 2; return; }
 
-    jq --arg tag "$tag" 'del(.outbounds[] | select(.tag == $tag))' "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
-    jq --arg tag "$tag" '.route.rules = [.route.rules[] | select(.outbound != $tag)]' "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+    jq_write "$outbound_file" --arg tag "$tag" 'del(.outbounds[] | select(.tag == $tag))'
+    jq_write "$route_file" --arg tag "$tag" '.route.rules = [.route.rules[] | select(.outbound != $tag)]'
 
     restart_singbox
     green "${tag} 代理出站已删除。"
@@ -2902,9 +2931,8 @@ remove_url_by_tag() {
 }
 
 update_sub() {
-    local sub_file="${work_dir}/sub.txt"
-    base64_content=$(cat "$client_dir" | base64 | tr -d '\n\r')
-    echo "$base64_content" > "$sub_file"
+    # 兼容旧调用名，统一走 update_subscription
+    update_subscription
 }
 
 # ---- Socks5 入站 ----
@@ -2920,24 +2948,7 @@ add_socks5_inbound() {
     local current_uuid
     current_uuid=$(get_current_uuid | tr -d '\n\r')
 
-    # 端口输入验证循环
-    while true; do
-        reading "请输入 Socks5 监听端口 (回车随机生成): " sk_port
-        if [ -z "$sk_port" ]; then
-            sk_port=$(shuf -i 10000-65000 -n 1)
-            green "socks5监听端口：${purple}${sk_port}${re}"
-            break
-        fi
-        
-        # 统一验证端口格式和范围
-        if [[ ! "$sk_port" =~ ^[0-9]+$ ]] || [ "$sk_port" -gt 65535 ] || [ "$sk_port" -lt 1 ]; then
-            yellow "错误：端口必须是1-65535之间的数字！"
-            continue
-        fi
-        
-        green "socks5监听端口：${purple}${sk_port}${re}"
-        break
-    done
+    sk_port=$(prompt_port_or_random "请输入 Socks5 监听端口 (回车随机生成): " "socks5监听端口")
 
     reading "请输入 Socks5 用户名 (回车自动使用UUID前8位): " sk_user
     if [ -n "$sk_user" ]; then
@@ -2967,7 +2978,7 @@ add_socks5_inbound() {
         fi
     fi
 
-    jq --arg tag "$tag" \
+    jq_write "$inbounds_file" --arg tag "$tag" \
        --argjson port "$sk_port" \
        --arg user "$sk_user" \
        --arg pass "$sk_pass" \
@@ -2977,7 +2988,7 @@ add_socks5_inbound() {
            "listen": "::",
            "listen_port": $port,
            "users": [{"username": $user, "password": $pass}]
-       }]' "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+       }]'
 
     allow_port ${sk_port}/tcp ${sk_port}/udp > /dev/null 2>&1
 
@@ -3009,8 +3020,7 @@ remove_socks5_inbound() {
         yellow "Socks5 协议未添加，无需删除。"; sleep 1; return
     fi
 
-    jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' \
-        "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+    jq_write "$inbounds_file" --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))'
 
     remove_url_by_tag "socks"
     update_sub
@@ -3034,26 +3044,9 @@ add_anytls() {
         red "无法获取当前UUID，请确认 sing-box 已正确安装并配置。"; sleep 2; return
     fi
 
-    # 端口输入验证循环
-    while true; do
-        reading "请输入 AnyTLS 监听端口 (回车随机生成): " at_port
-        
-        if [ -z "$at_port" ]; then
-            at_port=$(shuf -i 10000-65000 -n 1)
-            green "Anytls监听端口：${purple}${at_port}${re}"
-            break
-        fi
-        
-        if [[ ! "$at_port" =~ ^[0-9]+$ ]] || [ "$at_port" -gt 65535 ] || [ "$at_port" -lt 1 ]; then
-            yellow "错误：端口必须是1-65535之间的数字！"
-            continue
-        fi
-        
-        green "Anytls监听端口：${purple}${at_port}${re}"
-        break
-    done
+    at_port=$(prompt_port_or_random "请输入 AnyTLS 监听端口 (回车随机生成): " "Anytls监听端口")
 
-    jq --arg tag "$tag" \
+    jq_write "$inbounds_file" --arg tag "$tag" \
        --argjson port "$at_port" \
        --arg pass "$current_uuid" \
        --arg cert "${work_dir}/cert.pem" \
@@ -3069,7 +3062,7 @@ add_anytls() {
                "certificate_path": $cert,
                "key_path": $key
            }
-       }]' "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+       }]'
 
     allow_port ${at_port}/tcp > /dev/null 2>&1
 
@@ -3101,8 +3094,7 @@ remove_anytls() {
         yellow "AnyTLS 协议未添加，无需删除。"; sleep 1; return
     fi
 
-    jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' \
-        "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+    jq_write "$inbounds_file" --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))'
 
     remove_url_by_tag "anytls"
     update_sub
@@ -3119,24 +3111,7 @@ add_ss2022() {
         yellow "Shadowsocks-2022 协议已存在，无需重复添加。"; sleep 1; return
     fi
 
-    # 端口输入验证循环
-    while true; do
-        reading "请输入 Shadowsocks-2022 监听端口 (回车随机生成): " ss_port
-        
-        if [ -z "$ss_port" ]; then
-            ss_port=$(shuf -i 10000-65000 -n 1)
-            green "Shadowsocks-2022监听端口：${purple}${ss_port}${re}"
-            break
-        fi
-        
-        if [[ ! "$ss_port" =~ ^[0-9]+$ ]] || [ "$ss_port" -gt 65535 ] || [ "$ss_port" -lt 1 ]; then
-            yellow "错误：端口必须是1-65535之间的数字！"
-            continue
-        fi
-        
-        green "Shadowsocks-2022监听端口：${purple}${ss_port}${re}"
-        break
-    done
+    ss_port=$(prompt_port_or_random "请输入 Shadowsocks-2022 监听端口 (回车随机生成): " "Shadowsocks-2022监听端口")
 
     echo ""
     green "请选择加密方式:"
@@ -3154,7 +3129,7 @@ add_ss2022() {
     local ss_key
     ss_key=$(dd if=/dev/urandom bs=1 count=${key_len} 2>/dev/null | base64 -w0)
     
-    jq --arg tag "$tag" \
+    jq_write "$inbounds_file" --arg tag "$tag" \
        --argjson port "$ss_port" \
        --arg method "$ss_method" \
        --arg key "$ss_key" \
@@ -3166,7 +3141,7 @@ add_ss2022() {
            "method": $method,
            "password": $key,
            "multiplex": {"enabled": true}
-       }]' "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+       }]'
 
     allow_port ${ss_port}/tcp ${ss_port}/udp > /dev/null 2>&1
 
@@ -3201,8 +3176,7 @@ remove_ss2022() {
         yellow "Shadowsocks-2022 协议未添加，无需删除。"; sleep 1; return
     fi
 
-    jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' \
-        "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
+    jq_write "$inbounds_file" --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))'
 
     remove_url_by_tag "ss"
     update_sub
@@ -3506,7 +3480,7 @@ apply_domain_cert() {
         sed -i -E "s#(hysteria2://[^?]*\?)sni=[^&]*&insecure=1&pinSHA256=[^&]*#\1sni=${domain}\&insecure=0#" "$client_dir"
         sed -i -E "s#(tuic://[^?]*\?)sni=[^&]*#\1sni=${domain}#" "$client_dir"
         sed -i -E "s#(tuic://[^#]*)allow_insecure=1#\1allow_insecure=0#" "$client_dir"
-        base64 -w0 "$client_dir" > "${work_dir}/sub.txt"
+        update_subscription
     fi
 
     green "\n域名证书申请成功！原bing.com自签证书已失效，hysteria2和tuic现已使用域名证书: ${purple}${domain}${re}"
@@ -3514,7 +3488,7 @@ apply_domain_cert() {
     yellow "acme.sh 已配置自动续期任务，到期前会自动续签证书并重启sing-box；"
     yellow "如果续期时80端口被其他服务占用，会自动临时停掉并在续期完成后恢复。\n"
     if [ -f "$client_dir" ]; then
-        while IFS= read -r line; do [ -n "$line" ] && yellow "$line"; done < "$client_dir"
+        print_client_urls
     fi
 }
 
@@ -3551,7 +3525,7 @@ restore_selfsigned_cert() {
         sed -i -E "s#(hysteria2://[^?]*\?)sni=[^&]*&insecure=0#\1sni=www.bing.com\&insecure=1\&pinSHA256=${fingerprint}#" "$client_dir"
         sed -i -E "s#(tuic://[^?]*\?)sni=[^&]*#\1sni=www.bing.com#" "$client_dir"
         sed -i -E "s#(tuic://[^#]*)allow_insecure=0#\1allow_insecure=1#" "$client_dir"
-        base64 -w0 "$client_dir" > "${work_dir}/sub.txt"
+        update_subscription
     fi
 
     green "\n已恢复为bing.com自签证书\n"
@@ -3641,18 +3615,16 @@ manage_outbound_strategy() {
         local heal_dns
         heal_dns=$(awk '/^nameserver[ \t]+/{print $2; exit}' /etc/resolv.conf 2>/dev/null)
         [ -z "$heal_dns" ] && heal_dns="1.1.1.1"
-        jq --arg s "$heal_dns" '.dns.servers = [{"tag":"sys","type":"udp","server":$s}] + .dns.servers' \
-            "$dns_file" > "${dns_file}.tmp" && mv "${dns_file}.tmp" "$dns_file"
+        jq_write "$dns_file" --arg s "$heal_dns" '.dns.servers = [{"tag":"sys","type":"udp","server":$s}] + .dns.servers'
     fi
 
     # 1. 更新 dns.json 中的默认策略（供dns模块内部解析使用）
-    jq --arg s "$new_strategy" '.dns.strategy = $s' "$dns_file" > "${dns_file}.tmp" && mv "${dns_file}.tmp" "$dns_file"
+    jq_write "$dns_file" --arg s "$new_strategy" '.dns.strategy = $s'
 
     # 2. 清理 direct 出站上可能残留的旧版 domain_strategy 字段
     #    （sing-box 1.12.0+ 已废弃该拨号字段写法，不清理会导致新内核 FATAL 拒绝启动）
     if [ -f "$outbound_file" ] && jq -e '.outbounds[] | select(.tag == "direct") | has("domain_strategy")' "$outbound_file" 2>/dev/null | grep -q true; then
-        jq '(.outbounds[] | select(.tag == "direct")) |= del(.domain_strategy)' \
-            "$outbound_file" > "${outbound_file}.tmp" && mv "${outbound_file}.tmp" "$outbound_file"
+        jq_write "$outbound_file" '(.outbounds[] | select(.tag == "direct")) |= del(.domain_strategy)'
     fi
 
     # 3. 更新 route.json 中的 default_domain_resolver（sing-box 1.11+ 的正式出站解析机制，未废弃）
@@ -3665,9 +3637,8 @@ manage_outbound_strategy() {
         cur_resolver_tag="sys"
     fi
     if [ -f "$route_file" ]; then
-        jq --arg s "$new_strategy" --arg srv "$cur_resolver_tag" \
-            '.route.default_domain_resolver = {"server": $srv, "strategy": $s}' \
-            "$route_file" > "${route_file}.tmp" && mv "${route_file}.tmp" "$route_file"
+        jq_write "$route_file" --arg s "$new_strategy" --arg srv "$cur_resolver_tag" \
+            '.route.default_domain_resolver = {"server": $srv, "strategy": $s}'
     fi
 
     restart_singbox
