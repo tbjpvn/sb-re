@@ -269,58 +269,84 @@ check_dualstack() {
     fi
 }
 
+# 包是否已安装（优先按包名查询，避免 coreutils 等与命令名不一致）
+pkg_installed() {
+    local pkg=$1
+    if command_exists dpkg-query; then
+        dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"
+    elif command_exists rpm; then
+        rpm -q "$pkg" >/dev/null 2>&1
+    elif command_exists apk; then
+        apk info -e "$pkg" >/dev/null 2>&1
+    else
+        command_exists "$pkg"
+    fi
+}
+
+# 本进程内软件源只刷新一次
+_SB_PKG_INDEX_READY=0
+_ensure_pkg_index() {
+    [ "${_SB_PKG_INDEX_READY}" = "1" ] && return 0
+    if command_exists apt; then
+        yellow "正在刷新软件源...\n"
+        DEBIAN_FRONTEND=noninteractive apt-get update -y || return 1
+    elif command_exists apk; then
+        yellow "正在刷新软件源...\n"
+        apk update || return 1
+    fi
+    _SB_PKG_INDEX_READY=1
+    return 0
+}
+
 manage_packages() {
     if [ $# -lt 2 ]; then
         red "Unspecified package name or action"
         return 1
     fi
 
-    action=$1
+    local action=$1
     shift
+    local package need_index=0
 
-    if [ "$action" == "install" ] && [ ! -d "$work_dir" ]; then
-        yellow "正在更新系统软件包...\n"
-        if command_exists apt; then
-            DEBIAN_FRONTEND=noninteractive apt update -y && DEBIAN_FRONTEND=noninteractive apt upgrade -y
-        elif command_exists dnf; then
-            dnf update -y
-        elif command_exists yum; then
-            yum update -y
-        elif command_exists apk; then
-            apk update && apk upgrade
-        else
-            yellow "Unknown system!\n"
+    if [ "$action" == "install" ]; then
+        for package in "$@"; do
+            if ! pkg_installed "$package" && ! command_exists "$package"; then
+                need_index=1
+                break
+            fi
+        done
+        if [ "$need_index" -eq 1 ]; then
+            _ensure_pkg_index || { red "刷新软件源失败"; return 1; }
         fi
-        green "finished updated system\n"
     fi
 
     for package in "$@"; do
         if [ "$action" == "install" ]; then
-            if command_exists "$package"; then
+            if pkg_installed "$package" || command_exists "$package"; then
                 green "${package} already installed"
                 continue
             fi
             yellow "正在安装 ${package}..."
             if command_exists apt; then
-                DEBIAN_FRONTEND=noninteractive apt install -y "$package"
+                DEBIAN_FRONTEND=noninteractive apt-get install -y "$package" || return 1
             elif command_exists dnf; then
-                dnf install -y "$package"
+                dnf install -y "$package" || return 1
             elif command_exists yum; then
-                yum install -y "$package"
+                yum install -y "$package" || return 1
             elif command_exists apk; then
-                apk add "$package"
+                apk add "$package" || return 1
             else
                 red "Unknown system!"
                 return 1
             fi
         elif [ "$action" == "uninstall" ]; then
-            if ! command_exists "$package"; then
+            if ! pkg_installed "$package" && ! command_exists "$package"; then
                 yellow "${package} is not installed"
                 continue
             fi
             yellow "正在卸载 ${package}..."
             if command_exists apt; then
-                apt remove -y "$package" && apt autoremove -y
+                apt-get remove -y "$package" && apt-get autoremove -y
             elif command_exists dnf; then
                 dnf remove -y "$package" && dnf autoremove -y
             elif command_exists yum; then
@@ -339,6 +365,29 @@ manage_packages() {
 
     return 0
 }
+
+# 安装入口一次装齐核心依赖（体积小）；WARP/证书等扩展仍按需安装
+ensure_core_deps() {
+    if [ "${_SB_CORE_DEPS_OK}" = "1" ]; then
+        return 0
+    fi
+    yellow "检查并安装核心依赖...\n"
+    local pkgs=(curl jq tar openssl ca-certificates)
+    manage_packages install "${pkgs[@]}" || return 1
+    manage_packages install lsof 2>/dev/null || true
+    local req
+    for req in curl jq tar openssl; do
+        if ! command_exists "$req"; then
+            red "核心依赖 ${req} 不可用，请手动安装后重试\n"
+            return 1
+        fi
+    done
+    _SB_CORE_DEPS_OK=1
+    green "核心依赖已就绪\n"
+    return 0
+}
+
+
 
 get_realip() {
     local cached ip v6 org
@@ -1697,7 +1746,7 @@ auto_install() {
     fi
 
     green "开始无交互式安装 sing-box..."
-    manage_packages install jq tar openssl lsof coreutils || { red "依赖安装失败"; exit 1; }
+    ensure_core_deps || { red "依赖安装失败"; exit 1; }
     install_singbox
 
     if command_exists systemctl; then
@@ -1705,7 +1754,7 @@ auto_install() {
     elif command_exists rc-update; then
         alpine_openrc_services
         change_hosts
-        rc-service sing-box restart
+        restart_singbox
         rc-service argo restart
     else
         red "不支持的 init 系统，安装中止。"
@@ -3367,8 +3416,15 @@ apply_domain_cert() {
         sleep 2; return
     fi
 
-    local reload_cmd="systemctl restart sing-box"
-    command_exists rc-service && reload_cmd="rc-service sing-box restart"
+    # 证书更新后重载 sing-box（优先 reload，失败再 restart）；不碰 argo
+    local reload_cmd
+    if command_exists systemctl; then
+        reload_cmd="systemctl reload sing-box || systemctl restart sing-box"
+    elif command_exists rc-service; then
+        reload_cmd="rc-service sing-box restart"
+    else
+        reload_cmd="true"
+    fi
 
     "$acme" --install-cert -d "$domain" --ecc \
         --key-file "${work_dir}/private.key" \
@@ -3834,14 +3890,14 @@ case "$1" in
                     if [ ${singbox_check} -eq 0 ]; then
                         yellow "sing-box 已经安装！\n"
                     else
-                        manage_packages install jq tar openssl lsof coreutils
+                        ensure_core_deps || { red "依赖安装失败"; continue; }
                         install_singbox
                         if command_exists systemctl; then
                             main_systemd_services
                         elif command_exists rc-update; then
                             alpine_openrc_services
                             change_hosts
-                            rc-service sing-box restart
+                            restart_singbox
                             rc-service argo restart
                         else
                             echo "Unsupported init system"; exit 1
