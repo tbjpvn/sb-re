@@ -244,6 +244,11 @@ _sb_cache_set() {
     } > "${_SB_IP_CACHE_DIR}/${key}" 2>/dev/null || true
 }
 
+# 出口变化时清空缓存（加装/删除系统级 WARP 后主菜单 IP 才准确）
+_sb_cache_clear() {
+    rm -f "${_SB_IP_CACHE_DIR}/realip" "${_SB_IP_CACHE_DIR}/isp" "${_SB_IP_CACHE_DIR}/dualstack" 2>/dev/null || true
+}
+
 check_dualstack() {
     local ip4 ip6 tmp4 tmp6 cached
     if cached=$(_sb_cache_get dualstack); then
@@ -1112,11 +1117,13 @@ sys_warp_add() {
             red "\n已尝试全部候选端口(2408/500/4500/1701)均未收到Cloudflare回包，当前网络很可能封锁了出站UDP，WARP出站暂时无法使用\n"
             yellow "接口配置已保留在 ${sys_warp_dir}/${iface}.conf，网络环境变化后可重新进入本菜单覆盖重试\n"
             sys_warp_enable_boot "$iface"
+            _sb_cache_clear
             return 1
         fi
     fi
 
     sys_warp_enable_boot "$iface"
+    _sb_cache_clear
 
     green "\n✅ WARP 出站已加装成功！接口: ${purple}${iface}${re}，已设置开机自启\n"
     if [ "$family" = "4" ]; then
@@ -1135,6 +1142,7 @@ sys_warp_remove() {
     local family="$1" iface
     iface=$(sys_warp_iface "$family")
     wg-quick down "$iface" &>/dev/null || true
+    ip link del "$iface" 2>/dev/null || true
     sys_warp_disable_boot "$iface"
     if [ -f "${sys_warp_dir}/${iface}.conf" ]; then
         rm -f "${sys_warp_dir}/${iface}.conf"
@@ -1142,6 +1150,7 @@ sys_warp_remove() {
     else
         yellow "${iface} 未安装，无需删除\n"
     fi
+    _sb_cache_clear
 }
 
 sys_warp_delete_menu() {
