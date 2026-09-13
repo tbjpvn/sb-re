@@ -2562,13 +2562,24 @@ finalize_rule_add() {
         for i in "${!out_tags[@]}"; do
             echo -e "  ${green}$((i+1)). ${skyblue}${out_tags[$i]}${re}"
         done
+        yellow "  直接回车: 使用 WARP (wireguard-out)"
+        echo -e "  ${red}0. 返回上级菜单${re}"
         reading "请输入编号: " out_choice
-        if [[ ! "$out_choice" =~ ^[0-9]+$ ]] || \
+        if [ -z "$out_choice" ]; then
+            if ! ensure_warp_endpoint; then
+                red "WARP 出站不可用，本次分流设置已取消，请检查网络后重试。"
+                sleep 2; warp_manage; return
+            fi
+            selected_out="wireguard-out"
+        elif [ "$out_choice" = "0" ]; then
+            yellow "已取消"; sleep 1; warp_manage; return
+        elif [[ ! "$out_choice" =~ ^[0-9]+$ ]] || \
            [ "$out_choice" -lt 1 ] || \
            [ "$out_choice" -gt "${#out_tags[@]}" ]; then
             red "无效选择"; sleep 1; warp_manage; return
+        else
+            selected_out="${out_tags[$((out_choice-1))]}"
         fi
-        selected_out="${out_tags[$((out_choice-1))]}"
     fi
 
     # telegram 同时启用 geosite + geoip
