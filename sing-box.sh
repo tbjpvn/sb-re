@@ -2558,11 +2558,10 @@ finalize_rule_add() {
         yellow "未找到其他出站，将自动使用 wireguard-out。"
     else
         echo ""
-        green "请选择分流流量要走的出站:"
+        green "请选择分流流量要走的出站:(直接回车使用warp分流)"
         for i in "${!out_tags[@]}"; do
             echo -e "  ${green}$((i+1)). ${skyblue}${out_tags[$i]}${re}"
         done
-        yellow "  直接回车: 使用 WARP (wireguard-out)"
         echo -e "  ${red}0. 返回上级菜单${re}"
         reading "请输入编号: " out_choice
         if [ -z "$out_choice" ]; then
