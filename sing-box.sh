@@ -3854,7 +3854,7 @@ menu() {
     green "10. 出站IPv4/IPv6优先级"
     green "11. sing-box内核查看/更新"
     green "12. 单栈VPS加装WARP全局出站"
-    green "13. 切换为BBR+fq拥塞控制"
+    green "13. 切换为 BBR+fq 拥塞控制"
     echo "==============="
     purple "20. ssh综合工具箱"
     echo "==============="
