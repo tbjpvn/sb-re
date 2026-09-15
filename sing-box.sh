@@ -48,7 +48,7 @@ is_port_free() {
 
 get_free_port() {
     local min=$1 max=$2 tries=0 port
-    while [ $tries -lt 200 ]; do
+    while [ "$tries" -lt 200 ]; do
         port=$(shuf -i "${min}-${max}" -n 1)
         if is_port_free "$port"; then
             echo "$port"
@@ -594,7 +594,7 @@ warp_probe_endpoint() {
                 fi
                 ip link set "$iface" up 2>/dev/null || true
                 ping -c 1 -W 1 -I "$iface" 1.1.1.1 >/dev/null 2>&1 || true
-                while [ $tries -lt 5 ]; do
+                while [ "$tries" -lt 5 ]; do
                     hs=$(wg show "$iface" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
                     if [ -n "$hs" ] && [ "$hs" != "0" ]; then
                         result=0
@@ -732,7 +732,7 @@ generate_warp_endpoint() {
     # 注册成功必须以拿到 v4 地址为准，禁用假地址兜底
     # 为准。之前用 `.config.interface.addresses.v4 // .config.client_id` 做判断，
     local try=0 max_try=5
-    while [ $try -lt $max_try ]; do
+    while [ "$try" -lt "$max_try" ]; do
         try=$((try + 1))
         reg_response=$(curl "$curl_family" -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
             -H "Content-Type: application/json" \
@@ -929,7 +929,7 @@ cf_warp_register() {
 
     # 注册成功必须以拿到 v4 地址为准，禁用假地址兜底
     # 不能用 client_id 兜底判断成功——client_id 几乎总是存在，会导致漏掉"注册回包
-    while [ $try -lt 5 ]; do
+    while [ "$try" -lt 5 ]; do
         try=$((try + 1))
         reg_response=$(curl "$curl_family" -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
             -H "Content-Type: application/json" \
@@ -1039,7 +1039,7 @@ sys_warp_status() {
 # 而不是只看wg-quick命令有没有报错——部分VPS/机房会过滤某些UDP端口，
 sys_warp_verify_handshake() {
     local iface="$1" tries=0 rx
-    while [ $tries -lt 5 ]; do
+    while [ "$tries" -lt 5 ]; do
         rx=$(wg show "$iface" transfer 2>/dev/null | awk '{print $2}')
         if [ -n "$rx" ] && [ "$rx" != "0" ]; then
             return 0
@@ -1818,7 +1818,7 @@ change_config() {
     local singbox_status=$(check_singbox 2>/dev/null)
     local singbox_installed=$?
 
-    if [ $singbox_installed -eq 2 ]; then
+    if [ "$singbox_installed" -eq 2 ]; then
         yellow "sing-box 尚未安装！"; sleep 1; menu; return
     fi
 
@@ -1962,16 +1962,16 @@ change_config() {
             yellow "你的结束端口为：$max_port\n"
             listen_port=$(jq -r '.inbounds[] | select(.type == "hysteria2").listen_port' "${conf_dir}/inbounds.json")
             iptables -t nat -A PREROUTING -p udp --dport $min_port:$max_port -j DNAT --to-destination :$listen_port > /dev/null
-            command -v ip6tables &> /dev/null && ip6tables -t nat -A PREROUTING -p udp --dport $min_port:$max_port -j DNAT --to-destination :$listen_port > /dev/null
+            command_exists ip6tables && ip6tables -t nat -A PREROUTING -p udp --dport $min_port:$max_port -j DNAT --to-destination :$listen_port > /dev/null
             if command_exists rc-service 2>/dev/null; then
                 iptables-save > /etc/iptables/rules.v4
-                command -v ip6tables &> /dev/null && ip6tables-save > /etc/iptables/rules.v6
+                command_exists ip6tables && ip6tables-save > /etc/iptables/rules.v6
                 cat << 'IEOF' > /etc/init.d/iptables
 #!/sbin/openrc-run
 depend() { need net; }
 start() {
     [ -f /etc/iptables/rules.v4 ] && iptables-restore < /etc/iptables/rules.v4
-    command -v ip6tables &> /dev/null && [ -f /etc/iptables/rules.v6 ] && ip6tables-restore < /etc/iptables/rules.v6
+    command_exists ip6tables && [ -f /etc/iptables/rules.v6 ] && ip6tables-restore < /etc/iptables/rules.v6
 }
 IEOF
                 chmod +x /etc/init.d/iptables && rc-update add iptables default && /etc/init.d/iptables start
@@ -1981,7 +1981,7 @@ IEOF
             elif [ -f /etc/redhat-release ]; then
                 manage_packages install iptables-services > /dev/null 2>&1 && service iptables save > /dev/null 2>&1
                 systemctl enable iptables > /dev/null 2>&1 && systemctl start iptables > /dev/null 2>&1
-                command -v ip6tables &> /dev/null && service ip6tables save > /dev/null 2>&1
+                command_exists ip6tables && service ip6tables save > /dev/null 2>&1
                 systemctl enable ip6tables > /dev/null 2>&1 && systemctl start ip6tables > /dev/null 2>&1
             fi
             reload_singbox
@@ -1998,14 +1998,14 @@ IEOF
             ;;
         5)
             iptables -t nat -F PREROUTING > /dev/null 2>&1
-            command -v ip6tables &> /dev/null && ip6tables -t nat -F PREROUTING > /dev/null 2>&1
+            command_exists ip6tables && ip6tables -t nat -F PREROUTING > /dev/null 2>&1
             if command_exists rc-service 2>/dev/null; then
                 rc-update del iptables default && rm -rf /etc/init.d/iptables
             elif [ -f /etc/debian_version ]; then
                 netfilter-persistent save > /dev/null 2>&1
             elif [ -f /etc/redhat-release ]; then
                 service iptables save > /dev/null 2>&1
-                command -v ip6tables &> /dev/null && service ip6tables save > /dev/null 2>&1
+                command_exists ip6tables && service ip6tables save > /dev/null 2>&1
             fi
             sed -i '/hysteria2/s/&mport=[^#&]*//g' /etc/sing-box/url.txt
             update_subscription
@@ -3347,10 +3347,10 @@ write_port80_hooks() {
 STATE_FILE="/etc/sing-box/.port80_state"
 : > "$STATE_FILE"
 for svc in nginx apache2 httpd caddy reality-80; do
-    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$svc" 2>/dev/null; then
+    if command_exists systemctl && systemctl is-active --quiet "$svc" 2>/dev/null; then
         echo "systemctl:$svc" >> "$STATE_FILE"
         systemctl stop "$svc" >/dev/null 2>&1
-    elif command -v rc-service >/dev/null 2>&1 && rc-service "$svc" status 2>/dev/null | grep -q started; then
+    elif command_exists rc-service && rc-service "$svc" status 2>/dev/null | grep -q started; then
         echo "rc-service:$svc" >> "$STATE_FILE"
         rc-service "$svc" stop >/dev/null 2>&1
     fi
@@ -3438,7 +3438,7 @@ apply_domain_cert() {
     local issue_result=$?
     echo "$issue_log" | tail -20
 
-    if [ $issue_result -ne 0 ]; then
+    if [ "$issue_result" -ne 0 ]; then
         red "\n证书申请失败！以上是acme.sh的详细输出，请检查域名解析是否生效、80端口是否仍被占用。\n"
         sleep 2; return
     fi
@@ -3833,6 +3833,36 @@ EOF
     fi
 }
 
+# 主菜单"1.安装sing-box"分支，原为内联逻辑，抽出便于维护
+# 返回 0：已完成（含"已安装"提示这种什么都没做的情况），主循环按正常流程走 need_pause
+# 返回 1：依赖安装失败，主循环用 `do_install_singbox || continue` 跳过 need_pause 直接重绘菜单，
+#         与原来内联时 `continue` 的效果完全一致
+do_install_singbox() {
+    local singbox_check
+    check_singbox &>/dev/null; singbox_check=$?
+    if [ "${singbox_check}" -eq 0 ]; then
+        yellow "sing-box 已经安装！\n"
+        return 0
+    fi
+
+    ensure_core_deps || { red "依赖安装失败"; return 1; }
+    install_singbox
+    if command_exists systemctl; then
+        main_systemd_services
+    elif command_exists rc-update; then
+        alpine_openrc_services
+        change_hosts
+        restart_singbox
+        rc-service argo restart
+    else
+        echo "Unsupported init system"; exit 1
+    fi
+    verify_udp_listening
+    get_info
+    create_shortcut
+    return 0
+}
+
 menu() {
     singbox_status=$(check_singbox 2>/dev/null)
     dualstack_status=$(check_dualstack 2>/dev/null)
@@ -3912,28 +3942,7 @@ case "$1" in
             echo ""
             need_pause=true  
             case "${choice}" in
-                1)
-                    check_singbox &>/dev/null; singbox_check=$?
-                    if [ ${singbox_check} -eq 0 ]; then
-                        yellow "sing-box 已经安装！\n"
-                    else
-                        ensure_core_deps || { red "依赖安装失败"; continue; }
-                        install_singbox
-                        if command_exists systemctl; then
-                            main_systemd_services
-                        elif command_exists rc-update; then
-                            alpine_openrc_services
-                            change_hosts
-                            restart_singbox
-                            rc-service argo restart
-                        else
-                            echo "Unsupported init system"; exit 1
-                        fi
-                        verify_udp_listening
-                        get_info
-                        create_shortcut
-                    fi
-                    ;;
+                1)  do_install_singbox || continue ;;
                 2)  uninstall_singbox;  need_pause=false ;;
                 3)  manage_singbox;     need_pause=false ;;
                 4)  manage_argo;        need_pause=true ;;
