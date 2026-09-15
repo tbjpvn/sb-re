@@ -1344,6 +1344,21 @@ write_install_configs() {
     write_default_route_json "$resolver_tag" "$dns_strategy"
 }
 
+# 调大内核 UDP 收发缓冲区，避免默认值(通常仅约200KB)成为 hysteria2/tuic 等 QUIC 协议的吞吐瓶颈
+# 纯内核 socket 缓冲区调整，跟拥塞控制算法无关；对本机其他 UDP 服务无副作用，安装时自动应用一次
+# 参考: sing-box/hysteria2 官方性能优化文档
+tune_udp_buffers() {
+    local sysctl_conf="/etc/sysctl.d/99-singbox-udp-buffer.conf"
+    cat > "$sysctl_conf" << 'EOF'
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.rmem_default = 16777216
+net.core.wmem_default = 16777216
+net.core.netdev_max_backlog = 65536
+EOF
+    sysctl -p "$sysctl_conf" >/dev/null 2>&1 || true
+}
+
 install_singbox() {
     clear
     purple "正在安装sing-box中，请稍后..."
@@ -1449,6 +1464,7 @@ install_singbox() {
     fi
 
     allow_port $vless_port/tcp $tuic_port/udp $hy2_port/udp > /dev/null 2>&1 || true
+    tune_udp_buffers
 
     openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key" || { red "生成证书私钥失败"; exit 1; }
     openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
