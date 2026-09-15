@@ -1634,23 +1634,77 @@ stop_argo()      { manage_service "argo" "stop"; }
 restart_argo()   { manage_service "argo" "restart"; }
 
 # 卸载 sing-box（交互式）
+# 停止服务并删除单元文件
+stop_and_remove_services() {
+    if command_exists rc-service; then
+        rc-service sing-box stop >/dev/null 2>&1 || true
+        rc-service argo stop >/dev/null 2>&1 || true
+        rc-update del sing-box default >/dev/null 2>&1 || true
+        rc-update del argo default >/dev/null 2>&1 || true
+        rm -f /etc/init.d/sing-box /etc/init.d/argo
+    fi
+    if command_exists systemctl; then
+        systemctl stop sing-box >/dev/null 2>&1 || true
+        systemctl stop argo >/dev/null 2>&1 || true
+        systemctl disable sing-box >/dev/null 2>&1 || true
+        systemctl disable argo >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/argo.service
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl reset-failed sing-box >/dev/null 2>&1 || true
+        systemctl reset-failed argo >/dev/null 2>&1 || true
+    fi
+}
+
+# 清理脚本产生的残留（目录、快捷方式、缓存、BBR 配置等）
+cleanup_singbox_residuals() {
+    # 工作目录（二进制、配置、证书、日志、tunnel、订阅等）
+    rm -rf "${work_dir}" 2>/dev/null || true
+
+    # 快捷命令
+    rm -f /usr/bin/sb 2>/dev/null || true
+
+    # IP 探测缓存
+    rm -rf "${TMPDIR:-/tmp}/sb-ip-cache" 2>/dev/null || true
+
+    # 菜单 13 写入的 BBR+fq 持久配置
+    if [ -f /etc/sysctl.d/99-bbr-fq.conf ]; then
+        rm -f /etc/sysctl.d/99-bbr-fq.conf
+        sysctl --system >/dev/null 2>&1 || true
+    fi
+
+    # 端口跳跃时在 Alpine 上可能写入的自定义 iptables OpenRC 脚本（仅删除本脚本特征文件）
+    if [ -f /etc/init.d/iptables ] && grep -q 'iptables-restore < /etc/iptables/rules.v4' /etc/init.d/iptables 2>/dev/null; then
+        if command_exists rc-update; then
+            rc-update del iptables default >/dev/null 2>&1 || true
+        fi
+        rm -f /etc/init.d/iptables
+    fi
+}
+
+# 可选：清理本脚本申请的 acme.sh 域名证书
+cleanup_acme_if_needed() {
+    local domain="$1"
+    local acme="${HOME}/.acme.sh/acme.sh"
+    [ -n "$domain" ] && [ -f "$acme" ] || return 0
+    "$acme" --remove -d "$domain" --ecc >/dev/null 2>&1 || true
+    rm -rf "${HOME}/.acme.sh/${domain}_ecc" 2>/dev/null || true
+}
+
+# 卸载 sing-box（交互式）
 uninstall_singbox() {
     reading "确定要卸载 sing-box 吗? (y/n): " choice
     case "${choice}" in
         y|Y)
             yellow "正在卸载 sing-box"
-            if command_exists rc-service; then
-                rc-service sing-box stop; rc-service argo stop
-                rm -f /etc/init.d/sing-box /etc/init.d/argo
-                rc-update del sing-box default; rc-update del argo default
-            else
-                systemctl stop "${server_name}"; systemctl stop argo
-                systemctl disable "${server_name}"; systemctl disable argo
-                systemctl daemon-reload || true
-            fi
-            rm -rf "${work_dir}" || true
-            rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/argo.service
 
+            # 卸载前先记下域名证书，便于后续清理 acme
+            local cert_domain=""
+            [ -f "${work_dir}/cert_domain.txt" ] && cert_domain=$(cat "${work_dir}/cert_domain.txt" 2>/dev/null)
+
+            stop_and_remove_services
+            cleanup_singbox_residuals
+
+            # 系统级 WARP
             if [ -f "${sys_warp_dir}/$(sys_warp_iface 4).conf" ] || [ -f "${sys_warp_dir}/$(sys_warp_iface 6).conf" ]; then
                 reading "检测到「单栈VPS加装WARP全局出站」(菜单12)仍在使用，是否一并卸载？(y/n): " warp_choice
                 case "${warp_choice}" in
@@ -1660,6 +1714,18 @@ uninstall_singbox() {
                         green "系统级WARP出站已一并卸载\n"
                         ;;
                     *) yellow "已保留系统级WARP出站，如需手动卸载可重新运行脚本进入菜单12\n" ;;
+                esac
+            fi
+
+            # acme.sh 域名证书（若曾申请过）
+            if [ -n "$cert_domain" ] && [ -f "${HOME}/.acme.sh/acme.sh" ]; then
+                reading "检测到曾用 acme.sh 申请过域名证书(${cert_domain})，是否一并删除该证书？(y/n): " acme_choice
+                case "${acme_choice}" in
+                    y|Y)
+                        cleanup_acme_if_needed "$cert_domain"
+                        green "acme.sh 中 ${cert_domain} 证书已删除\n"
+                        ;;
+                    *) yellow "已保留 acme.sh 证书，可手动执行: ~/.acme.sh/acme.sh --remove -d ${cert_domain} --ecc\n" ;;
                 esac
             fi
 
@@ -1721,27 +1787,18 @@ auto_install() {
 auto_uninstall() {
     green "开始无交互式卸载sing-box..."
 
-    if command_exists rc-service; then
-        rc-service sing-box stop  > /dev/null 2>&1
-        rc-service argo stop      > /dev/null 2>&1
-        rc-update del sing-box default > /dev/null 2>&1
-        rc-update del argo default     > /dev/null 2>&1
-        rm -f /etc/init.d/sing-box /etc/init.d/argo
-    elif command_exists systemctl; then
-        systemctl stop    sing-box > /dev/null 2>&1
-        systemctl stop    argo     > /dev/null 2>&1
-        systemctl disable sing-box > /dev/null 2>&1
-        systemctl disable argo     > /dev/null 2>&1
-        systemctl daemon-reload    > /dev/null 2>&1
-        rm -f /etc/systemd/system/sing-box.service \
-              /etc/systemd/system/argo.service
-    fi
+    local cert_domain=""
+    [ -f "${work_dir}/cert_domain.txt" ] && cert_domain=$(cat "${work_dir}/cert_domain.txt" 2>/dev/null)
 
-    rm -rf "${work_dir}"
-    rm -f /usr/bin/sb
+    stop_and_remove_services
+    cleanup_singbox_residuals
 
+    # 静默清理系统级 WARP
     sys_warp_remove 4 >/dev/null 2>&1
     sys_warp_remove 6 >/dev/null 2>&1
+
+    # 静默清理本脚本申请的域名证书（不删整个 acme.sh）
+    cleanup_acme_if_needed "$cert_domain"
 
     green "\nsing-box 已完全卸载!\n"
 }
