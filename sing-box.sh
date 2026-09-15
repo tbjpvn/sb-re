@@ -67,39 +67,31 @@ jq_write() {
     jq "$@" "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
 }
 
-# 交互取空闲端口（回车=随机）
-prompt_free_port() {
+# 交互取端口，统一入口（原 prompt_free_port / prompt_port_or_random 合并）
+# 用法: prompt_port <prompt> [min] [max] [label] [check_free:0|1]
+#   min/max      回车随机时的取值区间，默认 10000-65000
+#   label        非空则打印"label：端口"的绿色提示；为空则不提示（对齐原 prompt_free_port 静默行为）
+#   check_free   1=校验端口未被占用并循环重试（原 prompt_free_port 行为）
+#                0=只校验数字格式和范围，不检测占用（原 prompt_port_or_random 行为）
+# 注：原 prompt_free_port 对手动输入的端口不校验数字格式，非数字输入会被当作"未占用"直接返回，
+#     这里统一加上格式校验，属于顺带修复，不影响任何一方原有的正常使用路径。
+prompt_port() {
     local prompt=$1
     local min=${2:-10000}
     local max=${3:-65000}
-    local new_port
-    reading "$prompt" new_port
-    if [ -z "$new_port" ]; then
-        get_free_port "$min" "$max"
-        return 0
-    fi
-    until is_port_free "$new_port"; do
-        echo -e "${red}端口 $new_port 已被占用${re}" >&2
-        reading "$prompt" new_port
-        if [ -z "$new_port" ]; then
-            get_free_port "$min" "$max"
-            return 0
-        fi
-    done
-    echo "$new_port"
-}
-
-# 交互取端口（1-65535 / 回车随机）
-# 用于新增协议；输出端口号，并打印绿色提示
-prompt_port_or_random() {
-    local prompt=$1
-    local label=${2:-端口}
+    local label=$4
+    local check_free=${5:-1}
     local port
+
     while true; do
         reading "$prompt" port
         if [ -z "$port" ]; then
-            port=$(shuf -i 10000-65000 -n 1)
-            green "${label}：${purple}${port}${re}" >&2
+            if [ "$check_free" = "1" ]; then
+                port=$(get_free_port "$min" "$max")
+            else
+                port=$(shuf -i "${min}-${max}" -n 1)
+            fi
+            [ -n "$label" ] && green "${label}：${purple}${port}${re}" >&2
             echo "$port"
             return 0
         fi
@@ -107,7 +99,11 @@ prompt_port_or_random() {
             yellow "错误：端口必须是1-65535之间的数字！" >&2
             continue
         fi
-        green "${label}：${purple}${port}${re}" >&2
+        if [ "$check_free" = "1" ] && ! is_port_free "$port"; then
+            red "端口 $port 已被占用" >&2
+            continue
+        fi
+        [ -n "$label" ] && green "${label}：${purple}${port}${re}" >&2
         echo "$port"
         return 0
     done
@@ -256,8 +252,8 @@ check_dualstack() {
         ip6=$(echo "$cached" | sed -n '2p')
     else
         tmp4=$(mktemp); tmp6=$(mktemp)
-        curl -4 -s -m 1.5 ip.sb > "$tmp4" 2>/dev/null &
-        curl -6 -s -m 1.5 ip.sb > "$tmp6" 2>/dev/null &
+        fetch_ip 4 1.5 > "$tmp4" &
+        fetch_ip 6 1.5 > "$tmp6" &
         wait
         ip4=$(cat "$tmp4" 2>/dev/null); ip6=$(cat "$tmp6" 2>/dev/null)
         rm -f "$tmp4" "$tmp6"
@@ -394,20 +390,33 @@ ensure_core_deps() {
 
 
 
+# 统一的直连 IP 探测（不走代理），替代全文分散的 curl -4/-6 -sm N ip.sb
+# 用法: fetch_ip <4|6> [timeout秒，默认2]
+fetch_ip() {
+    local flag=$1 timeout=${2:-2}
+    curl -"${flag}" -sm "$timeout" ip.sb 2>/dev/null
+}
+
+# 判断某协议栈的出口是否为 Cloudflare WARP（用于阻止把 WARP 出口当直连节点用）
+# 用法: is_warp_org <4|6> [timeout秒，默认2]
+is_warp_org() {
+    local flag=$1 timeout=${2:-2}
+    curl -"${flag}" -sm "$timeout" http://ipinfo.io/org 2>/dev/null | grep -qE 'Cloudflare|UnReal|AEZA|Andrei'
+}
+
 get_realip() {
-    local cached ip v6 org
+    local cached ip v6
     if cached=$(_sb_cache_get realip); then
         echo "$cached"
         return 0
     fi
-    ip=$(curl -4 -sm 2 ip.sb 2>/dev/null)
-    _get_ipv6() { curl -6 -sm 2 ip.sb 2>/dev/null; }
+    ip=$(fetch_ip 4)
+    _get_ipv6() { fetch_ip 6; }
     if [ -z "$ip" ]; then
         v6=$(_get_ipv6)
         cached="[$v6]"
     else
-        org=$(curl -4 -sm 2 http://ipinfo.io/org 2>/dev/null)
-        if echo "$org" | grep -qE 'Cloudflare|UnReal|AEZA|Andrei'; then
+        if is_warp_org 4; then
             v6=$(_get_ipv6)
             cached="[$v6]"
         else
@@ -1128,11 +1137,11 @@ sys_warp_add() {
     green "\n✅ WARP 出站已加装成功！接口: ${purple}${iface}${re}，已设置开机自启\n"
     if [ "$family" = "4" ]; then
         local got_v4
-        got_v4=$(curl -4 -sm 8 ip.sb 2>/dev/null)
+        got_v4=$(fetch_ip 4 8)
         green "当前出口IPv4: ${purple}${got_v4:-获取失败，可稍后自行执行: curl -4 ip.sb 检查}${re}\n"
     else
         local got_v6
-        got_v6=$(curl -6 -sm 8 ip.sb 2>/dev/null)
+        got_v6=$(fetch_ip 6 8)
         green "当前出口IPv6: ${purple}${got_v6:-获取失败，可稍后自行执行: curl -6 ip.sb 检查}${re}\n"
     fi
 }
@@ -1852,7 +1861,7 @@ change_config() {
             local inbounds_file="${conf_dir}/inbounds.json"
             case "${choice}" in
                 1)
-                    new_port=$(prompt_free_port "\n请输入vless-reality端口 (回车跳过将使用随机端口): ")
+                    new_port=$(prompt_port "\n请输入vless-reality端口 (回车跳过将使用随机端口): " 10000 65000 "" 1)
                     jq_write "$inbounds_file" --arg port "$new_port" \
                        '(.inbounds[] | select(.type == "vless").listen_port) = ($port | tonumber)'
                     reload_singbox
@@ -1863,7 +1872,7 @@ change_config() {
                     green "\nvless-reality端口已修改成：${purple}$new_port${re}\n"
                     ;;
                 2)
-                    new_port=$(prompt_free_port "\n请输入hysteria2端口 (回车跳过将使用随机端口): ")
+                    new_port=$(prompt_port "\n请输入hysteria2端口 (回车跳过将使用随机端口): " 10000 65000 "" 1)
                     jq_write "$inbounds_file" --arg port "$new_port" \
                        '(.inbounds[] | select(.type == "hysteria2").listen_port) = ($port | tonumber)'
                     reload_singbox
@@ -1874,7 +1883,7 @@ change_config() {
                     green "\nhysteria2端口已修改为：${purple}${new_port}${re}\n"
                     ;;
                 3)
-                    new_port=$(prompt_free_port "\n请输入tuic端口 (回车跳过将使用随机端口): ")
+                    new_port=$(prompt_port "\n请输入tuic端口 (回车跳过将使用随机端口): " 10000 65000 "" 1)
                     jq_write "$inbounds_file" --arg port "$new_port" \
                        '(.inbounds[] | select(.type == "tuic").listen_port) = ($port | tonumber)'
                     reload_singbox
@@ -1885,7 +1894,7 @@ change_config() {
                     green "\ntuic端口已修改为：${purple}${new_port}${re}\n"
                     ;;
                 4)
-                    new_port=$(prompt_free_port "\n请输入vmess-argo端口 (回车跳过将使用随机端口): ")
+                    new_port=$(prompt_port "\n请输入vmess-argo端口 (回车跳过将使用随机端口): " 10000 65000 "" 1)
                     jq_write "$inbounds_file" --arg port "$new_port" \
                        '(.inbounds[] | select(.type == "vmess").listen_port) = ($port | tonumber)'
                     allow_port $new_port/tcp > /dev/null 2>&1
@@ -2009,12 +2018,12 @@ IEOF
                 red "\n错误: $client_dir 不存在\n"
                 return 1
             }
-            new_ipv4=$(curl -4 -sm 2 ip.sb)
+            new_ipv4=$(fetch_ip 4)
             if ! printf '%s' "$new_ipv4" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
                 red "\n错误: 获取 IPv4 失败: $new_ipv4\n"
                 return 1
             fi
-            if curl -4 -sm 2 http://ipinfo.io/org | grep -qE 'Cloudflare|UnReal|AEZA|Andrei'; then
+            if is_warp_org 4; then
                 red "\n当前服务器的ipv4: $new_ipv4 为warp ip,无法作为直连节点使用\n"
                 return 1
             fi
@@ -2033,12 +2042,12 @@ IEOF
                 red "\n错误: $client_dir 不存在\n"
                 return 1
             }
-            new_ipv6=$(curl -6 -sm 3 ip.sb)
+            new_ipv6=$(fetch_ip 6 3)
             if ! printf '%s' "$new_ipv6" | grep -Eq '^[0-9a-fA-F:]+$'; then
                 red "\n当前服务器没有可用的ipv6\n"
                 return 1
             fi
-            if curl -6 -sm 2 http://ipinfo.io/org | grep -qE 'Cloudflare|UnReal|AEZA|Andrei'; then
+            if is_warp_org 6; then
                 red "\n当前服务器的ipv6 $new_ipv6 为warp ip,无法作为直连节点使用\n"
                 return 1
             fi
@@ -2940,7 +2949,7 @@ add_socks5_inbound() {
     local current_uuid
     current_uuid=$(get_current_uuid | tr -d '\n\r')
 
-    sk_port=$(prompt_port_or_random "请输入 Socks5 监听端口 (回车随机生成): " "socks5监听端口")
+    sk_port=$(prompt_port "请输入 Socks5 监听端口 (回车随机生成): " 10000 65000 "socks5监听端口" 0)
 
     reading "请输入 Socks5 用户名 (回车自动使用UUID前8位): " sk_user
     if [ -n "$sk_user" ]; then
@@ -3035,7 +3044,7 @@ add_anytls() {
         red "无法获取当前UUID，请确认 sing-box 已正确安装并配置。"; sleep 2; return
     fi
 
-    at_port=$(prompt_port_or_random "请输入 AnyTLS 监听端口 (回车随机生成): " "Anytls监听端口")
+    at_port=$(prompt_port "请输入 AnyTLS 监听端口 (回车随机生成): " 10000 65000 "Anytls监听端口" 0)
 
     jq_write "$inbounds_file" --arg tag "$tag" \
        --argjson port "$at_port" \
@@ -3101,7 +3110,7 @@ add_ss2022() {
         yellow "Shadowsocks-2022 协议已存在，无需重复添加。"; sleep 1; return
     fi
 
-    ss_port=$(prompt_port_or_random "请输入 Shadowsocks-2022 监听端口 (回车随机生成): " "Shadowsocks-2022监听端口")
+    ss_port=$(prompt_port "请输入 Shadowsocks-2022 监听端口 (回车随机生成): " 10000 65000 "Shadowsocks-2022监听端口" 0)
 
     echo ""
     green "请选择加密方式:"
@@ -3388,8 +3397,8 @@ apply_domain_cert() {
 
     yellow "\n正在检测域名解析..."
     local server_ip4 server_ip6 resolved_ip4 resolved_ip6
-    server_ip4=$(curl -4 -sm 5 ip.sb)
-    server_ip6=$(curl -6 -sm 5 ip.sb)
+    server_ip4=$(fetch_ip 4 5)
+    server_ip6=$(fetch_ip 6 5)
     resolved_ip4=$(resolve_dns_record "$domain" 4)
     resolved_ip6=$(resolve_dns_record "$domain" 6)
     if [ -n "$server_ip4" ] && [ -n "$resolved_ip4" ] && [ "$server_ip4" != "$resolved_ip4" ]; then
