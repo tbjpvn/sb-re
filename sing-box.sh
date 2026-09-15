@@ -539,6 +539,132 @@ allow_port() {
     fi
 }
 
+
+# 关闭/删除防火墙中指定端口规则（与 allow_port 对应）
+deny_port() {
+    local has_ufw=0 has_firewalld=0 has_iptables=0 has_ip6tables=0
+    local rule port proto
+
+    command_exists ufw && has_ufw=1
+    command_exists firewall-cmd && systemctl is-active firewalld >/dev/null 2>&1 && has_firewalld=1
+    command_exists iptables && has_iptables=1
+    command_exists ip6tables && has_ip6tables=1
+
+    for rule in "$@"; do
+        [ -z "$rule" ] && continue
+        port=${rule%/*}
+        proto=${rule#*/}
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        [ "$proto" = "tcp" ] || [ "$proto" = "udp" ] || continue
+
+        if [ "$has_ufw" -eq 1 ]; then
+            ufw delete allow in ${port}/${proto} >/dev/null 2>&1 || true
+            ufw delete allow ${port}/${proto} >/dev/null 2>&1 || true
+        fi
+        if [ "$has_firewalld" -eq 1 ]; then
+            firewall-cmd --permanent --remove-port=${port}/${proto} >/dev/null 2>&1 || true
+        fi
+        if [ "$has_iptables" -eq 1 ]; then
+            while iptables -C INPUT -p ${proto} --dport ${port} -j ACCEPT 2>/dev/null; do
+                iptables -D INPUT -p ${proto} --dport ${port} -j ACCEPT 2>/dev/null || break
+            done
+        fi
+        if [ "$has_ip6tables" -eq 1 ]; then
+            while ip6tables -C INPUT -p ${proto} --dport ${port} -j ACCEPT 2>/dev/null; do
+                ip6tables -D INPUT -p ${proto} --dport ${port} -j ACCEPT 2>/dev/null || break
+            done
+        fi
+    done
+
+    [ "$has_firewalld" -eq 1 ] && firewall-cmd --reload >/dev/null 2>&1 || true
+
+    # 持久化
+    if command_exists rc-service 2>/dev/null; then
+        [ "$has_iptables" -eq 1 ] && iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        [ "$has_ip6tables" -eq 1 ] && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+    else
+        if command_exists netfilter-persistent; then
+            netfilter-persistent save >/dev/null 2>&1 || true
+        elif command_exists service; then
+            service iptables save 2>/dev/null || true
+            service ip6tables save 2>/dev/null || true
+        fi
+    fi
+}
+
+# 从配置收集本脚本节点端口（格式: port/proto）
+collect_node_ports() {
+    local inbounds_file="${conf_dir}/inbounds.json"
+    local ports=() typ port
+
+    [ -f "$inbounds_file" ] && command_exists jq || return 0
+    while IFS=$'\t' read -r typ port; do
+        [ -z "$port" ] || [ "$port" = "null" ] && continue
+        case "$typ" in
+            vless|vmess|anytls) ports+=("${port}/tcp") ;;
+            hysteria2|tuic)     ports+=("${port}/udp") ;;
+            socks|shadowsocks)  ports+=("${port}/tcp" "${port}/udp") ;;
+            *)                  ports+=("${port}/tcp") ;;
+        esac
+    done < <(jq -r '.inbounds[]? | select(.listen_port != null) | "\(.type)\t\(.listen_port)"' "$inbounds_file" 2>/dev/null)
+
+    if [ ${#ports[@]} -gt 0 ]; then
+        printf '%s\n' "${ports[@]}" | awk 'NF && !seen[$0]++'
+    fi
+}
+
+# 仅删除本脚本添加的 hy2 端口跳跃 DNAT（不清空整张 PREROUTING）
+cleanup_port_hop_nat() {
+    local mport listen_port min_port max_port
+    [ -f "$client_dir" ] || return 0
+
+    # 订阅里: mport=主端口,起始-结束
+    mport=$(grep -oE 'mport=[0-9]+,[0-9]+-[0-9]+' "$client_dir" 2>/dev/null | head -1 | sed 's/mport=//')
+    [ -n "$mport" ] || return 0
+
+    listen_port=${mport%%,*}
+    min_port=${mport#*,}
+    min_port=${min_port%-*}
+    max_port=${mport##*-}
+
+    [[ "$listen_port" =~ ^[0-9]+$ && "$min_port" =~ ^[0-9]+$ && "$max_port" =~ ^[0-9]+$ ]] || return 0
+
+    if command_exists iptables; then
+        while iptables -t nat -C PREROUTING -p udp --dport ${min_port}:${max_port} -j DNAT --to-destination :${listen_port} 2>/dev/null; do
+            iptables -t nat -D PREROUTING -p udp --dport ${min_port}:${max_port} -j DNAT --to-destination :${listen_port} 2>/dev/null || break
+        done
+    fi
+    if command_exists ip6tables; then
+        while ip6tables -t nat -C PREROUTING -p udp --dport ${min_port}:${max_port} -j DNAT --to-destination :${listen_port} 2>/dev/null; do
+            ip6tables -t nat -D PREROUTING -p udp --dport ${min_port}:${max_port} -j DNAT --to-destination :${listen_port} 2>/dev/null || break
+        done
+    fi
+
+    if command_exists rc-service 2>/dev/null; then
+        command_exists iptables && iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        command_exists ip6tables && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+    elif command_exists netfilter-persistent; then
+        netfilter-persistent save >/dev/null 2>&1 || true
+    fi
+}
+
+# 卸载前：只关本脚本节点端口 + 跳跃端口规则
+close_node_firewall_ports() {
+    local port_list
+    port_list=$(collect_node_ports)
+    if [ -z "$port_list" ]; then
+        return 0
+    fi
+    yellow "正在关闭本脚本节点端口：\n"
+    while IFS= read -r port; do
+        [ -n "$port" ] && yellow "  - ${port}\n"
+    done <<< "$port_list"
+    # shellcheck disable=SC2086
+    deny_port $port_list
+    cleanup_port_hop_nat
+    green "节点/跳跃端口已关闭\n"
+}
+
 detect_warp_out_family() {
     if curl -4 -sm 5 -o /dev/null https://www.cloudflare.com 2>/dev/null; then
         echo 4
@@ -1701,6 +1827,9 @@ uninstall_singbox() {
             local cert_domain=""
             [ -f "${work_dir}/cert_domain.txt" ] && cert_domain=$(cat "${work_dir}/cert_domain.txt" 2>/dev/null)
 
+            # 先根据配置关闭防火墙端口（需在删除工作目录之前）
+            close_node_firewall_ports
+
             stop_and_remove_services
             cleanup_singbox_residuals
 
@@ -1789,6 +1918,9 @@ auto_uninstall() {
 
     local cert_domain=""
     [ -f "${work_dir}/cert_domain.txt" ] && cert_domain=$(cat "${work_dir}/cert_domain.txt" 2>/dev/null)
+
+    # 先关闭节点防火墙端口（需在删除工作目录之前）
+    close_node_firewall_ports >/dev/null 2>&1 || true
 
     stop_and_remove_services
     cleanup_singbox_residuals
