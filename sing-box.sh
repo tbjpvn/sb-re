@@ -1,7 +1,12 @@
 #!/bin/bash
 
+# =========================
 # 老王 sing-box 四合一安装脚本
+# vless-reality | vmess-ws-tls(Argo) | hysteria2 | tuic5
+# 可额外添加 AnyTLS / Socks5 / SS2022 等协议
+# =========================
 
+# 颜色与输出
 export LANG=en_US.UTF-8
 re="\033[0m"
 red="\033[1;91m"
@@ -16,6 +21,7 @@ purple() { echo -e "\e[1;35m$1\033[0m"; }
 skyblue() { echo -e "\e[1;36m$1\033[0m"; }
 reading() { read -p "$(red "$1")" "$2"; }
 
+# 常量定义
 server_name="sing-box"
 work_dir="/etc/sing-box"
 conf_dir="${work_dir}/conf"
@@ -26,12 +32,15 @@ export CFIP=${CFIP:-'cdns.doon.eu.org'}
 export ARGO_PORT=${ARGO_PORT:-'8001'} 
 export CFPORT=${CFPORT:-'443'} 
 
+# 检查 root 权限
 [[ $EUID -ne 0 ]] && red "请在root用户下运行脚本，可输入 sudo -i 回车切换到root用户" && exit 1
 
+# 检查命令是否存在
 command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# 检查端口是否空闲
 is_port_free() {
     local port=$1
     if command_exists ss; then
@@ -42,10 +51,10 @@ is_port_free() {
         lsof -iUDP:"$port" -t >/dev/null 2>&1 && return 1
         return 0
     fi
-    # 没有ss也没有lsof时无法检测，默认放行（不阻断安装）
     return 0
 }
 
+# 获取空闲端口
 get_free_port() {
     local min=$1 max=$2 tries=0 port
     while [ "$tries" -lt 200 ]; do
@@ -60,21 +69,14 @@ get_free_port() {
     return 1
 }
 
-# jq 成功才覆盖原文件
+# jq 写回文件（成功才覆盖）
 jq_write() {
     local file=$1
     shift
     jq "$@" "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
 }
 
-# 交互取端口，统一入口（原 prompt_free_port / prompt_port_or_random 合并）
-# 用法: prompt_port <prompt> [min] [max] [label] [check_free:0|1]
-#   min/max      回车随机时的取值区间，默认 10000-65000
-#   label        非空则打印"label：端口"的绿色提示；为空则不提示（对齐原 prompt_free_port 静默行为）
-#   check_free   1=校验端口未被占用并循环重试（原 prompt_free_port 行为）
-#                0=只校验数字格式和范围，不检测占用（原 prompt_port_or_random 行为）
-# 注：原 prompt_free_port 对手动输入的端口不校验数字格式，非数字输入会被当作"未占用"直接返回，
-#     这里统一加上格式校验，属于顺带修复，不影响任何一方原有的正常使用路径。
+# 交互获取端口
 prompt_port() {
     local prompt=$1
     local min=${2:-10000}
@@ -129,12 +131,13 @@ print_client_urls() {
     done < "$f"
 }
 
+# 检查服务状态
 check_service() {
     local service_name=$1
     local service_file=$2
-    
+
     [[ ! -f "${service_file}" ]] && { red "not installed"; return 2; }
-        
+
     if command_exists apk; then
         rc-service "${service_name}" status | grep -q "started" && green "running" || yellow "not running"
     else
@@ -143,8 +146,7 @@ check_service() {
     return $?
 }
 
-# 校验 hy2/tuic UDP 是否真正监听（规则集下载可能较慢，轮询等待）
-# sing-box绑定失败时通常只是静默不监听，不会让脚本报错，
+# 校验 hy2/tuic UDP 是否真正监听
 verify_udp_listening() {
     command_exists ss || return 0
     local max_wait=30
@@ -184,10 +186,12 @@ verify_udp_listening() {
     return 0
 }
 
+# 检查 sing-box 状态
 check_singbox() {
     check_service "sing-box" "${work_dir}/${server_name}"
 }
 
+# 检查 TCP 拥塞控制算法
 check_congestion() {
     local cc qdisc
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
@@ -204,6 +208,7 @@ check_congestion() {
     return 0
 }
 
+# 检查 argo 状态
 check_argo() {
     check_service "argo" "${work_dir}/argo"
 }
@@ -240,11 +245,11 @@ _sb_cache_set() {
     } > "${_SB_IP_CACHE_DIR}/${key}" 2>/dev/null || true
 }
 
-# 出口变化时清空缓存（加装/删除系统级 WARP 后主菜单 IP 才准确）
 _sb_cache_clear() {
     rm -f "${_SB_IP_CACHE_DIR}/realip" "${_SB_IP_CACHE_DIR}/isp" "${_SB_IP_CACHE_DIR}/dualstack" 2>/dev/null || true
 }
 
+# 检查双栈 IP
 check_dualstack() {
     local ip4 ip6 tmp4 tmp6 cached
     if cached=$(_sb_cache_get dualstack); then
@@ -270,7 +275,7 @@ check_dualstack() {
     fi
 }
 
-# 包是否已安装（优先按包名查询，避免 coreutils 等与命令名不一致）
+# 判断包是否已安装
 pkg_installed() {
     local pkg=$1
     if command_exists dpkg-query; then
@@ -284,8 +289,9 @@ pkg_installed() {
     fi
 }
 
-# 本进程内软件源只刷新一次
 _SB_PKG_INDEX_READY=0
+
+# 本进程内软件源只刷新一次
 _ensure_pkg_index() {
     [ "${_SB_PKG_INDEX_READY}" = "1" ] && return 0
     if command_exists apt; then
@@ -299,6 +305,7 @@ _ensure_pkg_index() {
     return 0
 }
 
+# 安装/卸载软件包
 manage_packages() {
     if [ $# -lt 2 ]; then
         red "Unspecified package name or action"
@@ -367,7 +374,7 @@ manage_packages() {
     return 0
 }
 
-# 安装入口一次装齐核心依赖（体积小）；WARP/证书等扩展仍按需安装
+# 安装核心依赖
 ensure_core_deps() {
     if [ "${_SB_CORE_DEPS_OK}" = "1" ]; then
         return 0
@@ -388,22 +395,19 @@ ensure_core_deps() {
     return 0
 }
 
-
-
-# 统一的直连 IP 探测（不走代理），替代全文分散的 curl -4/-6 -sm N ip.sb
-# 用法: fetch_ip <4|6> [timeout秒，默认2]
+# 探测直连 IP（不走代理）
 fetch_ip() {
     local flag=$1 timeout=${2:-2}
     curl -"${flag}" -sm "$timeout" ip.sb 2>/dev/null
 }
 
-# 判断某协议栈的出口是否为 Cloudflare WARP（用于阻止把 WARP 出口当直连节点用）
-# 用法: is_warp_org <4|6> [timeout秒，默认2]
+# 判断出口是否为 Cloudflare WARP
 is_warp_org() {
     local flag=$1 timeout=${2:-2}
     curl -"${flag}" -sm "$timeout" http://ipinfo.io/org 2>/dev/null | grep -qE 'Cloudflare|UnReal|AEZA|Andrei'
 }
 
+# 获取真实出口 IP
 get_realip() {
     local cached ip v6
     if cached=$(_sb_cache_get realip); then
@@ -436,8 +440,7 @@ get_realip() {
     echo "$cached"
 }
 
-# GitHub 拉取：失败时走镜像代理（兼容纯 IPv6）
-# 伪装成一段无意义的jq报错甩给用户。
+# 从 GitHub 拉取 JSON（失败走镜像）
 gh_fetch_json() {
     local url=$1 out proxy
     out=$(curl -s -m 8 "$url" 2>/dev/null)
@@ -453,6 +456,7 @@ gh_fetch_json() {
     return 1
 }
 
+# 从 GitHub 下载文件（失败走镜像）
 gh_download() {
     local url=$1 dest=$2 proxy
     if curl -sL --fail -m 60 -o "$dest" "$url" 2>/dev/null; then
@@ -466,13 +470,12 @@ gh_download() {
     return 1
 }
 
-# 提示纯IPv6直连GitHub失败时的通用引导文案
+# 纯 IPv6 访问 GitHub 失败时的提示
 gh_ipv6_hint() {
     yellow "提示：GitHub官方(github.com/api.github.com)长期未提供IPv6解析，纯IPv6 VPS在未配置NAT64或WARP出站时通常无法直连，脚本已自动尝试镜像代理但仍失败（可能是网络波动或镜像暂时不可用）。可到主菜单「单栈VPS加装WARP全局出站」加装IPv4 WARP出站后重试，或稍后再试。\n"
 }
 
-# 按 get_realip 同一协议栈查 ISP，避免 WARP 出口误判
-# 出口去查询，避免加装WARP出站(单栈VPS加装WARP全局出站功能)后，
+# 获取 ISP 信息
 get_isp() {
     local addr flag result cached
     if cached=$(_sb_cache_get isp); then
@@ -503,6 +506,7 @@ get_isp() {
     return 0
 }
 
+# 放行防火墙端口
 allow_port() {
     has_ufw=0
     has_firewalld=0
@@ -555,7 +559,6 @@ allow_port() {
 }
 
 # 探测出口协议栈 4/6
-# 用于纯IPv6单栈机器——这类机器如果沿用写死的IPv4注册/IPv4 Endpoint，
 detect_warp_out_family() {
     if curl -4 -sm 5 -o /dev/null https://www.cloudflare.com 2>/dev/null; then
         echo 4
@@ -566,11 +569,8 @@ detect_warp_out_family() {
     fi
 }
 
-# WARP 端口探测（不碰正在运行的服务）
-# 完全不碰正在跑的 sing-box 服务/配置——避免像之前那样为了试4个端口反复
+# 探测 WARP Endpoint 可用端口
 warp_probe_endpoint() {
-    # 优先内核 wg 测握手；无内核时短超时回退
-    # 优先内核 wg；无内核工具时回退到临时 sing-box 进程，通过 wg-style 不可用则用短超时判断进程存活+UDP。
     local port="$1" v4="$2" v6="$3" private_key="$4" peer_pub="$5" reserved_json="$6" peer_addr="$7"
     local iface="sbwprobe$$"
     local conf result=1 tries=0 hs
@@ -668,7 +668,6 @@ EOF
 }
 
 # 注册 WARP 并写入 endpoints.json
-# 成功返回 0 并写入 endpoints.json；失败返回 1（调用方可决定是否回退）
 generate_warp_endpoint() {
     local quiet="${1:-}"
     local sb_bin="${work_dir}/sing-box"
@@ -679,7 +678,6 @@ generate_warp_endpoint() {
 
     [ -z "$quiet" ] && yellow "正在生成独立 WARP WireGuard 密钥并注册到 Cloudflare...\n"
 
-    # 1. 生成密钥对（优先 sing-box，其次 openssl X25519）
     local private_key public_key key_output
     key_output=$("$sb_bin" generate wg-keypair 2>/dev/null)
     private_key=$(echo "$key_output" | awk '/PrivateKey:/ {print $2}')
@@ -710,14 +708,11 @@ generate_warp_endpoint() {
         return 1
     fi
 
-    # 2. 向 Cloudflare 注册
     local install_id fcm_token tos_date reg_response
     install_id=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 22)
     fcm_token="${install_id}:APA91b$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 134)"
     tos_date=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-    # 按出口协议栈选注册与 Endpoint
-    # 注册接口，永远连不上，重试几次全部超时，表现为"注册就没成功过"。
     local out_family curl_family peer_addr
     out_family=$(detect_warp_out_family)
     if [ "$out_family" = "6" ]; then
@@ -729,8 +724,6 @@ generate_warp_endpoint() {
         peer_addr="162.159.192.1"
     fi
 
-    # 注册成功必须以拿到 v4 地址为准，禁用假地址兜底
-    # 为准。之前用 `.config.interface.addresses.v4 // .config.client_id` 做判断，
     local try=0 max_try=5
     while [ "$try" -lt "$max_try" ]; do
         try=$((try + 1))
@@ -753,7 +746,6 @@ generate_warp_endpoint() {
         return 1
     fi
 
-    # 3. 解析结果
     local v4 v6 client_id peer_pub reserved_json device_id token
     v4=$(echo "$reg_response" | jq -r '.config.interface.addresses.v4 // empty')
     v6=$(echo "$reg_response" | jq -r '.config.interface.addresses.v6 // empty')
@@ -767,7 +759,6 @@ generate_warp_endpoint() {
         v6="${v6}/128"
     fi
 
-    # reserved = client_id 前 3 字节
     if [ -n "$client_id" ]; then
         local r_bytes
         r_bytes=$(printf '%s' "$client_id" | base64 -d 2>/dev/null | od -An -tu1 -N3 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//')
@@ -780,8 +771,6 @@ generate_warp_endpoint() {
         reserved_json="[0, 0, 0]"
     fi
 
-    # 探测候选 UDP 端口，写入可用端口
-    # 真正可用的写入配置。部分VPS/机房会封锁2408这种明显是VPN流量的端口，
     local candidate_ports=(2408 4500 1701 500)
     local port ok_port=""
     for port in "${candidate_ports[@]}"; do
@@ -868,7 +857,6 @@ EOF
 }
 
 # 按需确保 wireguard-out 可用
-# 仅在真正即将使用 WARP 出站时按需调用，避免安装阶段/不需要WARP的场景
 ensure_warp_endpoint() {
     local endpoints_file="${conf_dir}/endpoints.json"
     if [ -f "$endpoints_file" ] && jq -e '.endpoints[]? | select(.tag=="wireguard-out")' "$endpoints_file" >/dev/null 2>&1; then
@@ -883,13 +871,12 @@ ensure_warp_endpoint() {
     return 1
 }
 
-# 系统级 WireGuard，全局生效（非仅 sing-box）
-# 这里通过系统级 WireGuard(wg-quick) 为纯IPv4/纯IPv6主机加装缺失协议栈的
+# 系统级 WireGuard 接口名
 sys_warp_iface() {
     [ "$1" = "4" ] && echo "wgcf-v4" || echo "wgcf-v6"
 }
 
-# REG_PRIV / REG_V4 / REG_V6 / REG_PEER
+# 向 Cloudflare 注册 WARP 账号
 cf_warp_register() {
     local family="${1:-4}"
     local sb_bin="${work_dir}/sing-box"
@@ -919,16 +906,12 @@ cf_warp_register() {
     fcm_token="${install_id}:APA91b$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 134)"
     tos_date=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-    # family=4 补 IPv4（走 IPv6 注册）；family=6 补 IPv6（走 IPv4 注册）
-    # family=4：VPS本身只有IPv6，需要通过IPv6访问Cloudflare注册API；
     if [ "$family" = "4" ]; then
         curl_family="-6"
     else
         curl_family="-4"
     fi
 
-    # 注册成功必须以拿到 v4 地址为准，禁用假地址兜底
-    # 不能用 client_id 兜底判断成功——client_id 几乎总是存在，会导致漏掉"注册回包
     while [ "$try" -lt 5 ]; do
         try=$((try + 1))
         reg_response=$(curl "$curl_family" -sS -m 15 --tlsv1.2 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
@@ -944,7 +927,6 @@ cf_warp_register() {
         sleep 2
     done
 
-    # 5次都没拿到真实v4地址：明确判定失败，不再用假地址掩盖，让上层如实报错
     if ! echo "$reg_response" | jq -e '.config.interface.addresses.v4' >/dev/null 2>&1; then
         red "Cloudflare WARP 注册失败：重试5次均未拿到有效IPv4地址（可能网络受限、触发了Cloudflare限流，或 API 变更），本次不会继续加装\n"
         echo "$reg_response" | head -c 300
@@ -956,7 +938,6 @@ cf_warp_register() {
     REG_V6=$(echo "$reg_response" | jq -r '.config.interface.addresses.v6 // empty')
     REG_PEER=$(echo "$reg_response" | jq -r '.config.peers[0].public_key // "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="')
 
-    # “已有协议栈”连接WARP Endpoint，避免把缺失协议栈错误地拿来连Endpoint。
     if [ "$family" = "4" ]; then
         REG_ENDPOINT="[2606:4700:d0::a29f:c001]:2408"
     else
@@ -966,8 +947,7 @@ cf_warp_register() {
     return 0
 }
 
-# 写 wg-quick：Endpoint 用已有协议栈，AllowedIPs 只放行缺失栈
-# family=6 表示给纯IPv4主机加装IPv6出站。
+# 写入 wg-quick 配置
 sys_warp_write_conf() {
     local family="$1" iface addr_line endpoint allowed
     iface=$(sys_warp_iface "$family")
@@ -981,7 +961,6 @@ sys_warp_write_conf() {
         allowed="::/0"
     fi
 
-    # 原有协议栈仍通过宿主机直连Endpoint。
     addr_line="${REG_V4}/32"
     [ -n "$REG_V6" ] && addr_line="${addr_line}, ${REG_V6}/128"
 
@@ -1000,7 +979,7 @@ EOF
     chmod 600 "${sys_warp_dir}/${iface}.conf"
 }
 
-# 开机自启
+# 设置开机自启
 sys_warp_enable_boot() {
     local iface="$1"
     if command_exists systemctl; then
@@ -1012,13 +991,14 @@ sys_warp_enable_boot() {
     fi
 }
 
+# 取消开机自启
 sys_warp_disable_boot() {
     local iface="$1"
     command_exists systemctl && systemctl disable "wg-quick@${iface}" &>/dev/null
     command_exists crontab && { crontab -l 2>/dev/null | grep -v "wg-quick up ${iface}" | crontab - 2>/dev/null; }
 }
 
-# 查看当前系统级WARP出站状态
+# 查看系统级 WARP 出站状态
 sys_warp_status() {
     local f iface
     for f in 4 6; do
@@ -1035,8 +1015,7 @@ sys_warp_status() {
     done
 }
 
-# 校验握手（有收包）而非仅 wg-quick 成功
-# 而不是只看wg-quick命令有没有报错——部分VPS/机房会过滤某些UDP端口，
+# 校验 WARP 握手是否成功
 sys_warp_verify_handshake() {
     local iface="$1" tries=0 rx
     while [ "$tries" -lt 5 ]; do
@@ -1051,7 +1030,6 @@ sys_warp_verify_handshake() {
 }
 
 # 轮询候选端口直到握手成功
-# 挑一个能真正握手成功(收到回包)的端口写入配置。
 sys_warp_find_working_port() {
     local iface="$1" conf="$2" host="$3" ipv6_endpoint="$4" port
     local ports=(2408 500 4500 1701)
@@ -1075,7 +1053,7 @@ sys_warp_find_working_port() {
     return 1
 }
 
-# 加装WARP出站主流程
+# 加装系统级 WARP 出站
 sys_warp_add() {
     local family="$1" iface
     iface=$(sys_warp_iface "$family")
@@ -1109,8 +1087,6 @@ sys_warp_add() {
         return 1
     fi
 
-    # 验证握手；失败则换端口
-    # 导致wg-quick成功但一直收不到Cloudflare的回包。这里实际验证握手，
     yellow "正在验证隧道是否真正握手成功...\n"
     if sys_warp_verify_handshake "$iface"; then
         :
@@ -1146,7 +1122,7 @@ sys_warp_add() {
     fi
 }
 
-# 删除指定协议栈的WARP出站
+# 删除系统级 WARP 出站
 sys_warp_remove() {
     local family="$1" iface
     iface=$(sys_warp_iface "$family")
@@ -1162,6 +1138,7 @@ sys_warp_remove() {
     _sb_cache_clear
 }
 
+# 删除 WARP 出站菜单
 sys_warp_delete_menu() {
     clear; echo ""
     purple "=== 删除WARP出站 ===\n"
@@ -1183,7 +1160,7 @@ sys_warp_delete_menu() {
     system_warp_menu
 }
 
-# 菜单：单栈VPS加装WARP全局出站
+# 单栈 VPS 加装 WARP 全局出站菜单
 system_warp_menu() {
     clear; echo ""
     purple "=== 单栈VPS加装WARP全局出站(IPv4/IPv6) ===\n"
@@ -1206,7 +1183,7 @@ system_warp_menu() {
     esac
 }
 
-# 菜单：重新生成 WARP 密钥
+# 重新生成 WARP 密钥
 regenerate_warp_keys() {
     check_singbox &>/dev/null
     if [ $? -eq 2 ]; then
@@ -1226,8 +1203,7 @@ regenerate_warp_keys() {
     sleep 2
 }
 
-
-# 默认远程规则集（安装与恢复 direct 共用，避免两处 heredoc 复制）
+# 默认远程规则集
 default_route_rule_sets_json() {
     jq -n '[
       {"tag":"gemini","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/google.srs","download_detour":"direct"},
@@ -1243,7 +1219,7 @@ default_route_rule_sets_json() {
     ]'
 }
 
-# 写默认 route.json（final=direct + sniff）
+# 写入默认 route.json
 write_default_route_json() {
     local resolver_tag=${1:-local}
     local dns_strategy=${2:-prefer_ipv4}
@@ -1263,7 +1239,7 @@ write_default_route_json() {
         }' > "${conf_dir}/route.json"
 }
 
-# 用 jq 生成安装阶段核心配置（替代超长 heredoc）
+# 生成安装阶段核心配置
 write_install_configs() {
     local uuid=$1 private_key=$2
     local vless_port=$3 hy2_port=$4 tuic_port=$5 argo_port=$6
@@ -1344,6 +1320,7 @@ write_install_configs() {
     write_default_route_json "$resolver_tag" "$dns_strategy"
 }
 
+# 下载并安装 sing-box / cloudflared
 install_singbox() {
     clear
     purple "正在安装sing-box中，请稍后..."
@@ -1360,8 +1337,6 @@ install_singbox() {
     mkdir -p "${work_dir}" "${conf_dir}"
     chmod 777 "${work_dir}" 2>/dev/null || true
 
-    # 从官方 GitHub Releases 下载 sing-box
-    # 裸curl会返回空内容或非JSON片段，直接喂给jq就是「parse error: Invalid numeric literal...」
     if ! releases_json=$(gh_fetch_json "https://api.github.com/repos/SagerNet/sing-box/releases"); then
         red "获取 sing-box 最新版本号失败，请检查服务器是否能访问 api.github.com\n"
         gh_ipv6_hint
@@ -1387,8 +1362,6 @@ install_singbox() {
     fi
     rm -rf "${work_dir}/${server_name}.tar.gz" "${work_dir}/sing-box-${latest_version}-linux-${ARCH}"
 
-    # Alpine 需 gcompat 才能跑官方 glibc 二进制
-    # 否则官方 GitHub 发行的 glibc 二进制文件在 Alpine 上会直接无法执行（shell报"not found"，容易误判为文件不存在或安装失败），
     if [ -f /etc/alpine-release ]; then
         if ! apk info -e gcompat >/dev/null 2>&1; then
             yellow "\n检测到 Alpine (musl) 系统，正在安装 glibc 兼容层 gcompat...\n"
@@ -1400,7 +1373,6 @@ install_singbox() {
         fi
     fi
 
-    # cloudflared 官方二进制
     case "${ARCH}" in
         'amd64') CF_ARCH='amd64' ;;
         '386')   CF_ARCH='386' ;;
@@ -1416,7 +1388,6 @@ install_singbox() {
         exit 1
     fi
 
-    # qrencode 可选，失败不阻断安装
     curl -sLo "${work_dir}/qrencode" "https://github.com/eooce/test/releases/download/${ARCH}/qrencode-linux-${ARCH}" 2>/dev/null || true
     chown root:root "${work_dir}" 2>/dev/null || true
     chmod +x "${work_dir}/${server_name}" 2>/dev/null || true
@@ -1426,8 +1397,6 @@ install_singbox() {
     while ! is_port_free "$vless_port"; do
         vless_port=$(shuf -i 10000-65000 -n 1)
     done
-    # tuic/hy2 独立选空闲端口，避免固定偏移冲突
-    # 因为那样必须连续2个端口同时空闲才行，冲突概率高很多——
     tuic_port=$(get_free_port 10000 65000)
     hy2_port=$(get_free_port 10000 65000)
     while [ "$tuic_port" = "$vless_port" ] || [ "$hy2_port" = "$vless_port" ] || \
@@ -1440,8 +1409,6 @@ install_singbox() {
     private_key=$(echo "${output}" | awk '/PrivateKey:/ {print $2}')
     public_key=$(echo "${output}" | awk '/PublicKey:/ {print $2}')
 
-    # reality 密钥为空则中止（二进制可能无法执行）
-    # 这里会拿到空字符串，之前会被原样写进配置文件，导致装完了但服务因invalid private key起不来，
     if [ -z "$private_key" ] || [ -z "$public_key" ]; then
         red "生成 reality 密钥对失败！/etc/sing-box/sing-box 二进制可能无法在本机正常执行。\n"
         yellow "请先手动执行 /etc/sing-box/sing-box version 排查(Alpine系统常见原因是缺少gcompat，可执行 apk add gcompat 后重试)。\n"
@@ -1452,14 +1419,12 @@ install_singbox() {
 
     openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key" || { red "生成证书私钥失败"; exit 1; }
     openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
-    
+
     fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
-    
+
     dns_strategy=$(ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1 && echo "prefer_ipv4" || \
         (ping -c 1 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && echo "prefer_ipv6" || echo "prefer_ipv4"))
 
-    # 常规用 local DNS；存在 WARP/clat 多网卡时改用固定 sys
-    # 复杂网络环境时，才切换成读取系统当前DNS地址、写死成固定udp服务器的兜底方案——
     resolver_tag="local"
     if ip link show 2>/dev/null | grep -qE '^[0-9]+: (wgcf-v[46]|[a-z]*clat[a-z0-9]*)[:@]'; then
         resolver_tag="sys"
@@ -1476,6 +1441,7 @@ install_singbox() {
 
 }
 
+# systemd 守护进程配置
 main_systemd_services() {
     cat > /etc/systemd/system/sing-box.service << EOF
 [Unit]
@@ -1531,6 +1497,7 @@ EOF
     systemctl start argo
 }
 
+# Alpine OpenRC 守护进程配置
 alpine_openrc_services() {
     cat > /etc/init.d/sing-box << 'EOF'
 #!/sbin/openrc-run
@@ -1566,6 +1533,7 @@ EOF
     rc-update add argo default     > /dev/null 2>&1
 }
 
+# 生成节点和订阅链接
 get_info() {
     yellow "\nip检测中,请稍等...\n"
     server_ip=$(get_realip)
@@ -1621,6 +1589,7 @@ EOF
     green "如需以订阅方式导入，可将该文件内容复制粘贴到客户端的订阅内容中。\n"
 }
 
+# 从配置中获取当前 UUID
 get_current_uuid() {
     local inbounds_file="${conf_dir}/inbounds.json"
     if [ -f "$inbounds_file" ]; then
@@ -1632,6 +1601,7 @@ get_current_uuid() {
     fi
 }
 
+# 通用服务管理
 manage_service() {
     local service_name="$1"
     local action="$2"
@@ -1697,12 +1667,12 @@ manage_service() {
 start_singbox()  { manage_service "sing-box" "start"; }
 stop_singbox()   { manage_service "sing-box" "stop"; }
 restart_singbox(){ manage_service "sing-box" "restart"; }
-# 改配置优先 reload（HUP），失败再 restart，减少断连
 reload_singbox() { manage_service "sing-box" "reload"; }
 start_argo()     { manage_service "argo" "start"; }
 stop_argo()      { manage_service "argo" "stop"; }
 restart_argo()   { manage_service "argo" "restart"; }
 
+# 卸载 sing-box
 uninstall_singbox() {
     reading "确定要卸载 sing-box 吗? (y/n): " choice
     case "${choice}" in
@@ -1720,8 +1690,6 @@ uninstall_singbox() {
             rm -rf "${work_dir}" || true
             rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/argo.service
 
-            # 可选：一并卸载系统级 WARP
-            # 二者是独立功能；这里额外询问一下，避免卸载后WARP的wg-quick接口/开机自启一直残留
             if [ -f "${sys_warp_dir}/$(sys_warp_iface 4).conf" ] || [ -f "${sys_warp_dir}/$(sys_warp_iface 6).conf" ]; then
                 reading "检测到「单栈VPS加装WARP全局出站」(菜单12)仍在使用，是否一并卸载？(y/n): " warp_choice
                 case "${warp_choice}" in
@@ -1740,6 +1708,7 @@ uninstall_singbox() {
     esac
 }
 
+# 创建快捷命令 sb
 create_shortcut() {
     cat > "$work_dir/sb.sh" << 'EOF'
 #!/usr/bin/env bash
@@ -1750,12 +1719,14 @@ EOF
     [ -s /usr/bin/sb ] && green "\n快捷指令 sb 创建成功\n" || red "\n快捷指令创建失败\n"
 }
 
+# 修正 hosts
 change_hosts() {
     sh -c 'echo "0 0" > /proc/sys/net/ipv4/ping_group_range'
     sed -i '1s/.*/127.0.0.1   localhost/' /etc/hosts
     sed -i '2s/.*/::1         localhost/' /etc/hosts
 }
 
+# 无交互安装
 auto_install() {
     check_singbox &>/dev/null
     if [ $? -eq 0 ]; then
@@ -1785,6 +1756,7 @@ auto_install() {
     green "\nsing-box 安装完成\n"
 }
 
+# 无交互卸载
 auto_uninstall() {
     green "开始无交互式卸载sing-box..."
 
@@ -1807,13 +1779,13 @@ auto_uninstall() {
     rm -rf "${work_dir}"
     rm -f /usr/bin/sb
 
-    # 清理系统级 WARP 出站（关闭接口、取消开机自启、删除 crontab 与配置文件，静默执行）
     sys_warp_remove 4 >/dev/null 2>&1
     sys_warp_remove 6 >/dev/null 2>&1
 
     green "\nsing-box 已完全卸载!\n"
 }
 
+# 修改节点配置
 change_config() {
     local singbox_status=$(check_singbox 2>/dev/null)
     local singbox_installed=$?
@@ -2065,6 +2037,7 @@ IEOF
     esac
 }
 
+# sing-box 服务管理菜单
 manage_singbox() {
     local singbox_status=$(check_singbox 2>/dev/null)
     clear; echo ""
@@ -2089,6 +2062,7 @@ manage_singbox() {
     read -n 1 -s -r -p $'\n\033[1;91m按任意键返回...\033[0m\n'
 }
 
+# Argo 隧道管理菜单
 manage_argo() {
     local argo_status=$(check_argo 2>/dev/null)
     clear; echo ""
@@ -2179,6 +2153,7 @@ EOF
     esac
 }
 
+# 获取临时 Argo 域名
 get_quick_tunnel() {
     restart_argo
     yellow "获取临时argo域名中，请稍等...\n"
@@ -2198,6 +2173,7 @@ get_quick_tunnel() {
     ArgoDomain=$get_argodomain
 }
 
+# 更新订阅中的 Argo 域名
 change_argo_domain() {
     content=$(cat "$client_dir")
     vmess_url=$(grep -o 'vmess://[^ ]*' "$client_dir")
@@ -2214,6 +2190,7 @@ change_argo_domain() {
     purple "$new_vmess_url\n"
 }
 
+# 查看节点信息
 check_nodes() {
     if [ ! -f "${work_dir}/url.txt" ]; then
         red "节点信息文件不存在，请先安装 sing-box"; return 1
@@ -2234,6 +2211,7 @@ check_nodes() {
     green "base64订阅内容已保存到: ${purple}${work_dir}/sub.txt${re}，如需以订阅方式导入，可复制该文件内容粘贴到客户端。\n"
 }
 
+# 修改 vmess-argo 优选域名
 change_cfip() {
     clear
     yellow "修改vmess-argo优选域名\n"
@@ -2271,6 +2249,7 @@ change_cfip() {
     purple "$new_vmess_url\n"
 }
 
+# 测试 WARP 连通性
 test_warp_connectivity() {
     local inbounds_file="${conf_dir}/inbounds.json"
     local route_file="${conf_dir}/route.json"
@@ -2291,11 +2270,9 @@ test_warp_connectivity() {
         red "WARP 密钥不可用，无法测试连通性\n"; sleep 2; return
     fi
 
-    # 备份
     cp "$route_file" "$route_bak"
     cp "$inbounds_file" "$inbounds_bak"
 
-    # 确保有本地 socks 入站
     if jq -e --argjson p "$test_port" '.inbounds[] | select(.type=="socks" and .listen_port==$p)' "$inbounds_file" >/dev/null 2>&1; then
         had_socks=1
     else
@@ -2307,7 +2284,6 @@ test_warp_connectivity() {
         }]'
     fi
 
-    # 临时全局 WARP（保留 sniff，避免域名类检测异常）
     cat > "$route_file" << EOF
 {
   "route": {
@@ -2357,7 +2333,6 @@ EOF
         yellow "  - endpoints.json 中 peer 地址是否为 162.159.192.1"
     fi
 
-    # 恢复
     yellow "\n正在恢复原配置..."
     mv "$route_bak" "$route_file"
     mv "$inbounds_bak" "$inbounds_file"
@@ -2367,6 +2342,7 @@ EOF
     warp_manage
 }
 
+# WARP 分流管理菜单
 warp_manage() {
     check_singbox &>/dev/null
     if [ $? -eq 2 ]; then
@@ -2417,6 +2393,7 @@ warp_manage() {
     esac
 }
 
+# 添加分流规则
 add_rule_menu() {
     clear
     green "选择要分流的服务:\n"
@@ -2458,6 +2435,7 @@ add_rule_menu() {
     finalize_rule_add "$rule_tag"
 }
 
+# 自定义分流规则
 custom_rule_menu() {
     clear
     green "=== 自定义分流规则 ===\n"
@@ -2467,7 +2445,6 @@ custom_rule_menu() {
         red "名称不能为空"; sleep 1; add_rule_menu; return
     fi
 
-    # 规范化为合法 tag：转小写，非法字符替换为下划线
     local custom_tag
     custom_tag=$(echo "$custom_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/_/g')
 
@@ -2475,7 +2452,6 @@ custom_rule_menu() {
         red "名称无效"; sleep 1; add_rule_menu; return
     fi
 
-    # 与内置服务保留字冲突检测
     case "$custom_tag" in
         openai|claude|gemini|google|tiktok|twitter|youtube|netflix|telegram|telegram-ip)
             red "该名称与内置服务保留字冲突，请换一个名称"; sleep 1; custom_rule_menu; return ;;
@@ -2496,7 +2472,6 @@ custom_rule_menu() {
         red "域名不能为空"; sleep 1; add_rule_menu; return
     fi
 
-    # 逗号统一替换为空格后按空白拆分
     domain_input="${domain_input//,/ }"
     local domains=()
     local d
@@ -2525,6 +2500,7 @@ custom_rule_menu() {
     finalize_rule_add "$custom_tag"
 }
 
+# 完成分流规则添加
 finalize_rule_add() {
     local rule_tag="$1"
 
@@ -2539,8 +2515,6 @@ finalize_rule_add() {
         yellow "规则集 '${rule_tag}' 已启用。"; sleep 1; warp_manage; return
     fi
 
-    # 清理空 rule_set，保持 sniff 在首位
-    # （旧逻辑依赖 length==1 的空 rule_set，加了 sniff 后必须改写，否则会把规则清空导致节点全挂）
     jq_write "$route_file" '
       .route.rules = (
         [{"action":"sniff"}]
@@ -2590,7 +2564,6 @@ finalize_rule_add() {
         fi
     fi
 
-    # telegram 同时启用 geosite + geoip
     local tags_to_add=("$rule_tag")
     if [ "$rule_tag" = "telegram" ]; then
         tags_to_add=("telegram" "telegram-ip")
@@ -2632,8 +2605,8 @@ finalize_rule_add() {
     sleep 2; warp_manage
 }
 
+# 设置全局代理出站
 set_global_outbound() {
-    # 检查是否存在 socks5/http 代理出站（排除 direct 和 wireguard-out）
     local proxy_tags
     proxy_tags=($(jq -r '.outbounds[] | select(.tag != "direct" and .tag != "wireguard-out") | .tag' \
         "$outbound_file" 2>/dev/null))
@@ -2658,7 +2631,6 @@ set_global_outbound() {
     fi
     local selected_out="${proxy_tags[$((out_choice-1))]}"
 
-    # 去掉 direct，防止绕过全局代理
     jq_write "$outbound_file" 'del(.outbounds[] | select(.tag == "direct"))'
     rm -f "${route_file}"
     reload_singbox
@@ -2667,16 +2639,14 @@ set_global_outbound() {
     sleep 2; warp_manage
 }
 
+# 恢复服务器原 IP 出站
 restore_direct_outbound() {
     yellow "\n正在恢复默认路由配置...\n"
 
-    # 读取当前IPv4/IPv6优先级策略，恢复时保持一致
     local cur_dns_strategy
     cur_dns_strategy=$(jq -r '.dns.strategy // "prefer_ipv4"' "${conf_dir}/dns.json" 2>/dev/null)
     [ -z "$cur_dns_strategy" ] || [ "$cur_dns_strategy" = "null" ] && cur_dns_strategy="prefer_ipv4"
 
-    # 补齐旧配置缺失的 sys DNS
-    # 避免下面route.json把default_domain_resolver指向一个不存在的tag导致FATAL。
     if ! jq -e '.dns.servers[] | select(.tag=="sys")' "${conf_dir}/dns.json" >/dev/null 2>&1; then
         local heal_dns
         heal_dns=$(awk '/^nameserver[ \t]+/{print $2; exit}' /etc/resolv.conf 2>/dev/null)
@@ -2684,14 +2654,11 @@ restore_direct_outbound() {
         jq_write "${conf_dir}/dns.json" --arg s "$heal_dns" '.dns.servers = [{"tag":"sys","type":"udp","server":$s}] + .dns.servers'
     fi
 
-    # 按当前网卡环境选择 local / sys 解析器
-    # 比如后来才装了菜单12的WARP），复杂环境用固定地址"sys"更稳，
     local cur_resolver_tag="local"
     if ip link show 2>/dev/null | grep -qE '^[0-9]+: (wgcf-v[46]|[a-z]*clat[a-z0-9]*)[:@]'; then
         cur_resolver_tag="sys"
     fi
 
-    # 恢复 outbounds.json 中的 direct 出站（不存在则插入到数组最前面）
     if ! jq -e '.outbounds[] | select(.tag == "direct")' "$outbound_file" > /dev/null 2>&1; then
         jq_write "$outbound_file" '.outbounds = [{"type": "direct", "tag": "direct"}] + .outbounds'
     fi
@@ -2702,6 +2669,7 @@ restore_direct_outbound() {
     sleep 2; warp_manage
 }
 
+# 删除分流规则
 delete_rule_menu() {
     clear
     green "当前已启用的分流规则集:"
@@ -2715,13 +2683,11 @@ delete_rule_menu() {
     if [ -z "$tag" ] || [ "$tag" == "null" ]; then
         red "无效的选择"; sleep 1; warp_manage; return
     fi
-    # 删除 telegram 时一并删除 telegram-ip
     local tags_to_del=("$tag")
     if [ "$tag" = "telegram" ] || [ "$tag" = "telegram-ip" ]; then
         tags_to_del=("telegram" "telegram-ip")
     fi
     for t in "${tags_to_del[@]}"; do
-        # 删除指定 rule_set 标签后，始终保留首位 sniff，并去掉空 rule_set 规则
         jq_write "$route_file" --arg tag "$t" '
           .route.rules = (
             [{"action":"sniff"}]
@@ -2739,8 +2705,6 @@ delete_rule_menu() {
           )
         '
 
-        # 删除 inline 自定义 rule_set 定义
-        # 避免名称被占用导致无法重新创建；内置服务的远程 rule_set 为共享定义，保留不动。
         if jq -e --arg tag "$t" '.route.rule_set[]? | select(.tag == $tag and .type == "inline")' "$route_file" >/dev/null 2>&1; then
             jq_write "$route_file" --arg tag "$t" '.route.rule_set = [.route.rule_set[] | select(.tag != $tag)]'
         fi
@@ -2754,13 +2718,13 @@ delete_rule_menu() {
     sleep 1; warp_manage
 }
 
-# URL 解码（ss2022 userinfo）
-# 例如 %2B -> +  %3D -> =  （注意：不把 '+' 转成空格，避免破坏 base64 内容）
+# URL 解码
 urldecode() {
     local data="${1//%/\\x}"
     printf '%b' "$data"
 }
 
+# 添加代理出站 (socks/http/ss)
 add_socks5_proxy() {
     clear
     reading "请输入代理URL (支持socks://,socks5://,http://,ss://(ss2022) 支持v2rayN导出的节点链接): " proxy_url
@@ -2801,8 +2765,6 @@ add_socks5_proxy() {
         fi
     fi
 
-    # 正确解析 [IPv6]:port
-    # 否则用简单的 %%:* / ##*: 会把 IPv6 地址从第一个冒号处截断，导致 server 字段变成垃圾值
     if [[ "$host_port" == \[*\]:* ]]; then
         server="${host_port%%]:*}"
         server="${server#\[}"
@@ -2813,14 +2775,12 @@ add_socks5_proxy() {
     [ -z "$server" ] || [ -z "$port" ] && { red "格式错误：缺少ip或端口"; sleep 2; return; }
 
     if [ "$outbound_type" = "shadowsocks" ]; then
-        # ss/ss2022：user_pass 部分是 method:password，沿用上面的解析结果
         method="$user"
         [ -z "$method" ] || [ -z "$password" ] && { red "格式错误：ss链接缺少加密方式(method)或密码"; sleep 2; return; }
         yellow "Shadowsocks/ss2022 出站暂不支持在线检测（检测API仅支持socks/http），将直接添加，请自行确认服务器信息无误。"
     else
         [[ "$proto" == "socks" || "$proto" == "socks5" ]] && check_proto="socks5" || check_proto="$proto"
 
-        # IPv6 host 加中括号
         local server_for_url="$server"
         [[ "$server" == *:* ]] && server_for_url="[${server}]"
 
@@ -2834,7 +2794,6 @@ add_socks5_proxy() {
             { [ -n "$user" ] && proxy_auth="${user}@"; }
 
         if [ "$is_local" = true ]; then
-            # 本地代理用 curl 测连通
             yellow "检测到本地代理 ${check_proto}://${server_for_url}:${port}，跳过外部API检测，正在用curl测试连通性..."
             local curl_proxy_url="${check_proto}://${proxy_auth}${server_for_url}:${port}"
             local test_result
@@ -2847,7 +2806,6 @@ add_socks5_proxy() {
                 green "本地代理可用，出口IP: $test_result"
             fi
         else
-            # 远程代理走检测 API
             yellow "正在测试代理 ${check_proto}://${server_for_url}:${port} ..."
             local api_response
             api_response=$(curl -s --max-time 8 -G \
@@ -2884,14 +2842,12 @@ add_socks5_proxy() {
            '.outbounds += [{"type":$type,"tag":$tag,"server":$server,"server_port":($port|tonumber)}]'
     fi
 
-    # 新出站不自动接管已有分流，需手动指定
-    # 否则会把之前所有服务(如gemini/openai等)的出站全部覆盖成这个新加的代理，
-
     reload_singbox
     green "\n${tag} 代理出站已添加\n"
     sleep 2; warp_manage
 }
 
+# 删除代理出站
 delete_socks5_proxy() {
     clear
     green "当前可用出站列表:"
@@ -2917,26 +2873,25 @@ delete_socks5_proxy() {
     sleep 1
 }
 
-# 协议管理
-
-# 检查指定 tag 是否已在 inbounds 中存在
+# 检查协议是否已存在
 proto_exists() {
     local tag="$1"
     jq -e --arg tag "$tag" '.inbounds[] | select(.tag == $tag)' "${conf_dir}/inbounds.json" > /dev/null 2>&1
 }
 
-# 更新订阅文件
+# 从订阅中删除指定协议链接
 remove_url_by_tag() {
     local tag="$1"
     sed -i '/'^${tag}':\/\//d' "$client_dir"
     sed -i '/^$/{N; /\n$/D}' "$client_dir"
 }
 
+# 更新订阅文件
 update_sub() {
-    # 兼容旧调用名，统一走 update_subscription
     update_subscription
 }
 
+# 添加 Socks5 入站
 add_socks5_inbound() {
     local inbounds_file="${conf_dir}/inbounds.json"
     local tag="socks5-in"
@@ -2945,7 +2900,6 @@ add_socks5_inbound() {
         yellow "Socks5 协议已存在，无需重复添加。"; sleep 1; return
     fi
 
-    # 获取当前UUID用于自动填充
     local current_uuid
     current_uuid=$(get_current_uuid | tr -d '\n\r')
 
@@ -3013,6 +2967,7 @@ add_socks5_inbound() {
     [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "$url_line"
 }
 
+# 删除 Socks5 入站
 remove_socks5_inbound() {
     local inbounds_file="${conf_dir}/inbounds.json"
     local tag="socks5-in"
@@ -3029,6 +2984,7 @@ remove_socks5_inbound() {
     green "\nSocks5 协议已删除\n"
 }
 
+# 添加 AnyTLS 协议
 add_anytls() {
     local inbounds_file="${conf_dir}/inbounds.json"
     local tag="anytls"
@@ -3037,7 +2993,6 @@ add_anytls() {
         yellow "AnyTLS 协议已存在，无需重复添加。"; sleep 1; return
     fi
 
-    # 使用已安装协议的UUID作为密码
     local current_uuid
     current_uuid=$(get_current_uuid)
     if [ -z "$current_uuid" ]; then
@@ -3086,6 +3041,7 @@ add_anytls() {
     [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "$url_line"
 }
 
+# 删除 AnyTLS 协议
 remove_anytls() {
     local inbounds_file="${conf_dir}/inbounds.json"
     local tag="anytls"
@@ -3102,6 +3058,7 @@ remove_anytls() {
     green "\nAnyTLS 协议已删除\n"
 }
 
+# 添加 Shadowsocks-2022 协议
 add_ss2022() {
     local inbounds_file="${conf_dir}/inbounds.json"
     local tag="shadowsocks-2022"
@@ -3127,7 +3084,7 @@ add_ss2022() {
     green "加密方式为：${purple}${ss_method}${re}"
     local ss_key
     ss_key=$(dd if=/dev/urandom bs=1 count=${key_len} 2>/dev/null | base64 -w0)
-    
+
     jq_write "$inbounds_file" --arg tag "$tag" \
        --argjson port "$ss_port" \
        --arg method "$ss_method" \
@@ -3167,6 +3124,7 @@ add_ss2022() {
     [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "$url_line"
 }
 
+# 删除 Shadowsocks-2022 协议
 remove_ss2022() {
     local inbounds_file="${conf_dir}/inbounds.json"
     local tag="shadowsocks-2022"
@@ -3183,12 +3141,12 @@ remove_ss2022() {
     green "\nShadowsocks-2022 协议已删除\n"
 }
 
+# 显示额外协议状态
 show_extra_proto_status() {
     local inbounds_file="${conf_dir}/inbounds.json"
     echo ""
     green "--- 额外协议状态 ---"
 
-    # Socks5
     if jq -e '.inbounds[] | select(.tag == "socks5-in")' "$inbounds_file" > /dev/null 2>&1; then
         local sk_port sk_user
         sk_port=$(jq -r '.inbounds[] | select(.tag == "socks5-in") | .listen_port' "$inbounds_file")
@@ -3199,7 +3157,6 @@ show_extra_proto_status() {
         echo -e " Socks5:           ${yellow}未启用${re}"
     fi
 
-    # AnyTLS
     if jq -e '.inbounds[] | select(.tag == "anytls")' "$inbounds_file" > /dev/null 2>&1; then
         local at_port at_pass
         at_port=$(jq -r '.inbounds[] | select(.tag == "anytls") | .listen_port' "$inbounds_file")
@@ -3209,7 +3166,6 @@ show_extra_proto_status() {
         echo -e " AnyTLS:           ${yellow}未启用${re}"
     fi
 
-    # Shadowsocks-2022
     if jq -e '.inbounds[] | select(.tag == "shadowsocks-2022")' "$inbounds_file" > /dev/null 2>&1; then
         local ss_port ss_method
         ss_port=$(jq -r '.inbounds[] | select(.tag == "shadowsocks-2022") | .listen_port' "$inbounds_file")
@@ -3221,6 +3177,7 @@ show_extra_proto_status() {
     echo ""
 }
 
+# 协议管理菜单
 manage_protocols() {
     check_singbox &>/dev/null
     if [ $? -eq 2 ]; then
@@ -3261,6 +3218,7 @@ manage_protocols() {
     manage_protocols
 }
 
+# 安装 acme.sh
 install_acme() {
     local acme_email="$1"
     [ -z "$acme_email" ] && acme_email="admin@gmail.com"
@@ -3272,7 +3230,6 @@ install_acme() {
 
     yellow "正在安装 acme.sh...\n"
 
-    # 尽量装好 cron 供 acme 续期
     if command_exists apt; then
         manage_packages install cron >/dev/null 2>&1
         systemctl enable --now cron >/dev/null 2>&1
@@ -3311,8 +3268,7 @@ install_acme() {
     return 0
 }
 
-# DNS 查询优先 DoH，避免本地 DNS 劫持误报
-# family=4 查A记录，family=6 查AAAA记录。
+# DNS 查询（优先 DoH）
 resolve_dns_record() {
     local domain="$1" family="$2" ip="" qtype="A" resp
     [ "$family" = "6" ] && qtype="AAAA"
@@ -3327,7 +3283,6 @@ resolve_dns_record() {
         return
     fi
 
-    # DoH 失败时 getent 兜底
     if command_exists getent; then
         if [ "$family" = "4" ]; then
             ip=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | head -1)
@@ -3338,8 +3293,7 @@ resolve_dns_record() {
     echo "$ip"
 }
 
-# 申请域名证书并替换 hy2/tuic 自签证书
-# 80 端口 pre/post hook：验证时临时停占用服务
+# 证书申请时临时释放 80 端口
 write_port80_hooks() {
     mkdir -p "${work_dir}"
     cat > "${work_dir}/port80-prehook.sh" << 'EOF'
@@ -3377,6 +3331,7 @@ EOF
     chmod +x "${work_dir}/port80-prehook.sh" "${work_dir}/port80-posthook.sh"
 }
 
+# 申请域名证书并替换 hy2/tuic 自签证书
 apply_domain_cert() {
     check_singbox &>/dev/null
     if [ $? -eq 2 ]; then
@@ -3443,7 +3398,6 @@ apply_domain_cert() {
         sleep 2; return
     fi
 
-    # 证书更新后重载 sing-box（优先 reload，失败再 restart）；不碰 argo
     local reload_cmd
     if command_exists systemctl; then
         reload_cmd="systemctl reload sing-box || systemctl restart sing-box"
@@ -3484,6 +3438,7 @@ apply_domain_cert() {
     fi
 }
 
+# 恢复 bing.com 自签证书
 restore_selfsigned_cert() {
     check_singbox &>/dev/null
     if [ $? -eq 2 ]; then
@@ -3522,7 +3477,7 @@ restore_selfsigned_cert() {
     green "\n已恢复为bing.com自签证书\n"
 }
 
-# 域名证书
+# 域名证书管理菜单
 manage_cert() {
     check_singbox &>/dev/null
     if [ $? -eq 2 ]; then
@@ -3554,6 +3509,7 @@ manage_cert() {
     manage_cert
 }
 
+# 出站 IPv4/IPv6 优先级设置
 manage_outbound_strategy() {
     check_singbox &>/dev/null
     if [ $? -eq 2 ]; then
@@ -3597,8 +3553,6 @@ manage_outbound_strategy() {
     local route_file="${conf_dir}/route.json"
     local outbound_file="${conf_dir}/outbounds.json"
 
-    # 补齐 dns.json 中 sys
-    #    避免下面第3步把default_domain_resolver指向一个不存在的tag导致FATAL。
     if ! jq -e '.dns.servers[] | select(.tag=="sys")' "$dns_file" >/dev/null 2>&1; then
         local heal_dns
         heal_dns=$(awk '/^nameserver[ \t]+/{print $2; exit}' /etc/resolv.conf 2>/dev/null)
@@ -3608,14 +3562,10 @@ manage_outbound_strategy() {
 
     jq_write "$dns_file" --arg s "$new_strategy" '.dns.strategy = $s'
 
-    # 删除已废弃的 domain_strategy 字段
-    #    （sing-box 1.12.0+ 已废弃该拨号字段写法，不清理会导致新内核 FATAL 拒绝启动）
     if [ -f "$outbound_file" ] && jq -e '.outbounds[] | select(.tag == "direct") | has("domain_strategy")' "$outbound_file" 2>/dev/null | grep -q true; then
         jq_write "$outbound_file" '(.outbounds[] | select(.tag == "direct")) |= del(.domain_strategy)'
     fi
 
-    # 更新 default_domain_resolver（1.11+）
-    #    系统级WARP(wgcf-v4、wgcf-v6)这类多网卡并存的复杂环境，才用固定地址的"sys"兜底——
     local cur_resolver_tag="local"
     if ip link show 2>/dev/null | grep -qE '^[0-9]+: (wgcf-v[46]|[a-z]*clat[a-z0-9]*)[:@]'; then
         cur_resolver_tag="sys"
@@ -3631,6 +3581,7 @@ manage_outbound_strategy() {
     menu
 }
 
+# 更新 sing-box 内核
 update_singbox_core() {
     local target_version="$1"
     local label="$2"
@@ -3650,8 +3601,6 @@ update_singbox_core() {
         *) red "不支持的架构: ${ARCH_RAW}"; return 1 ;;
     esac
 
-    # Alpine 需 gcompat 才能跑官方 glibc 二进制
-    # 否则官方 GitHub 发行的 glibc 二进制文件在 Alpine 上会直接无法运行（无任何输出，误判为"内核校验失败"）
     if [ -f /etc/alpine-release ]; then
         if ! apk info -e gcompat >/dev/null 2>&1; then
             yellow "\n检测到 Alpine (musl) 系统，正在安装 glibc 兼容层 gcompat...\n"
@@ -3697,7 +3646,6 @@ update_singbox_core() {
         return 1
     fi
 
-    # 校验配置与新内核兼容，失败则回滚
     yellow "正在校验现有配置与新内核的兼容性...\n"
     local check_output
     check_output=$("${work_dir}/sing-box" check -C "${conf_dir}" 2>&1)
@@ -3730,6 +3678,7 @@ update_singbox_core() {
     return 0
 }
 
+# sing-box 内核查看与更新菜单
 manage_singbox_core() {
     check_singbox &>/dev/null
     if [ $? -eq 2 ]; then
@@ -3801,6 +3750,7 @@ manage_singbox_core() {
     manage_singbox_core
 }
 
+# 切换为 BBR+fq 拥塞控制
 enable_bbr_fq() {
     local sysctl_conf="/etc/sysctl.d/99-bbr-fq.conf"
 
@@ -3833,10 +3783,7 @@ EOF
     fi
 }
 
-# 主菜单"1.安装sing-box"分支，原为内联逻辑，抽出便于维护
-# 返回 0：已完成（含"已安装"提示这种什么都没做的情况），主循环按正常流程走 need_pause
-# 返回 1：依赖安装失败，主循环用 `do_install_singbox || continue` 跳过 need_pause 直接重绘菜单，
-#         与原来内联时 `continue` 的效果完全一致
+# 安装 sing-box 主流程
 do_install_singbox() {
     local singbox_check
     check_singbox &>/dev/null; singbox_check=$?
@@ -3863,6 +3810,7 @@ do_install_singbox() {
     return 0
 }
 
+# 主菜单
 menu() {
     singbox_status=$(check_singbox 2>/dev/null)
     dualstack_status=$(check_dualstack 2>/dev/null)
@@ -3901,8 +3849,10 @@ menu() {
     echo "==========="
 }
 
+# 捕获 Ctrl+C
 trap 'red "\n强制退出"; exit' INT
 
+# 参数解析入口
 case "$1" in
     -i | --install)
         auto_install
