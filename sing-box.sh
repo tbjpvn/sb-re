@@ -648,6 +648,16 @@ cleanup_port_hop_nat() {
     fi
 }
 
+# 回收申请证书时放行的80端口（仅在确认没有服务在用80时才关，避免误伤用户自己的网站）
+close_port80_if_unused() {
+    [ -f "${work_dir}/cert_domain.txt" ] || [ -f "${work_dir}/port80-prehook.sh" ] || return 0
+    if is_port_free 80; then
+        deny_port 80/tcp >/dev/null 2>&1 || true
+    else
+        yellow "检测到80端口仍被其他服务占用，已保留防火墙放行规则\n"
+    fi
+}
+
 # 卸载前：只关本脚本节点端口 + 跳跃端口规则
 close_node_firewall_ports() {
     local port_list
@@ -1852,6 +1862,7 @@ uninstall_singbox() {
 
             # 先根据配置关闭防火墙端口（需在删除工作目录之前）
             close_node_firewall_ports
+            close_port80_if_unused
 
             stop_and_remove_services
             cleanup_singbox_residuals
@@ -1877,7 +1888,13 @@ uninstall_singbox() {
                         cleanup_acme_if_needed "$cert_domain"
                         green "acme.sh 中 ${cert_domain} 证书已删除\n"
                         ;;
-                    *) yellow "已保留 acme.sh 证书，可手动执行: ~/.acme.sh/acme.sh --remove -d ${cert_domain} --ecc\n" ;;
+                    *)
+                        # 保留证书时必须摘掉指向 /etc/sing-box 的 pre/post hook，
+                        # 否则工作目录被删后续期会因找不到钩子脚本而失败
+                        local dconf="${HOME}/.acme.sh/${cert_domain}_ecc/${cert_domain}.conf"
+                        [ -f "$dconf" ] && sed -i "/^Le_PreHook=/d;/^Le_PostHook=/d;/^Le_ReloadCmd=/d" "$dconf" 2>/dev/null
+                        yellow "已保留 acme.sh 证书，可手动执行: ~/.acme.sh/acme.sh --remove -d ${cert_domain} --ecc\n"
+                        ;;
                 esac
             fi
 
@@ -1944,6 +1961,7 @@ auto_uninstall() {
 
     # 先关闭节点防火墙端口（需在删除工作目录之前）
     close_node_firewall_ports >/dev/null 2>&1 || true
+    close_port80_if_unused >/dev/null 2>&1 || true
 
     stop_and_remove_services
     cleanup_singbox_residuals
@@ -3397,13 +3415,7 @@ install_acme() {
     local acme_email="$1"
     [ -z "$acme_email" ] && acme_email="admin@gmail.com"
 
-    if [ -f "${HOME}/.acme.sh/acme.sh" ]; then
-        "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1
-        return 0
-    fi
-
-    yellow "正在安装 acme.sh...\n"
-
+    # 无论 acme.sh 是否已安装，都确保 cron 在跑，否则自动续期不会触发
     if command_exists apt; then
         manage_packages install cron >/dev/null 2>&1
         systemctl enable --now cron >/dev/null 2>&1
@@ -3415,6 +3427,13 @@ install_acme() {
         rc-update add dcron default >/dev/null 2>&1
         rc-service dcron start >/dev/null 2>&1
     fi
+
+    if [ -f "${HOME}/.acme.sh/acme.sh" ]; then
+        "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1
+        return 0
+    fi
+
+    yellow "正在安装 acme.sh...\n"
 
     local install_log
     install_log=$(curl -s https://get.acme.sh | sh -s email="$acme_email" --force 2>&1)
@@ -3482,14 +3501,21 @@ for svc in nginx apache2 httpd caddy reality-80; do
     fi
 done
 # 强杀占用80端口的残留进程，但绝不杀 sing-box 自己
-if command -v fuser >/dev/null 2>&1; then
-    for pid in $(fuser 80/tcp 2>/dev/null); do
-        case "$(readlink -f /proc/$pid/exe 2>/dev/null)" in
-            */sing-box) continue ;;
-        esac
-        kill -9 "$pid" >/dev/null 2>&1
-    done
-fi
+port80_pids() {
+    if command -v fuser >/dev/null 2>&1; then
+        fuser 80/tcp 2>/dev/null
+    elif command -v ss >/dev/null 2>&1; then
+        ss -H -tlnp 2>/dev/null | grep -E '[.:]80 ' | grep -oE 'pid=[0-9]+' | cut -d= -f2
+    elif command -v lsof >/dev/null 2>&1; then
+        lsof -iTCP:80 -sTCP:LISTEN -t 2>/dev/null
+    fi
+}
+for pid in $(port80_pids); do
+    case "$(readlink -f /proc/$pid/exe 2>/dev/null)" in
+        */sing-box) continue ;;
+    esac
+    kill -9 "$pid" >/dev/null 2>&1
+done
 exit 0
 EOF
 
@@ -3566,13 +3592,22 @@ apply_domain_cert() {
 
     yellow "\n正在申请证书，请稍候...\n"
     local issue_log
-    issue_log=$("$acme" --issue -d "$domain" --standalone --listen-v6 --local-address :: -k ec-256 --force \
+    # 只有域名仅有 AAAA 记录时才让 acme.sh 监听 IPv6，
+    # 纯 IPv4 机器上强行 --listen-v6 会导致绑定失败
+    local listen_opts=""
+    if [ -z "$resolved_ip4" ] && [ -n "$resolved_ip6" ]; then
+        listen_opts="--listen-v6"
+    fi
+    # shellcheck disable=SC2086
+    issue_log=$("$acme" --issue -d "$domain" --standalone $listen_opts -k ec-256 --force \
         --pre-hook "${work_dir}/port80-prehook.sh" \
         --post-hook "${work_dir}/port80-posthook.sh" 2>&1)
     local issue_result=$?
     echo "$issue_log" | tail -20
 
     if [ "$issue_result" -ne 0 ]; then
+        # acme.sh 失败时不一定会执行 post-hook，这里手动兜底，避免 nginx/caddy 被停掉后不再拉起
+        [ -f "${work_dir}/.port80_state" ] && bash "${work_dir}/port80-posthook.sh" >/dev/null 2>&1
         red "\n证书申请失败！以上是acme.sh的详细输出，请检查域名解析是否生效、80端口是否仍被占用。\n"
         sleep 2; return
     fi
@@ -3643,6 +3678,7 @@ restore_selfsigned_cert() {
 
     [ -f "${HOME}/.acme.sh/acme.sh" ] && "${HOME}/.acme.sh/acme.sh" --remove -d "$old_domain" --ecc >/dev/null 2>&1
     rm -f "${work_dir}/cert_domain.txt"
+    close_port80_if_unused
 
     ensure_singbox_running
 
