@@ -655,14 +655,10 @@ close_node_firewall_ports() {
     if [ -z "$port_list" ]; then
         return 0
     fi
-    yellow "正在关闭本脚本节点端口：\n"
-    while IFS= read -r port; do
-        [ -n "$port" ] && yellow "  - ${port}\n"
-    done <<< "$port_list"
     # shellcheck disable=SC2086
     deny_port $port_list
     cleanup_port_hop_nat
-    green "节点/跳跃端口已关闭\n"
+    green "已关闭本脚本添加的端口防火墙规则\n"
 }
 
 detect_warp_out_family() {
@@ -1755,6 +1751,33 @@ start_singbox()  { manage_service "sing-box" "start"; }
 stop_singbox()   { manage_service "sing-box" "stop"; }
 restart_singbox(){ manage_service "sing-box" "restart"; }
 reload_singbox() { manage_service "sing-box" "reload"; }
+
+# 重启 sing-box 并确认确实起来了，起不来就重试/给出日志
+ensure_singbox_running() {
+    local i status
+    for i in 1 2 3; do
+        if command_exists rc-service; then
+            rc-service sing-box restart >/dev/null 2>&1
+        elif command_exists systemctl; then
+            systemctl restart sing-box >/dev/null 2>&1
+        fi
+        sleep 2
+        status=$(check_service "sing-box" "${work_dir}/${server_name}" 2>/dev/null)
+        if echo "$status" | grep -q "running"; then
+            green "sing-box 运行正常\n"
+            return 0
+        fi
+        sleep 2
+    done
+    red "sing-box 未能正常启动，请检查配置：\n"
+    if command_exists systemctl; then
+        journalctl -u sing-box -n 15 --no-pager 2>/dev/null
+    else
+        "${work_dir}/${server_name}" check -C "${conf_dir}" 2>&1 | tail -15
+    fi
+    return 1
+}
+
 start_argo()     { manage_service "argo" "start"; }
 stop_argo()      { manage_service "argo" "stop"; }
 restart_argo()   { manage_service "argo" "restart"; }
@@ -2086,6 +2109,7 @@ change_config() {
             iptables -t nat -A PREROUTING -p udp --dport $min_port:$max_port -j DNAT --to-destination :$listen_port > /dev/null
             command_exists ip6tables && ip6tables -t nat -A PREROUTING -p udp --dport $min_port:$max_port -j DNAT --to-destination :$listen_port > /dev/null
             if command_exists rc-service 2>/dev/null; then
+                mkdir -p /etc/iptables
                 iptables-save > /etc/iptables/rules.v4
                 command_exists ip6tables && ip6tables-save > /etc/iptables/rules.v6
                 cat << 'IEOF' > /etc/init.d/iptables
@@ -2093,7 +2117,8 @@ change_config() {
 depend() { need net; }
 start() {
     [ -f /etc/iptables/rules.v4 ] && iptables-restore < /etc/iptables/rules.v4
-    command_exists ip6tables && [ -f /etc/iptables/rules.v6 ] && ip6tables-restore < /etc/iptables/rules.v6
+    command -v ip6tables >/dev/null 2>&1 && [ -f /etc/iptables/rules.v6 ] && ip6tables-restore < /etc/iptables/rules.v6
+    return 0
 }
 IEOF
                 chmod +x /etc/init.d/iptables && rc-update add iptables default && /etc/init.d/iptables start
@@ -2106,16 +2131,28 @@ IEOF
                 command_exists ip6tables && service ip6tables save > /dev/null 2>&1
                 systemctl enable ip6tables > /dev/null 2>&1 && systemctl start ip6tables > /dev/null 2>&1
             fi
-            reload_singbox
-            ip=$(get_realip)
-            fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
-            uuid=$(sed -n 's/.*hysteria2:\/\/\([^@]*\)@.*/\1/p' $client_dir)
-            line_number=$(grep -n 'hysteria2://' $client_dir | cut -d':' -f1)
-            isp=$(get_isp || echo "$(hostname)")
-            sed -i.bak "/hysteria2:/d" $client_dir
-            sed -i "${line_number}i hysteria2://$uuid@$ip:$listen_port?peer=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none&mport=$listen_port,$min_port-$max_port#$isp-Hysteria2" $client_dir
-            update_subscription
-            print_client_urls
+            # 不重建整条链接，只在原有 hysteria2 行上追加/替换 mport，
+            # 这样 sni、证书、insecure、IPv6 中括号等原有参数都不会丢
+            local hy2_line new_hy2 tmp_url
+            hy2_line=$(grep -m1 '^hysteria2://' "$client_dir")
+            if [ -z "$hy2_line" ]; then
+                red "\n未在订阅中找到 hysteria2 节点，跳跃端口规则已添加但链接未更新\n"
+            else
+                hy2_line=$(printf '%s' "$hy2_line" | sed -E 's/[&?]mport=[^#&]*//g')
+                if printf '%s' "$hy2_line" | grep -q '#'; then
+                    new_hy2="${hy2_line%%#*}&mport=${listen_port},${min_port}-${max_port}#${hy2_line#*#}"
+                else
+                    new_hy2="${hy2_line}&mport=${listen_port},${min_port}-${max_port}"
+                fi
+                tmp_url=$(mktemp)
+                awk -v new="$new_hy2" '
+                    /^hysteria2:\/\// { if (!done) { print new; done=1 } ; next }
+                    { print }
+                ' "$client_dir" > "$tmp_url" && cat "$tmp_url" > "$client_dir"
+                rm -f "$tmp_url"
+                update_subscription
+                print_client_urls
+            fi
             green "\nhysteria2端口跳跃已开启：${purple}$min_port-$max_port${re}\n"
             ;;
         5)
@@ -3436,15 +3473,23 @@ write_port80_hooks() {
 STATE_FILE="/etc/sing-box/.port80_state"
 : > "$STATE_FILE"
 for svc in nginx apache2 httpd caddy reality-80; do
-    if command_exists systemctl && systemctl is-active --quiet "$svc" 2>/dev/null; then
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$svc" 2>/dev/null; then
         echo "systemctl:$svc" >> "$STATE_FILE"
         systemctl stop "$svc" >/dev/null 2>&1
-    elif command_exists rc-service && rc-service "$svc" status 2>/dev/null | grep -q started; then
+    elif command -v rc-service >/dev/null 2>&1 && rc-service "$svc" status 2>/dev/null | grep -q started; then
         echo "rc-service:$svc" >> "$STATE_FILE"
         rc-service "$svc" stop >/dev/null 2>&1
     fi
 done
-fuser -k -9 80/tcp >/dev/null 2>&1
+# 强杀占用80端口的残留进程，但绝不杀 sing-box 自己
+if command -v fuser >/dev/null 2>&1; then
+    for pid in $(fuser 80/tcp 2>/dev/null); do
+        case "$(readlink -f /proc/$pid/exe 2>/dev/null)" in
+            */sing-box) continue ;;
+        esac
+        kill -9 "$pid" >/dev/null 2>&1
+    done
+fi
 exit 0
 EOF
 
@@ -3534,7 +3579,7 @@ apply_domain_cert() {
 
     local reload_cmd
     if command_exists systemctl; then
-        reload_cmd="systemctl reload sing-box || systemctl restart sing-box"
+        reload_cmd="systemctl restart sing-box"
     elif command_exists rc-service; then
         reload_cmd="rc-service sing-box restart"
     else
@@ -3554,7 +3599,10 @@ apply_domain_cert() {
     chmod 600 "${work_dir}/private.key"
     echo "$domain" > "${work_dir}/cert_domain.txt"
 
-    reload_singbox
+    # acme.sh 的 reloadcmd 可能已经重启过一次，这里稍等再统一重启并确认状态，
+    # 避免两次重启相互抢端口导致 sing-box 停在未运行状态
+    sleep 2
+    ensure_singbox_running || { sleep 2; return; }
 
     if [ -f "$client_dir" ]; then
         sed -i -E "s#(hysteria2://[^?]*\?)sni=[^&]*&insecure=1&pinSHA256=[^&]*#\1sni=${domain}\&insecure=0#" "$client_dir"
@@ -3596,7 +3644,7 @@ restore_selfsigned_cert() {
     [ -f "${HOME}/.acme.sh/acme.sh" ] && "${HOME}/.acme.sh/acme.sh" --remove -d "$old_domain" --ecc >/dev/null 2>&1
     rm -f "${work_dir}/cert_domain.txt"
 
-    reload_singbox
+    ensure_singbox_running
 
     local fingerprint
     fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
