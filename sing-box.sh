@@ -2562,7 +2562,7 @@ warp_manage() {
     jq -r '.route.rules[] | select(.rule_set != null) | .rule_set[]?' "$route_file" 2>/dev/null | sort -u | grep -v '^telegram-ip$' | while read tag; do
         echo -e " - ${skyblue}$tag${re}"
     done || echo "  无"
-    green "\n已添加的代理出站(socks/http/ss2022):"
+    green "\n已添加的出站(代理socks/http/ss2022 及 本地IP直出):"
     jq -r '.outbounds[] | select(.tag != "direct") | " - \(.tag) [\(.type)]"' "$outbound_file" 2>/dev/null || echo "  无"
 
     echo ""
@@ -2572,11 +2572,13 @@ warp_manage() {
     skyblue "--------------"
     green "3. 添加 代理出站 (Socks5/HTTP/SS2022)"
     skyblue "----------------------"
-    red "4. 删除 代理出站 (Socks5/HTTP/SS2022)"
+    green "4. 添加 本地IP出站 (多IP机器选择出口IP)"
     skyblue "----------------------"
-    green "5. 重新生成独立 WARP 密钥"
+    red "5. 删除 出站 (代理出站/本地IP出站)"
     skyblue "----------------------"
-    green "6. 测试 WARP 连通性（推荐）"
+    green "6. 重新生成独立 WARP 密钥"
+    skyblue "----------------------"
+    green "7. 测试 WARP 连通性（推荐）"
     skyblue "----------------------"
     purple "0. 返回主菜单"
     skyblue "------------"
@@ -2587,9 +2589,10 @@ warp_manage() {
         1)  add_rule_menu ;;
         2)  delete_rule_menu ;;
         3)  add_socks5_proxy ;;
-        4)  delete_socks5_proxy ;;
-        5)  regenerate_warp_keys; warp_manage ;;
-        6)  test_warp_connectivity ;;
+        4)  add_local_ip_outbound ;;
+        5)  delete_socks5_proxy ;;
+        6)  regenerate_warp_keys; warp_manage ;;
+        7)  test_warp_connectivity ;;
         0)  menu ;;
         00) exit 0 ;;
         *)  red "无效选项"; sleep 1; warp_manage ;;
@@ -3041,6 +3044,81 @@ add_socks5_proxy() {
 
     reload_singbox
     green "\n${tag} 代理出站已添加\n"
+    sleep 2; warp_manage
+}
+
+add_local_ip_outbound() {
+    clear
+    green "=== 添加 本地IP出站 (多IP机器选择出口IP) ===\n"
+    yellow "原理：为 direct 出站绑定本机某个具体公网IP，作用类似WARP/代理出站，\n可用于将指定分流规则固定从某张网卡/某个IP发出（如机房IPv4/机房IPv6/家宽IP三选一）。\n"
+
+    local ip4_list ip6_list ip_list
+    ip4_list=($(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1))
+    ip6_list=($(ip -6 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1))
+    ip_list=("${ip4_list[@]}" "${ip6_list[@]}")
+
+    if [ ${#ip_list[@]} -eq 0 ]; then
+        red "未检测到本机可用的公网IP地址！"; sleep 2; return
+    fi
+
+    green "检测到本机以下可用IP:"
+    local i=1
+    for ip in "${ip_list[@]}"; do
+        echo -e "  ${green}${i}. ${skyblue}${ip}${re}"
+        i=$((i+1))
+    done
+    echo -e "  ${red}0. 返回上级菜单${re}"
+
+    reading "\n请输入编号选择出口IP(也可直接手动输入未列出的IP): " ip_choice
+    local selected_ip
+    if [ "$ip_choice" = "0" ]; then
+        warp_manage; return
+    elif [[ "$ip_choice" =~ ^[0-9]+$ ]] && [ "$ip_choice" -ge 1 ] && [ "$ip_choice" -le "${#ip_list[@]}" ]; then
+        selected_ip="${ip_list[$((ip_choice-1))]}"
+    else
+        selected_ip="$ip_choice"
+    fi
+    [ -z "$selected_ip" ] && { red "输入为空！"; sleep 1; return; }
+
+    reading "请输入该出站的标签名(仅限字母/数字/下划线/中横线，直接回车自动生成): " custom_tag
+    local tag
+    if [ -n "$custom_tag" ]; then
+        tag=$(echo "$custom_tag" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/_/g')
+    else
+        tag="local-$(echo "$selected_ip" | tr ':.' '--')"
+    fi
+
+    jq -e --arg tag "$tag" '.outbounds[] | select(.tag == $tag)' "$outbound_file" >/dev/null 2>&1 \
+        && { red "出站标签 '${tag}' 已存在"; sleep 2; return; }
+
+    local bind_field
+    if [[ "$selected_ip" == *:* ]]; then
+        bind_field="inet6_bind_address"
+    else
+        bind_field="inet4_bind_address"
+    fi
+
+    yellow "正在测试从 ${selected_ip} 出站的连通性..."
+    local test_ip
+    if [ "$bind_field" = "inet4_bind_address" ]; then
+        test_ip=$(curl -s --max-time 8 --interface "$selected_ip" -4 "https://api.ip.sb/ip" 2>/dev/null)
+    else
+        test_ip=$(curl -s --max-time 8 --interface "$selected_ip" -6 "https://api.ip.sb/ip" 2>/dev/null)
+    fi
+    if [ -z "$test_ip" ]; then
+        yellow "警告：绑定 ${selected_ip} 测试出站失败（可能该IP未配置在本机网卡上，或被防火墙拦截）。"
+        reading "是否仍然添加此出站？(y/n): " force_add
+        [[ ! "$force_add" =~ ^[yY]$ ]] && { yellow "已取消"; sleep 1; return; }
+    else
+        green "测试成功，出口IP: ${test_ip}"
+    fi
+
+    jq_write "$outbound_file" --arg tag "$tag" --arg field "$bind_field" --arg ip "$selected_ip" \
+        '.outbounds += [{"type":"direct","tag":$tag} + {($field): $ip}]'
+
+    reload_singbox
+    green "\n本地IP出站 '${tag}' (绑定 ${selected_ip}) 已添加\n"
+    yellow "提示: 到「1. 设置分流服务」或「10. 添加 全局代理出站」中选择该出站，\n即可让指定流量固定从这个本地IP发出。\n"
     sleep 2; warp_manage
 }
 
