@@ -3091,11 +3091,23 @@ add_local_ip_outbound() {
     jq -e --arg tag "$tag" '.outbounds[] | select(.tag == $tag)' "$outbound_file" >/dev/null 2>&1 \
         && { red "出站标签 '${tag}' 已存在"; sleep 2; return; }
 
-    local bind_field
+    local bind_field domain_strategy strict_family
     if [[ "$selected_ip" == *:* ]]; then
         bind_field="inet6_bind_address"
+        strict_family="ipv6"
     else
         bind_field="inet4_bind_address"
+        strict_family="ipv4"
+    fi
+
+    yellow "\n该出站需要设置 domain_strategy，避免被全局 prefer_ipv4/v6 策略带偏："
+    echo -e "  ${green}1. 严格模式 (${strict_family}_only)${re} —— 保证100%走这个IP，但如果这个协议族连不通就直接失败，不会偷偷换别的出口"
+    echo -e "  ${green}2. 优先模式 (prefer_${strict_family})${re} —— 优先走这个IP，连不通时会自动换成本机默认IP兜底（可能不是你想要的出口）"
+    reading "请选择 [1/2，直接回车默认1]: " ds_choice
+    if [ "$ds_choice" = "2" ]; then
+        domain_strategy="prefer_${strict_family}"
+    else
+        domain_strategy="${strict_family}_only"
     fi
 
     yellow "正在测试从 ${selected_ip} 出站的连通性..."
@@ -3113,11 +3125,11 @@ add_local_ip_outbound() {
         green "测试成功，出口IP: ${test_ip}"
     fi
 
-    jq_write "$outbound_file" --arg tag "$tag" --arg field "$bind_field" --arg ip "$selected_ip" \
-        '.outbounds += [{"type":"direct","tag":$tag} + {($field): $ip}]'
+    jq_write "$outbound_file" --arg tag "$tag" --arg field "$bind_field" --arg ip "$selected_ip" --arg ds "$domain_strategy" \
+        '.outbounds += [{"type":"direct","tag":$tag} + {($field): $ip} + {"domain_strategy":$ds}]'
 
     reload_singbox
-    green "\n本地IP出站 '${tag}' (绑定 ${selected_ip}) 已添加\n"
+    green "\n本地IP出站 '${tag}' (绑定 ${selected_ip}, domain_strategy=${domain_strategy}) 已添加\n"
     yellow "提示: 到「1. 设置分流服务」或「10. 添加 全局代理出站」中选择该出站，\n即可让指定流量固定从这个本地IP发出。\n"
     sleep 2; warp_manage
 }
