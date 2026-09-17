@@ -3100,7 +3100,11 @@ add_local_ip_outbound() {
         strict_family="ipv4"
     fi
 
-    yellow "\n该出站需要设置 domain_strategy，避免被全局 prefer_ipv4/v6 策略带偏："
+    local dns_resolver_tag
+    dns_resolver_tag=$(jq -r '.route.default_domain_resolver.server // .route.default_domain_resolver // empty' "$route_file" 2>/dev/null)
+    [ -z "$dns_resolver_tag" ] || [ "$dns_resolver_tag" = "null" ] && dns_resolver_tag="local"
+
+    yellow "\n该出站需要设置 domain_resolver（sing-box 1.12+ 已废弃 domain_strategy 字段），避免被全局策略带偏："
     echo -e "  ${green}1. 严格模式 (${strict_family}_only)${re} —— 保证100%走这个IP，但如果这个协议族连不通就直接失败，不会偷偷换别的出口"
     echo -e "  ${green}2. 优先模式 (prefer_${strict_family})${re} —— 优先走这个IP，连不通时会自动换成本机默认IP兜底（可能不是你想要的出口）"
     reading "请选择 [1/2，直接回车默认1]: " ds_choice
@@ -3125,11 +3129,11 @@ add_local_ip_outbound() {
         green "测试成功，出口IP: ${test_ip}"
     fi
 
-    jq_write "$outbound_file" --arg tag "$tag" --arg field "$bind_field" --arg ip "$selected_ip" --arg ds "$domain_strategy" \
-        '.outbounds += [{"type":"direct","tag":$tag} + {($field): $ip} + {"domain_strategy":$ds}]'
+    jq_write "$outbound_file" --arg tag "$tag" --arg field "$bind_field" --arg ip "$selected_ip" --arg ds "$domain_strategy" --arg resolver "$dns_resolver_tag" \
+        '.outbounds += [{"type":"direct","tag":$tag} + {($field): $ip} + {"domain_resolver": {"server": $resolver, "strategy": $ds}}]'
 
     reload_singbox
-    green "\n本地IP出站 '${tag}' (绑定 ${selected_ip}, domain_strategy=${domain_strategy}) 已添加\n"
+    green "\n本地IP出站 '${tag}' (绑定 ${selected_ip}, domain_resolver.strategy=${domain_strategy}) 已添加\n"
     yellow "提示: 到「1. 设置分流服务」或「10. 添加 全局代理出站」中选择该出站，\n即可让指定流量固定从这个本地IP发出。\n"
     sleep 2; warp_manage
 }
