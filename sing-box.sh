@@ -2559,8 +2559,8 @@ warp_manage() {
     echo ""
     green "=== WARP 分流管理 ===\n"
     green "当前已启用的分流规则集:"
-    jq -r '.route.rules[] | select(.rule_set != null) | .rule_set[]?' "$route_file" 2>/dev/null | sort -u | grep -v '^telegram-ip$' | while read tag; do
-        echo -e " - ${skyblue}$tag${re}"
+    jq -r '.route.rules[]? | select(.rule_set != null) | .outbound as $out | .rule_set[]? | select(. != "telegram-ip") | "\(.)\t\($out)"' "$route_file" 2>/dev/null | sort -u -t$'\t' -k1,1 | while IFS=$'\t' read -r tag out; do
+        echo -e " - ${skyblue}${tag}${re} ${yellow}→${re} ${purple}${out}${re}"
     done || echo "  无"
     green "\n已添加的出站(代理socks/http/ss2022 及 本地IP直出):"
     jq -r '.outbounds[] | select(.tag != "direct") | " - \(.tag) [\(.type)]"' "$outbound_file" 2>/dev/null || echo "  无"
@@ -2875,7 +2875,7 @@ restore_direct_outbound() {
 delete_rule_menu() {
     clear
     green "当前已启用的分流规则集:"
-    jq -r '.route.rules[] | select(.rule_set != null) | .rule_set[]?' "$route_file" | grep -v '^telegram-ip$' | nl -w2 -s'. '
+    jq -r '.route.rules[]? | select(.rule_set != null) | .outbound as $out | .rule_set[]? | select(. != "telegram-ip") | "\(.) → \($out)"' "$route_file" | nl -w2 -s'. '
     reading "\n输入要删除的规则名称或序号: " del_input
     if [[ "$del_input" =~ ^[0-9]+$ ]]; then
         tag=$(jq -r --arg idx "$del_input" '[.route.rules[] | select(.rule_set != null) | .rule_set[]] | .[(($idx | tonumber) - 1)]' "$route_file")
