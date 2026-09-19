@@ -1757,10 +1757,40 @@ manage_service() {
     esac
 }
 
+validate_singbox_config() {
+    local sb_bin="${work_dir}/sing-box"
+    [ -x "$sb_bin" ] || return 0
+    "$sb_bin" check -C "${conf_dir}" 2>&1
+}
+
 start_singbox()  { manage_service "sing-box" "start"; }
 stop_singbox()   { manage_service "sing-box" "stop"; }
-restart_singbox(){ manage_service "sing-box" "restart"; }
-reload_singbox() { manage_service "sing-box" "reload"; }
+
+restart_singbox(){
+    local check_output
+    if [ -x "${work_dir}/sing-box" ]; then
+        check_output=$(validate_singbox_config)
+        if [ $? -ne 0 ]; then
+            red "配置校验未通过，sing-box 未重启，当前仍在使用旧配置运行：\n"
+            echo "$check_output"
+            return 1
+        fi
+    fi
+    manage_service "sing-box" "restart"
+}
+
+reload_singbox() {
+    local check_output
+    if [ -x "${work_dir}/sing-box" ]; then
+        check_output=$(validate_singbox_config)
+        if [ $? -ne 0 ]; then
+            red "配置校验未通过，sing-box 未重载，当前仍在使用旧配置运行：\n"
+            echo "$check_output"
+            return 1
+        fi
+    fi
+    manage_service "sing-box" "reload"
+}
 
 # 重启 sing-box 并确认确实起来了，起不来就重试/给出日志
 ensure_singbox_running() {
@@ -2716,6 +2746,21 @@ finalize_rule_add() {
         '.route.rules[] | select(.rule_set != null) | .rule_set[]? | select(. == $tag)' \
         "$route_file" > /dev/null 2>&1; then
         yellow "规则集 '${rule_tag}' 已启用。"; sleep 1; warp_manage; return
+    fi
+
+    # 防止生成"引用存在但定义缺失"的悬空规则(sing-box会因此启动失败)：
+    # 添加引用前先确认 rule_set 定义存在，缺失则尝试从内置定义自动补回。
+    if ! jq -e --arg tag "$rule_tag" '.route.rule_set[]? | select(.tag == $tag)' "$route_file" > /dev/null 2>&1; then
+        local builtin_def
+        builtin_def=$(default_route_rule_sets_json 2>/dev/null | jq -c --arg tag "$rule_tag" '.[] | select(.tag == $tag)')
+        if [ -n "$builtin_def" ]; then
+            jq_write "$route_file" --argjson def "$builtin_def" '.route.rule_set += [$def]'
+            yellow "规则集 '${rule_tag}' 的定义缺失，已自动补回。"
+        else
+            red "规则集 '${rule_tag}' 不存在（既非内置服务，定义也已丢失），无法启用。"
+            yellow "请使用「12. 自定义分流」重新创建该规则。"
+            sleep 2; warp_manage; return
+        fi
     fi
 
     jq_write "$route_file" '
