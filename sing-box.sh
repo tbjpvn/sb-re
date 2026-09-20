@@ -2758,14 +2758,15 @@ finalize_rule_add() {
     # 防止生成"引用存在但定义缺失"的悬空规则(sing-box会因此启动失败)：
     # 添加引用前先确认 rule_set 定义存在，缺失则尝试从内置定义自动补回。
     if ! jq -e --arg tag "$rule_tag" '.route.rule_set[]? | select(.tag == $tag)' "$route_file" > /dev/null 2>&1; then
-        local builtin_def
-        builtin_def=$(default_route_rule_sets_json 2>/dev/null | jq -c --arg tag "$rule_tag" '.[] | select(.tag == $tag)')
-        if [ -n "$builtin_def" ]; then
-            jq_write "$route_file" --argjson def "$builtin_def" '.route.rule_set += [$def]'
+        local builtin_defs matched_count
+        builtin_defs=$(default_route_rule_sets_json 2>/dev/null)
+        matched_count=$(echo "$builtin_defs" | jq --arg tag "$rule_tag" '[.[] | select(.tag == $tag)] | length' 2>/dev/null)
+        if [ "$matched_count" = "1" ] && jq_write "$route_file" --argjson defs "$builtin_defs" --arg tag "$rule_tag" \
+            '.route.rule_set += [$defs[] | select(.tag == $tag)]'; then
             yellow "规则集 '${rule_tag}' 的定义缺失，已自动补回。"
         else
-            red "规则集 '${rule_tag}' 不存在（既非内置服务，定义也已丢失），无法启用。"
-            yellow "请使用「12. 自定义分流」重新创建该规则。"
+            red "规则集 '${rule_tag}' 不存在，或自动补回失败，无法启用。"
+            yellow "请使用「12. 自定义分流」重新创建该规则，或检查 route.json 是否有其他问题。"
             sleep 2; warp_manage; return
         fi
     fi
