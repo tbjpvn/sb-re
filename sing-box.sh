@@ -2589,8 +2589,15 @@ warp_manage() {
     echo ""
     green "=== WARP 分流管理 ===\n"
     green "当前已启用的分流规则集:"
-    jq -r '.route.rules[] | select(.rule_set != null) | .rule_set[]?' "$route_file" 2>/dev/null | sort -u | grep -v '^telegram-ip$' | while read tag; do
-        echo -e " - ${skyblue}$tag${re}"
+    jq -r '
+      .route.rules[]
+      | select(.rule_set != null and .outbound != null)
+      | . as $r
+      | ($r.rule_set - ["telegram-ip"]) as $tags
+      | select(($tags | length) > 0)
+      | "\($tags | join(", "))\t\($r.outbound)"
+    ' "$route_file" 2>/dev/null | while IFS=$'\t' read -r tags outb; do
+        echo -e " - ${skyblue}${tags}${re} ${purple}->${re} ${green}${outb}${re}"
     done || echo "  无"
     green "\n已添加的出站(代理socks/http/ss2022 及 本地IP直出):"
     jq -r '.outbounds[] | select(.tag != "direct") | " - \(.tag) [\(.type)]"' "$outbound_file" 2>/dev/null || echo "  无"
