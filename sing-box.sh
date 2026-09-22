@@ -4142,6 +4142,50 @@ EOF
     fi
 }
 
+sync_system_time() {
+    clear; echo ""
+    green "=== 系统时间同步（校时，缓解因时间偏差导致的连接异常/卡顿） ===\n"
+    yellow "同步前系统时间: $(date)\n"
+
+    if ! command_exists chronyd && ! command_exists chronyc; then
+        yellow "正在安装 chrony...\n"
+        manage_packages install chrony || { red "chrony 安装失败，请检查网络后重试，或手动安装。\n"; return 1; }
+    else
+        green "chrony 已安装\n"
+    fi
+
+    if command_exists systemctl; then
+        if systemctl is-active systemd-timesyncd &>/dev/null; then
+            yellow "检测到 systemd-timesyncd 正在运行，为避免与 chrony 冲突，先将其停用...\n"
+            systemctl disable --now systemd-timesyncd &>/dev/null
+        fi
+        local svc="chrony"
+        systemctl list-unit-files 2>/dev/null | grep -q '^chronyd\.service' && svc="chronyd"
+        systemctl enable --now "$svc" &>/dev/null
+        yellow "正在强制校准一次系统时间...\n"
+        command_exists chronyc && chronyc -a makestep &>/dev/null
+        sleep 1
+        if systemctl is-active "$svc" &>/dev/null; then
+            green "时间同步服务(${svc})已启用并正在运行。\n"
+        else
+            red "时间同步服务启动失败，请手动检查: systemctl status ${svc}\n"
+        fi
+    elif command_exists rc-service; then
+        rc-update add chronyd default &>/dev/null
+        rc-service chronyd start &>/dev/null || rc-service chronyd restart &>/dev/null
+        command_exists chronyc && chronyc -a makestep &>/dev/null
+        green "chronyd 已通过 OpenRC 启用。\n"
+    else
+        yellow "未识别到 systemctl / OpenRC，尝试直接前台校时一次...\n"
+        command_exists chronyd && chronyd -q 'server pool.ntp.org iburst' 2>&1 | tail -5
+    fi
+
+    echo ""
+    green "同步后系统时间: $(date)\n"
+    yellow "提示：VPS 卡顿/连接异常除了时间偏差，也可能是 CPU/内存/带宽跑满导致，同步后若问题依旧，建议用 top/负载排查或联系服务商。\n"
+    return 0
+}
+
 do_install_singbox() {
     local singbox_check
     check_singbox &>/dev/null; singbox_check=$?
@@ -4200,6 +4244,7 @@ menu() {
     green "11. sing-box内核查看/更新"
     green "12. 单栈VPS加装WARP全局出站"
     green "13. 切换为 BBR+fq 拥塞控制"
+    green "14. 系统时间同步(校时/防卡顿)"
     echo "==============="
     purple "20. ssh综合工具箱"
     echo "==============="
@@ -4246,7 +4291,7 @@ case "$1" in
     "")
         while true; do
             menu
-            reading "请输入选择(0-13,20): " choice 
+            reading "请输入选择(0-14,20): " choice 
             echo ""
             need_pause=true  
             case "${choice}" in
@@ -4263,6 +4308,7 @@ case "$1" in
                 11) manage_singbox_core; need_pause=false ;;
                 12) system_warp_menu;   need_pause=false ;;
                 13) enable_bbr_fq;       need_pause=true ;;
+                14) sync_system_time;    need_pause=true ;;
                 20)
                     clear
                     bash <(curl -Ls ssh_tool.eooce.com)
@@ -4270,7 +4316,7 @@ case "$1" in
                     ;;
                 0)  exit 0 ;;       
                 *)
-                    red "无效的选项，请输入 0-13 或 20"
+                    red "无效的选项，请输入 0-14 或 20"
                     need_pause=true
                     ;;
             esac
