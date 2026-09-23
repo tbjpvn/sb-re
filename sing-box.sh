@@ -4193,7 +4193,7 @@ time_sync_status() {
     elif [ "$abs_offset" -le 30 ]; then
         yellow "时间偏差: 约 ${offset}s，偏差较小，建议关注\n"
     else
-        red "时间偏差: 约 ${offset}s，偏差过大！建议执行「1. 安装并同步」修复\n"
+        red "时间偏差: 约 ${offset}s，偏差过大！建议执行「2. 安装并立即同步时间」修复(或先用「1. 仅校准一次」应急)\n"
     fi
     return 0
 }
@@ -4227,20 +4227,57 @@ remove_system_time_sync() {
     return 0
 }
 
+# 仅执行一次性时间校准，不安装任何软件包(基于HTTPS响应头Date字段，用date -s直接改系统时间)
+quick_time_sync() {
+    clear; echo ""
+    purple "=== 仅校准一次(不安装chrony) ===\n"
+    yellow "校准前系统时间: $(date)\n"
+
+    local url remote_str
+    for url in "https://www.cloudflare.com" "https://www.qq.com" "https://www.baidu.com"; do
+        remote_str=$(curl -sI --max-time 4 "$url" 2>/dev/null | grep -i '^date:' | head -1 | sed 's/^[Dd]ate:[[:space:]]*//' | tr -d '\r')
+        [ -n "$remote_str" ] && break
+    done
+
+    if [ -z "$remote_str" ]; then
+        red "获取网络时间失败(可能是网络受限)，无法校准\n"
+        return 1
+    fi
+
+    if date -s "$remote_str" &>/dev/null; then
+        green "已根据网络时间校准系统时间\n"
+    else
+        red "校准失败，请确认当前是root权限，或系统date命令是否支持 -s 参数\n"
+        return 1
+    fi
+
+    if command_exists hwclock; then
+        hwclock --systohc &>/dev/null && yellow "已同步写入硬件时钟(RTC)\n"
+    fi
+
+    echo ""
+    green "校准后系统时间: $(date)\n"
+    yellow "提示：此校准为一次性操作，不会常驻后台防止时间再次漂移。若服务器时钟经常跑偏，建议用「2. 安装并立即同步时间」装 chrony 常驻校准。\n"
+    return 0
+}
+
 time_sync_menu() {
     clear; echo ""
     purple "=== 系统时间同步管理 ===\n"
     time_sync_status
     echo ""
-    green  "1. 安装并立即同步时间(chrony)"
-    red    "2. 卸载时间同步服务(chrony)"
+    green  "1. 仅校准一次(不安装chrony)"
+    green  "2. 安装并立即同步时间(chrony)"
+    red    "3. 卸载时间同步服务(chrony)"
     purple "0. 返回主菜单"
     echo "==========================="
-    reading "请输入选择(0-2): " tsm_choice
+    reading "请输入选择(0-3，回车默认1): " tsm_choice
+    [ -z "$tsm_choice" ] && tsm_choice=1
     echo ""
     case "$tsm_choice" in
-        1) sync_system_time; read -n 1 -s -r -p $'\n按任意键返回...'; time_sync_menu ;;
-        2) remove_system_time_sync; read -n 1 -s -r -p $'\n按任意键返回...'; time_sync_menu ;;
+        1) quick_time_sync; read -n 1 -s -r -p $'\n按任意键返回...'; time_sync_menu ;;
+        2) sync_system_time; read -n 1 -s -r -p $'\n按任意键返回...'; time_sync_menu ;;
+        3) remove_system_time_sync; read -n 1 -s -r -p $'\n按任意键返回...'; time_sync_menu ;;
         0) return ;;
         *) red "无效选项\n"; sleep 1; time_sync_menu ;;
     esac
