@@ -4142,6 +4142,110 @@ EOF
     fi
 }
 
+# 通过HTTPS响应头的Date字段获取网络时间，与本机时间比较得出偏差秒数
+# 不依赖是否已安装chrony/ntp等工具，成功回显偏差(整数，正数=本机偏快)，失败返回非0
+get_time_offset() {
+    local url remote_str remote_epoch local_epoch
+    for url in "https://www.cloudflare.com" "https://www.qq.com" "https://www.baidu.com"; do
+        remote_str=$(curl -sI --max-time 4 "$url" 2>/dev/null | grep -i '^date:' | head -1 | sed 's/^[Dd]ate:[[:space:]]*//' | tr -d '\r')
+        [ -n "$remote_str" ] && break
+    done
+    [ -z "$remote_str" ] && return 1
+    remote_epoch=$(date -d "$remote_str" +%s 2>/dev/null)
+    [ -z "$remote_epoch" ] && return 1
+    local_epoch=$(date +%s)
+    echo $((local_epoch - remote_epoch))
+    return 0
+}
+
+# 展示校时服务安装状态、本机时间，并给出偏差诊断
+time_sync_status() {
+    local installed=0 running=0 svc="chrony" offset abs_offset
+
+    if command_exists chronyd || command_exists chronyc; then
+        installed=1
+        if command_exists systemctl; then
+            systemctl list-unit-files 2>/dev/null | grep -q '^chronyd\.service' && svc="chronyd"
+            systemctl is-active "$svc" &>/dev/null && running=1
+        elif command_exists rc-service; then
+            rc-service chronyd status &>/dev/null && running=1
+        fi
+    fi
+
+    if [ "$installed" -eq 1 ] && [ "$running" -eq 1 ]; then
+        green "校时服务: 已安装并运行中(chrony)\n"
+    elif [ "$installed" -eq 1 ]; then
+        yellow "校时服务: 已安装但未运行(chrony)\n"
+    else
+        yellow "校时服务: 未安装\n"
+    fi
+
+    yellow "本机系统时间: $(date)\n"
+
+    offset=$(get_time_offset)
+    if [ -z "$offset" ]; then
+        red "网络时间校验: 获取失败(可能是网络受限)，暂无法判断偏差\n"
+        return 1
+    fi
+    abs_offset=${offset#-}
+    if [ "$abs_offset" -le 3 ]; then
+        green "时间偏差: 约 ${offset}s，正常，无需处理\n"
+    elif [ "$abs_offset" -le 30 ]; then
+        yellow "时间偏差: 约 ${offset}s，偏差较小，建议关注\n"
+    else
+        red "时间偏差: 约 ${offset}s，偏差过大！建议执行「1. 安装并同步」修复\n"
+    fi
+    return 0
+}
+
+# 卸载时间同步服务(chrony)，若系统原生带systemd-timesyncd则恢复它作为基础兜底
+remove_system_time_sync() {
+    clear; echo ""
+    purple "=== 卸载时间同步服务 ===\n"
+    if ! command_exists chronyd && ! command_exists chronyc; then
+        yellow "未检测到已安装的 chrony，无需卸载\n"
+        return 0
+    fi
+
+    if command_exists systemctl; then
+        local svc="chrony"
+        systemctl list-unit-files 2>/dev/null | grep -q '^chronyd\.service' && svc="chronyd"
+        systemctl disable --now "$svc" &>/dev/null
+    elif command_exists rc-service; then
+        rc-service chronyd stop &>/dev/null
+        rc-update del chronyd default &>/dev/null
+    fi
+
+    manage_packages uninstall chrony
+
+    if command_exists systemctl && systemctl list-unit-files 2>/dev/null | grep -q '^systemd-timesyncd\.service'; then
+        yellow "正在恢复 systemd-timesyncd 作为基础时间同步...\n"
+        systemctl enable --now systemd-timesyncd &>/dev/null
+    fi
+
+    green "chrony 已卸载\n"
+    return 0
+}
+
+time_sync_menu() {
+    clear; echo ""
+    purple "=== 系统时间同步管理 ===\n"
+    time_sync_status
+    echo ""
+    green  "1. 安装并立即同步时间(chrony)"
+    red    "2. 卸载时间同步服务(chrony)"
+    purple "0. 返回主菜单"
+    echo "==========================="
+    reading "请输入选择(0-2): " tsm_choice
+    echo ""
+    case "$tsm_choice" in
+        1) sync_system_time; read -n 1 -s -r -p $'\n按任意键返回...'; time_sync_menu ;;
+        2) remove_system_time_sync; read -n 1 -s -r -p $'\n按任意键返回...'; time_sync_menu ;;
+        0) return ;;
+        *) red "无效选项\n"; sleep 1; time_sync_menu ;;
+    esac
+}
+
 sync_system_time() {
     clear; echo ""
     green "=== 系统时间同步（校时，缓解因时间偏差导致的连接异常/卡顿） ===\n"
@@ -4308,7 +4412,7 @@ case "$1" in
                 11) manage_singbox_core; need_pause=false ;;
                 12) system_warp_menu;   need_pause=false ;;
                 13) enable_bbr_fq;       need_pause=true ;;
-                14) sync_system_time;    need_pause=true ;;
+                14) time_sync_menu;      need_pause=false ;;
                 20)
                     clear
                     bash <(curl -Ls ssh_tool.eooce.com)
