@@ -4439,7 +4439,7 @@ create_swap() {
 
 delete_swap() {
     if [ ! -f "$swap_file" ] && ! swapon --show=NAME 2>/dev/null | grep -qx "$swap_file"; then
-        yellow "未检测到本脚本创建的 ${swap_file}，无需处理(系统若还有其他方式创建的swap，请到对应面板处理)\n"
+        yellow "未检测到本脚本创建的swap，无需处理\n"
         return 0
     fi
     swapoff "$swap_file" 2>/dev/null
@@ -4460,7 +4460,7 @@ swap_manage_menu() {
     if swapon --show=NAME 2>/dev/null | grep -qx "$swap_file"; then
         green "其中本脚本管理的 ${swap_file}: $(check_swap_status)\n"
     else
-        yellow "提示: 未检测到本脚本创建的 ${swap_file}；上方如已显示有swap，说明是通过面板或系统自带方式创建的，本脚本不会覆盖或重复创建，只负责管理 ${swap_file} 这一个文件。若在此选择档位，会在系统已有swap之外，再额外新增一份。\n"
+        yellow "提示: 上方swap非本脚本创建，选择档位会额外新增一份\n"
     fi
     green  "1. 512M"
     green  "2. 1024M"
