@@ -4353,6 +4353,117 @@ do_install_singbox() {
     return 0
 }
 
+# ===== 虚拟内存(SWAP)管理 =====
+swap_file="/swapfile"
+
+get_swap_size_mb() {
+    # 返回当前 swap_file 对应的 swap 大小(MB)，未启用返回0
+    if swapon --show=NAME 2>/dev/null | grep -qx "$swap_file"; then
+        local kb
+        kb=$(awk -v f="$swap_file" '$1==f{print $3}' /proc/swaps 2>/dev/null)
+        if [ -n "$kb" ]; then
+            echo $(( kb / 1024 ))
+        else
+            echo "?"
+        fi
+    else
+        echo 0
+    fi
+}
+
+check_swap_status() {
+    local mb
+    mb=$(get_swap_size_mb)
+    if [ "$mb" != "0" ] && [ -n "$mb" ]; then
+        echo "已启用 (约${mb}M)"
+    else
+        echo "未启用"
+    fi
+}
+
+create_swap() {
+    # $1 = 大小(MB)
+    local size_mb="$1"
+    if ! [[ "$size_mb" =~ ^[0-9]+$ ]] || [ "$size_mb" -le 0 ]; then
+        red "无效的大小，请输入正整数(单位M)\n"
+        return 1
+    fi
+
+    local avail_mb
+    avail_mb=$(df -Pm "$(dirname "$swap_file")" 2>/dev/null | awk 'NR==2{print $4}')
+    if [ -n "$avail_mb" ] && [ "$avail_mb" -lt "$size_mb" ]; then
+        red "磁盘可用空间不足(可用约${avail_mb}M，需要${size_mb}M)，已取消\n"
+        return 1
+    fi
+
+    yellow "正在配置 ${size_mb}M 虚拟内存(swap)...\n"
+
+    if swapon --show=NAME 2>/dev/null | grep -qx "$swap_file"; then
+        swapoff "$swap_file" 2>/dev/null
+    fi
+    rm -f "$swap_file"
+
+    if command_exists fallocate && fallocate -l "${size_mb}M" "$swap_file" 2>/dev/null; then
+        :
+    else
+        dd if=/dev/zero of="$swap_file" bs=1M count="$size_mb" status=none
+    fi
+
+    chmod 600 "$swap_file"
+    mkswap "$swap_file" >/dev/null 2>&1
+    if ! swapon "$swap_file" 2>/dev/null; then
+        red "swap启用失败，请检查系统是否支持或内核限制\n"
+        rm -f "$swap_file"
+        return 1
+    fi
+
+    if ! grep -qE "^[^#].*${swap_file}[[:space:]]" /etc/fstab 2>/dev/null; then
+        echo "${swap_file} none swap sw 0 0" >> /etc/fstab
+    fi
+
+    green "虚拟内存已设置为 ${size_mb}M 并已启用(开机自动挂载)\n"
+    free -h
+}
+
+delete_swap() {
+    if [ ! -f "$swap_file" ] && ! swapon --show=NAME 2>/dev/null | grep -qx "$swap_file"; then
+        yellow "当前未配置虚拟内存\n"
+        return 0
+    fi
+    swapoff "$swap_file" 2>/dev/null
+    sed -i "\|^${swap_file}[[:space:]]|d" /etc/fstab 2>/dev/null
+    rm -f "$swap_file"
+    green "虚拟内存已关闭并删除\n"
+}
+
+swap_manage_menu() {
+    clear; echo ""
+    purple "=== 调整虚拟内存(SWAP) ===\n"
+    green "当前状态: $(check_swap_status)\n"
+    green  "1. 512M"
+    green  "2. 1G (1024M)"
+    green  "3. 1.5G (1536M)"
+    green  "4. 自定义大小"
+    red    "5. 关闭并删除虚拟内存"
+    purple "0. 返回主菜单"
+    echo "==========================="
+    reading "请输入选择(0-5): " swap_choice
+    echo ""
+    case "$swap_choice" in
+        1) create_swap 512;  read -n 1 -s -r -p $'\n按任意键返回...'; swap_manage_menu ;;
+        2) create_swap 1024; read -n 1 -s -r -p $'\n按任意键返回...'; swap_manage_menu ;;
+        3) create_swap 1536; read -n 1 -s -r -p $'\n按任意键返回...'; swap_manage_menu ;;
+        4)
+            reading "请输入自定义大小(单位M，例如 2048 表示2G): " swap_custom_mb
+            create_swap "$swap_custom_mb"
+            read -n 1 -s -r -p $'\n按任意键返回...'; swap_manage_menu
+            ;;
+        5) delete_swap; read -n 1 -s -r -p $'\n按任意键返回...'; swap_manage_menu ;;
+        0) return ;;
+        *) red "无效选项\n"; sleep 1; swap_manage_menu ;;
+    esac
+}
+
 # 主菜单
 menu() {
     singbox_status=$(check_singbox 2>/dev/null)
@@ -4386,6 +4497,7 @@ menu() {
     green "12. 单栈VPS加装WARP全局出站"
     green "13. 切换为 BBR+fq 拥塞控制"
     green "14. 系统时间同步(校时/防卡顿)"
+    green "15. 调整虚拟内存(SWAP)"
     echo "==============="
     purple "20. ssh综合工具箱"
     echo "==============="
@@ -4432,7 +4544,7 @@ case "$1" in
     "")
         while true; do
             menu
-            reading "请输入选择(0-14,20): " choice 
+            reading "请输入选择(0-15,20): " choice 
             echo ""
             need_pause=true  
             case "${choice}" in
@@ -4450,6 +4562,7 @@ case "$1" in
                 12) system_warp_menu;   need_pause=false ;;
                 13) enable_bbr_fq;       need_pause=true ;;
                 14) time_sync_menu;      need_pause=false ;;
+                15) swap_manage_menu;    need_pause=false ;;
                 20)
                     clear
                     bash <(curl -Ls ssh_tool.eooce.com)
@@ -4457,7 +4570,7 @@ case "$1" in
                     ;;
                 0)  exit 0 ;;       
                 *)
-                    red "无效的选项，请输入 0-14 或 20"
+                    red "无效的选项，请输入 0-15 或 20"
                     need_pause=true
                     ;;
             esac
