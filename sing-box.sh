@@ -4381,6 +4381,18 @@ check_swap_status() {
     fi
 }
 
+# 系统当前所有已启用的swap汇总(不限于本脚本创建的swap_file，
+# 面板/系统自带方式创建的swap也会统计在内，避免误判为"未启用")
+system_swap_summary() {
+    local total_kb
+    total_kb=$(awk 'NR>1{sum+=$3} END{print sum+0}' /proc/swaps 2>/dev/null)
+    if [ -n "$total_kb" ] && [ "$total_kb" -gt 0 ]; then
+        echo "已启用 (系统总计约 $(( total_kb / 1024 ))M)"
+    else
+        echo "未启用"
+    fi
+}
+
 create_swap() {
     # $1 = 大小(MB)
     local size_mb="$1"
@@ -4427,19 +4439,29 @@ create_swap() {
 
 delete_swap() {
     if [ ! -f "$swap_file" ] && ! swapon --show=NAME 2>/dev/null | grep -qx "$swap_file"; then
-        yellow "当前未配置虚拟内存\n"
+        yellow "未检测到本脚本创建的 ${swap_file}，无需处理(系统若还有其他方式创建的swap，请到对应面板处理)\n"
         return 0
     fi
     swapoff "$swap_file" 2>/dev/null
     sed -i "\|^${swap_file}[[:space:]]|d" /etc/fstab 2>/dev/null
     rm -f "$swap_file"
-    green "虚拟内存已关闭并删除\n"
+    green "本脚本管理的虚拟内存(${swap_file})已关闭并删除\n"
 }
 
 swap_manage_menu() {
     clear; echo ""
     purple "=== 调整虚拟内存(SWAP) ===\n"
-    green "当前状态: $(check_swap_status)\n"
+    green "系统当前SWAP状态: $(system_swap_summary)"
+    local all_swap
+    all_swap=$(swapon --show 2>/dev/null)
+    if [ -n "$all_swap" ]; then
+        echo "$all_swap"
+    fi
+    if swapon --show=NAME 2>/dev/null | grep -qx "$swap_file"; then
+        green "其中本脚本管理的 ${swap_file}: $(check_swap_status)\n"
+    else
+        yellow "提示: 未检测到本脚本创建的 ${swap_file}；上方如已显示有swap，说明是通过面板或系统自带方式创建的，本脚本不会覆盖或重复创建，只负责管理 ${swap_file} 这一个文件。若在此选择档位，会在系统已有swap之外，再额外新增一份。\n"
+    fi
     green  "1. 512M"
     green  "2. 1024M"
     green  "3. 1536M"
