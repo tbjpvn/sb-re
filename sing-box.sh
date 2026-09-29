@@ -2699,7 +2699,14 @@ warp_manage() {
       | "\($tags | join(", "))\t\($r.outbound)"
     ' "$route_file" 2>/dev/null | while IFS=$'\t' read -r tags outb; do
         echo -e " - ${skyblue}${tags}${re} ${purple}->${re} ${green}${outb}${re}"
-    done || echo "  无"
+    done
+    if ! jq -e '.route.rules[]? | select(.rule_set != null and .outbound != null)' "$route_file" >/dev/null 2>&1; then
+        echo "  无"
+    fi
+    cur_final=$(jq -r '.route.final // empty' "$route_file" 2>/dev/null)
+    if [ -n "$cur_final" ] && [ "$cur_final" != "direct" ]; then
+        echo -e "\n${green}全局代理出站(其余流量): ${purple}${cur_final}${re}"
+    fi
     green "\n已添加的出站(代理socks/http/ss2022 及 本地IP直出):"
     jq -r '.outbounds[] | select(.tag != "direct") | " - \(.tag) [\(.type)]"' "$outbound_file" 2>/dev/null || echo "  无"
 
