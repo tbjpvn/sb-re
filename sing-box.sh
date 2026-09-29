@@ -3355,6 +3355,8 @@ delete_socks5_proxy() {
 
     jq_write "$outbound_file" --arg tag "$tag" 'del(.outbounds[] | select(.tag == $tag))'
     jq_write "$route_file" --arg tag "$tag" '.route.rules = [.route.rules[] | select(.outbound != $tag)]'
+    # 若被删除的出站正是全局代理(final)，把 final 改回 direct，避免悬空引用导致校验失败
+    jq_write "$route_file" --arg tag "$tag" 'if .route.final == $tag then .route.final = "direct" else . end'
 
     reload_singbox
     green "${tag} 代理出站已删除。"
