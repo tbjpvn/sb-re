@@ -2988,18 +2988,40 @@ set_global_outbound() {
     fi
     local selected_out="${proxy_tags[$((out_choice-1))]}"
 
-    jq_write "$outbound_file" 'del(.outbounds[] | select(.tag == "direct"))'
-    rm -f "${route_file}"
+    # 保留 direct 出站与 route.json（含分流规则、default_domain_resolver），
+    # 仅把兜底出站 final 指向所选代理；校验失败自动回滚。
+    if [ ! -s "$route_file" ] || \
+       ! jq -e '.route.default_domain_resolver' "$route_file" >/dev/null 2>&1; then
+        repair_default_route || { red "生成默认路由配置失败"; sleep 2; warp_manage; return; }
+    fi
+
+    cp -f "$route_file" "${route_file}.bak"
+    cp -f "$outbound_file" "${outbound_file}.bak"
+
+    if ! jq -e '.outbounds[] | select(.tag == "direct")' "$outbound_file" >/dev/null 2>&1; then
+        jq_write "$outbound_file" '.outbounds = [{"type": "direct", "tag": "direct"}] + .outbounds'
+    fi
+    jq_write "$route_file" --arg out "$selected_out" '.route.final = $out'
+
+    local check_output
+    check_output=$(validate_singbox_config)
+    if [ $? -ne 0 ]; then
+        cp -f "${route_file}.bak" "$route_file"
+        cp -f "${outbound_file}.bak" "$outbound_file"
+        red "\n配置校验未通过，已自动回滚，未做任何更改：\n"
+        echo "$check_output"
+        sleep 3; warp_manage; return
+    fi
+    rm -f "${route_file}.bak" "${outbound_file}.bak"
+
     reload_singbox
     green "\n已设置全局代理出站：${purple}${selected_out}${re}"
-    yellow "所有流量将通过 ${selected_out} 转发，如需恢复请选择「恢复服务器原IP出站」\n"
+    yellow "未命中分流规则的流量将通过 ${selected_out} 转发（已有分流规则仍然优先），如需恢复请选择「恢复服务器原IP出站」\n"
     sleep 2; warp_manage
 }
 
-# 恢复服务器原IP出站（恢复默认 route.json）
-restore_direct_outbound() {
-    yellow "\n正在恢复默认路由配置...\n"
-
+# 重写默认 route.json（补回 direct、DNS 兜底、default_domain_resolver）
+repair_default_route() {
     local cur_dns_strategy
     cur_dns_strategy=$(jq -r '.dns.strategy // "prefer_ipv4"' "${conf_dir}/dns.json" 2>/dev/null)
     [ -z "$cur_dns_strategy" ] || [ "$cur_dns_strategy" = "null" ] && cur_dns_strategy="prefer_ipv4"
@@ -3021,8 +3043,23 @@ restore_direct_outbound() {
     fi
 
     write_default_route_json "$cur_resolver_tag" "$cur_dns_strategy"
+}
+
+# 恢复服务器原IP出站：route.json 正常时只把 final 改回 direct（保留分流规则）；
+# route.json 缺失/损坏时重写默认配置
+restore_direct_outbound() {
+    yellow "\n正在恢复服务器原IP出站...\n"
+
+    if [ -s "$route_file" ] && \
+       jq -e '.route.default_domain_resolver' "$route_file" >/dev/null 2>&1 && \
+       jq -e '.outbounds[] | select(.tag == "direct")' "$outbound_file" >/dev/null 2>&1; then
+        jq_write "$route_file" '.route.final = "direct"'
+    else
+        repair_default_route
+    fi
+
     reload_singbox
-    green "\n已恢复服务器原IP出站，所有流量走 direct。\n"
+    green "\n已恢复服务器原IP出站，未命中分流规则的流量走 direct。\n"
     sleep 2; warp_manage
 }
 
