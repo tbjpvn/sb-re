@@ -4167,6 +4167,64 @@ remove_tuic() {
     green "\nTUIC5 协议已删除\n"
 }
 
+# 四合一主协议：添加子菜单(已安装的显示暗灰色)
+add_main_protocol_menu() {
+    clear; echo ""
+    green "=== 添加四合一主协议 ===\n"
+    local names=("VLESS-Reality" "VMess-WS(Argo)" "Hysteria2" "TUIC5")
+    local types=(vless vmess hysteria2 tuic)
+    local i
+    for i in 0 1 2 3; do
+        if protocol_installed "${types[$i]}"; then
+            gray "$((i+1)). ${names[$i]} (已安装)"
+        else
+            green "$((i+1)). ${names[$i]}"
+        fi
+    done
+    skyblue "-----------------------------"
+    purple "0. 返回上一级"
+    skyblue "-----------------------------"
+    reading "请输入选择: " main_add_choice
+    echo ""
+    case "${main_add_choice}" in
+        1) add_vless_reality ;;
+        2) add_vmess_argo ;;
+        3) add_hysteria2 ;;
+        4) add_tuic ;;
+        0) return ;;
+        *) red "无效的选项！" ;;
+    esac
+}
+
+# 四合一主协议：删除子菜单(未安装的显示暗灰色)
+remove_main_protocol_menu() {
+    clear; echo ""
+    green "=== 删除四合一主协议 ===\n"
+    local names=("VLESS-Reality" "VMess-WS(Argo)" "Hysteria2" "TUIC5")
+    local types=(vless vmess hysteria2 tuic)
+    local i
+    for i in 0 1 2 3; do
+        if protocol_installed "${types[$i]}"; then
+            red "$((i+1)). ${names[$i]}"
+        else
+            gray "$((i+1)). ${names[$i]} (未安装)"
+        fi
+    done
+    skyblue "-----------------------------"
+    purple "0. 返回上一级"
+    skyblue "-----------------------------"
+    reading "请输入选择: " main_del_choice
+    echo ""
+    case "${main_del_choice}" in
+        1) remove_vless_reality ;;
+        2) remove_vmess_argo ;;
+        3) remove_hysteria2 ;;
+        4) remove_tuic ;;
+        0) return ;;
+        *) red "无效的选项！" ;;
+    esac
+}
+
 # 协议管理主菜单
 manage_protocols() {
     check_singbox &>/dev/null
@@ -4177,49 +4235,38 @@ manage_protocols() {
     clear; echo ""
     green "=== 协议管理 (增加/删除) ===\n"
     show_main_proto_status
+    echo ""
+    green "--- 四合一主协议 ---"
+    green "1. 添加四合一主协议"
+    red   "2. 删除四合一主协议"
+    skyblue "-----------------------------"
     show_extra_proto_status
 
     green "--- Socks5 协议 ---"
-    green "1. 添加 Socks5 协议"
-    red   "2. 删除 Socks5 协议"
+    green "3. 添加 Socks5 协议"
+    red   "4. 删除 Socks5 协议"
     skyblue "-----------------------------"
     green "--- AnyTLS 协议 ---"
-    green "3. 添加 AnyTLS 协议"
-    red   "4. 删除 AnyTLS 协议"
+    green "5. 添加 AnyTLS 协议"
+    red   "6. 删除 AnyTLS 协议"
     skyblue "-----------------------------"
     green "--- Shadowsocks-2022 协议 ---"
-    green "5. 添加 Shadowsocks-2022 协议"
-    red   "6. 删除 Shadowsocks-2022 协议"
-    skyblue "-----------------------------"
-    green "--- 四合一主协议 ---"
-    green "7. 添加 VLESS-Reality"
-    red   "8. 删除 VLESS-Reality"
-    green "9. 添加 VMess-WS(Argo)"
-    red   "10. 删除 VMess-WS(Argo)"
-    green "11. 添加 Hysteria2"
-    red   "12. 删除 Hysteria2"
-    green "13. 添加 TUIC5"
-    red   "14. 删除 TUIC5"
+    green "7. 添加 Shadowsocks-2022 协议"
+    red   "8. 删除 Shadowsocks-2022 协议"
     skyblue "-----------------------------"
     purple "0. 返回主菜单"
     skyblue "-----------------------------"
     reading "请输入选择: " proto_choice
     echo ""
     case "${proto_choice}" in
-        1) add_socks5_inbound ;;
-        2) remove_socks5_inbound ;;
-        3) add_anytls ;;
-        4) remove_anytls ;;
-        5) add_ss2022 ;;
-        6) remove_ss2022 ;;
-        7) add_vless_reality ;;
-        8) remove_vless_reality ;;
-        9) add_vmess_argo ;;
-        10) remove_vmess_argo ;;
-        11) add_hysteria2 ;;
-        12) remove_hysteria2 ;;
-        13) add_tuic ;;
-        14) remove_tuic ;;
+        1) add_main_protocol_menu ;;
+        2) remove_main_protocol_menu ;;
+        3) add_socks5_inbound ;;
+        4) remove_socks5_inbound ;;
+        5) add_anytls ;;
+        6) remove_anytls ;;
+        7) add_ss2022 ;;
+        8) remove_ss2022 ;;
         0) menu; return ;;
         *) red "无效的选项！" ;;
     esac
