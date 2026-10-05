@@ -19,7 +19,7 @@ green() { echo -e "\e[1;32m$1\033[0m"; }
 yellow() { echo -e "\e[1;33m$1\033[0m"; }
 purple() { echo -e "\e[1;35m$1\033[0m"; }
 skyblue() { echo -e "\e[1;36m$1\033[0m"; }
-reading() { read -r -p "$(red "$1")" "$2"; }
+reading() { read -p "$(red "$1")" "$2"; }
 
 # 定义常量
 server_name="sing-box"
@@ -132,24 +132,12 @@ check_service() {
 
     [[ ! -f "${service_file}" ]] && { red "not installed"; return 2; }
 
-    # 仅用于展示：已安装返回0（运行与否看输出文字）。
-    # 需要判断“是否真的在运行”请用 service_is_running。
-    if service_is_running "${service_name}"; then
-        green "running"
+    if command_exists apk; then
+        rc-service "${service_name}" status | grep -q "started" && green "running" || yellow "not running"
     else
-        yellow "not running"
+        systemctl is-active "${service_name}" | grep -q "^active$" && green "running" || yellow "not running"
     fi
-    return 0
-}
-
-# 真实运行状态判断：运行中返回0，否则返回1（不依赖带颜色的输出文字）
-service_is_running() {
-    local name=$1
-    if command_exists rc-service && ! command_exists systemctl; then
-        rc-service "$name" status 2>/dev/null | grep -q "started"
-    else
-        systemctl is-active --quiet "$name" 2>/dev/null
-    fi
+    return $?
 }
 
 verify_udp_listening() {
@@ -499,21 +487,6 @@ get_isp() {
     return 0
 }
 
-# 统一的 iptables 规则持久化（Alpine / Debian / RHEL）
-persist_iptables() {
-    if command_exists rc-service && ! command_exists systemctl; then
-        mkdir -p /etc/iptables
-        command_exists iptables && iptables-save > /etc/iptables/rules.v4 2>/dev/null
-        command_exists ip6tables && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
-    elif command_exists netfilter-persistent; then
-        netfilter-persistent save >/dev/null 2>&1
-    elif command_exists service; then
-        service iptables save >/dev/null 2>&1
-        service ip6tables save >/dev/null 2>&1
-    fi
-    return 0
-}
-
 # 处理防火墙
 allow_port() {
     has_ufw=0
@@ -527,14 +500,17 @@ allow_port() {
     command_exists ip6tables && has_ip6tables=1
 
     [ "$has_ufw" -eq 1 ] && ufw --force default allow outgoing >/dev/null 2>&1
+    [ "$has_firewalld" -eq 1 ] && firewall-cmd --permanent --zone=public --set-target=ACCEPT >/dev/null 2>&1
     [ "$has_iptables" -eq 1 ] && {
         iptables -C INPUT -i lo -j ACCEPT 2>/dev/null || iptables -I INPUT 3 -i lo -j ACCEPT
         iptables -C INPUT -p icmp -j ACCEPT 2>/dev/null || iptables -I INPUT 4 -p icmp -j ACCEPT
+        iptables -P FORWARD DROP 2>/dev/null || true
         iptables -P OUTPUT ACCEPT 2>/dev/null || true
     }
     [ "$has_ip6tables" -eq 1 ] && {
         ip6tables -C INPUT -i lo -j ACCEPT 2>/dev/null || ip6tables -I INPUT 3 -i lo -j ACCEPT
         ip6tables -C INPUT -p icmp -j ACCEPT 2>/dev/null || ip6tables -I INPUT 4 -p icmp -j ACCEPT
+        ip6tables -P FORWARD DROP 2>/dev/null || true
         ip6tables -P OUTPUT ACCEPT 2>/dev/null || true
     }
 
@@ -549,11 +525,18 @@ allow_port() {
 
     [ "$has_firewalld" -eq 1 ] && firewall-cmd --reload >/dev/null 2>&1
 
-    # Debian/Ubuntu 上若尚未安装 netfilter-persistent，先装再保存
-    if ! command_exists rc-service && ! command_exists netfilter-persistent && command_exists apt; then
-        manage_packages install iptables-persistent || yellow "请手动安装netfilter-persistent或保存iptables规则"
+    if command_exists rc-service 2>/dev/null; then
+        [ "$has_iptables" -eq 1 ] && iptables-save > /etc/iptables/rules.v4 2>/dev/null
+        [ "$has_ip6tables" -eq 1 ] && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
+    else
+        if ! command_exists netfilter-persistent; then
+            manage_packages install iptables-persistent || yellow "请手动安装netfilter-persistent或保存iptables规则"
+            netfilter-persistent save >/dev/null 2>&1
+        elif command_exists service; then
+            service iptables save 2>/dev/null
+            service ip6tables save 2>/dev/null
+        fi
     fi
-    persist_iptables
 }
 
 
@@ -596,7 +579,17 @@ deny_port() {
     [ "$has_firewalld" -eq 1 ] && firewall-cmd --reload >/dev/null 2>&1 || true
 
     # 持久化
-    persist_iptables
+    if command_exists rc-service 2>/dev/null; then
+        [ "$has_iptables" -eq 1 ] && iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        [ "$has_ip6tables" -eq 1 ] && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+    else
+        if command_exists netfilter-persistent; then
+            netfilter-persistent save >/dev/null 2>&1 || true
+        elif command_exists service; then
+            service iptables save 2>/dev/null || true
+            service ip6tables save 2>/dev/null || true
+        fi
+    fi
 }
 
 # 从配置收集本脚本节点端口（格式: port/proto）
@@ -647,7 +640,12 @@ cleanup_port_hop_nat() {
         done
     fi
 
-    persist_iptables
+    if command_exists rc-service 2>/dev/null; then
+        command_exists iptables && iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        command_exists ip6tables && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+    elif command_exists netfilter-persistent; then
+        netfilter-persistent save >/dev/null 2>&1 || true
+    fi
 }
 
 # 回收申请证书时放行的80端口（仅在确认没有服务在用80时才关，避免误伤用户自己的网站）
@@ -1426,34 +1424,34 @@ install_singbox() {
         'aarch64' | 'arm64') ARCH='arm64' ;;
         'armv7l')  ARCH='armv7' ;;
         's390x')   ARCH='s390x' ;;
-        *) red "不支持的架构: ${ARCH_RAW}"; return 1 ;;
+        *) red "不支持的架构: ${ARCH_RAW}"; exit 1 ;;
     esac
 
     mkdir -p "${work_dir}" "${conf_dir}"
-    chmod 755 "${work_dir}" 2>/dev/null || true
+    chmod 777 "${work_dir}" 2>/dev/null || true
 
     if ! releases_json=$(gh_fetch_json "https://api.github.com/repos/SagerNet/sing-box/releases"); then
         red "获取 sing-box 最新版本号失败，请检查服务器是否能访问 api.github.com\n"
         gh_ipv6_hint
-        return 1
+        exit 1
     fi
     latest_version=$(echo "$releases_json" | jq -r '[.[] | select(.prerelease==false)][0].tag_name // empty' | sed 's/^v//')
     if [ -z "$latest_version" ] || [ "$latest_version" = "null" ]; then
         red "获取 sing-box 最新版本号失败，请检查服务器是否能访问 api.github.com\n"
-        return 1
+        exit 1
     fi
     if ! gh_download "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${ARCH}.tar.gz" "${work_dir}/${server_name}.tar.gz"; then
         red "从 GitHub 下载 sing-box 二进制失败，请检查服务器是否能访问 github.com\n"
         gh_ipv6_hint
-        return 1
+        exit 1
     fi
     if ! tar -xzf "${work_dir}/${server_name}.tar.gz" -C "${work_dir}/"; then
         red "解压 sing-box 失败\n"
-        return 1
+        exit 1
     fi
     if ! mv "${work_dir}/sing-box-${latest_version}-linux-${ARCH}/sing-box" "${work_dir}/"; then
         red "移动 sing-box 二进制失败\n"
-        return 1
+        exit 1
     fi
     rm -rf "${work_dir}/${server_name}.tar.gz" "${work_dir}/sing-box-${latest_version}-linux-${ARCH}"
 
@@ -1463,7 +1461,7 @@ install_singbox() {
             apk add --no-cache gcompat >/dev/null 2>&1
             if ! apk info -e gcompat >/dev/null 2>&1; then
                 red "gcompat 安装失败，官方sing-box二进制在Alpine上大概率无法运行，请手动执行: apk add gcompat 后重新运行本脚本安装\n"
-                return 1
+                exit 1
             fi
         fi
     fi
@@ -1480,7 +1478,7 @@ install_singbox() {
         : > "${work_dir}/argo"
     elif ! curl -fsSLo "${work_dir}/argo" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"; then
         red "从 GitHub 下载 cloudflared 失败，请检查服务器是否能访问 github.com\n"
-        return 1
+        exit 1
     fi
 
     curl -sLo "${work_dir}/qrencode" "https://github.com/eooce/test/releases/download/${ARCH}/qrencode-linux-${ARCH}" 2>/dev/null || true
@@ -1507,14 +1505,13 @@ install_singbox() {
     if [ -z "$private_key" ] || [ -z "$public_key" ]; then
         red "生成 reality 密钥对失败！/etc/sing-box/sing-box 二进制可能无法在本机正常执行。\n"
         yellow "请先手动执行 /etc/sing-box/sing-box version 排查(Alpine系统常见原因是缺少gcompat，可执行 apk add gcompat 后重试)。\n"
-        return 1
+        exit 1
     fi
 
     allow_port $vless_port/tcp $tuic_port/udp $hy2_port/udp > /dev/null 2>&1 || true
 
-    openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key" || { red "生成证书私钥失败"; return 1; }
+    openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key" || { red "生成证书私钥失败"; exit 1; }
     openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
-    chmod 600 "${work_dir}/private.key"
 
     fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
 
@@ -1571,7 +1568,7 @@ After=network-online.target
 Type=simple
 NoNewPrivileges=yes
 TimeoutStartSec=0
-ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --url http://localhost:$(get_argo_port) --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1"
+ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --url http://localhost:8001 --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1"
 Restart=on-failure
 RestartSec=5s
 
@@ -1609,11 +1606,11 @@ depend() {
 }
 EOF
 
-    cat > /etc/init.d/argo << EOF
+    cat > /etc/init.d/argo << 'EOF'
 #!/sbin/openrc-run
 description="Cloudflare Tunnel"
 command="/bin/sh"
-command_args="-c '/etc/sing-box/argo tunnel --url http://localhost:$(get_argo_port) --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1'"
+command_args="-c '/etc/sing-box/argo tunnel --url http://localhost:8001 --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1'"
 command_background=true
 pidfile="/var/run/argo.pid"
 
@@ -1685,13 +1682,6 @@ EOF
     green "如需以订阅方式导入，可将该文件内容复制粘贴到客户端的订阅内容中。\n"
 }
 
-# 获取 vmess-argo 实际监听端口（以 inbounds.json 为准，退回环境变量默认值）
-get_argo_port() {
-    local p
-    p=$(jq -r '.inbounds[]? | select(.type=="vmess") | .listen_port // empty' "${conf_dir}/inbounds.json" 2>/dev/null | head -1)
-    echo "${p:-${ARGO_PORT}}"
-}
-
 # 从已安装配置中获取UUID
 get_current_uuid() {
     local inbounds_file="${conf_dir}/inbounds.json"
@@ -1713,39 +1703,34 @@ manage_service() {
         red "缺少服务名或操作参数\n"; return 1
     fi
 
-    # 用返回码判断状态（旧版解析带颜色转义的输出，判断恒不成立）
-    local svc_file="${work_dir}/${service_name}"
-    [ "$service_name" = "sing-box" ] && svc_file="${work_dir}/${server_name}"
-    local installed=1 running=0
-    [ -f "$svc_file" ] && installed=0
-    service_is_running "$service_name" && running=1
+    local status=$(check_service "$service_name" 2>/dev/null)
 
     case "$action" in
         "start")
-            [ "$installed" -ne 0 ] && { yellow "${service_name} 尚未安装!\n"; return 1; }
-            [ "$running" -eq 1 ] && { yellow "${service_name} 正在运行\n"; return 0; }
+            [ "$status" == "running" ] && { yellow "${service_name} 正在运行\n"; return 0; }
+            [ "$status" == "not installed" ] && { yellow "${service_name} 尚未安装!\n"; return 1; }
             yellow "正在启动 ${service_name} 服务\n"
             if command_exists rc-service; then rc-service "$service_name" start
             elif command_exists systemctl; then systemctl daemon-reload && systemctl start "$service_name"; fi
             [ $? -eq 0 ] && green "${service_name} 服务已成功启动\n" || red "${service_name} 服务启动失败\n"
             ;;
         "stop")
-            [ "$installed" -ne 0 ] && { yellow "${service_name} 尚未安装！\n"; return 2; }
-            [ "$running" -eq 0 ] && { yellow "${service_name} 未运行\n"; return 1; }
+            [ "$status" == "not installed" ] && { yellow "${service_name} 尚未安装！\n"; return 2; }
+            [ "$status" == "not running" ]   && { yellow "${service_name} 未运行\n"; return 1; }
             yellow "正在停止 ${service_name} 服务\n"
             if command_exists rc-service; then rc-service "$service_name" stop
             elif command_exists systemctl; then systemctl stop "$service_name"; fi
             [ $? -eq 0 ] && green "${service_name} 服务已成功停止\n" || red "${service_name} 服务停止失败\n"
             ;;
         "restart")
-            [ "$installed" -ne 0 ] && { yellow "${service_name} 尚未安装！\n"; return 1; }
+            [ "$status" == "not installed" ] && { yellow "${service_name} 尚未安装！\n"; return 1; }
             yellow "正在重启 ${service_name} 服务\n"
             if command_exists rc-service; then rc-service "$service_name" restart
             elif command_exists systemctl; then systemctl daemon-reload && systemctl restart "$service_name"; fi
             [ $? -eq 0 ] && green "${service_name} 服务已成功重启\n" || red "${service_name} 服务重启失败\n"
             ;;
         "reload")
-            [ "$installed" -ne 0 ] && { yellow "${service_name} 尚未安装！\n"; return 1; }
+            [ "$status" == "not installed" ] && { yellow "${service_name} 尚未安装！\n"; return 1; }
             yellow "正在重载 ${service_name} 配置\n"
             if command_exists systemctl; then
                 if systemctl is-active --quiet "$service_name" 2>/dev/null && systemctl reload "$service_name" 2>/dev/null; then
@@ -1809,7 +1794,7 @@ reload_singbox() {
 
 # 重启 sing-box 并确认确实起来了，起不来就重试/给出日志
 ensure_singbox_running() {
-    local i
+    local i status
     for i in 1 2 3; do
         if command_exists rc-service; then
             rc-service sing-box restart >/dev/null 2>&1
@@ -1817,7 +1802,8 @@ ensure_singbox_running() {
             systemctl restart sing-box >/dev/null 2>&1
         fi
         sleep 2
-        if service_is_running "sing-box"; then
+        status=$(check_service "sing-box" "${work_dir}/${server_name}" 2>/dev/null)
+        if echo "$status" | grep -q "running"; then
             green "sing-box 运行正常\n"
             return 0
         fi
@@ -1913,14 +1899,14 @@ uninstall_singbox() {
 
             # 系统级 WARP
             if [ -f "${sys_warp_dir}/$(sys_warp_iface 4).conf" ] || [ -f "${sys_warp_dir}/$(sys_warp_iface 6).conf" ]; then
-                reading "检测到「单栈VPS加装WARP全局出站」(菜单11)仍在使用，是否一并卸载？(y/n): " warp_choice
+                reading "检测到「单栈VPS加装WARP全局出站」(菜单12)仍在使用，是否一并卸载？(y/n): " warp_choice
                 case "${warp_choice}" in
                     y|Y)
                         sys_warp_remove 4 >/dev/null 2>&1
                         sys_warp_remove 6 >/dev/null 2>&1
                         green "系统级WARP出站已一并卸载\n"
                         ;;
-                    *) yellow "已保留系统级WARP出站，如需手动卸载可重新运行脚本进入菜单11\n" ;;
+                    *) yellow "已保留系统级WARP出站，如需手动卸载可重新运行脚本进入菜单12\n" ;;
                 esac
             fi
 
@@ -1961,10 +1947,9 @@ EOF
 
 # 适配alpine
 change_hosts() {
-    sh -c 'echo "0 0" > /proc/sys/net/ipv4/ping_group_range' 2>/dev/null || true
-    # 只在缺失时补 localhost 记录，不再盲改 /etc/hosts 的前两行
-    grep -qE '^127\.0\.0\.1[[:space:]]+localhost' /etc/hosts 2>/dev/null || echo "127.0.0.1   localhost" >> /etc/hosts
-    grep -qE '^::1[[:space:]]+localhost' /etc/hosts 2>/dev/null || echo "::1         localhost" >> /etc/hosts
+    sh -c 'echo "0 0" > /proc/sys/net/ipv4/ping_group_range'
+    sed -i '1s/.*/127.0.0.1   localhost/' /etc/hosts
+    sed -i '2s/.*/::1         localhost/' /etc/hosts
 }
 
 # 非交互静默安装（-i 参数）
@@ -1977,7 +1962,7 @@ auto_install() {
 
     green "开始无交互式安装 sing-box..."
     ensure_core_deps || { red "依赖安装失败"; exit 1; }
-    install_singbox || { red "安装失败，已中止"; exit 1; }
+    install_singbox
 
     if command_exists systemctl; then
         main_systemd_services
@@ -2131,17 +2116,11 @@ change_config() {
             reload_singbox
             sed -i -E 's/(vless:\/\/|hysteria2:\/\/|anytls:\/\/)[^@]*(@.*)/\1'"$new_uuid"'\2/' $client_dir
             sed -i -E "s#tuic://[0-9a-f-]{36}:[0-9a-f-]{36}@#tuic://$new_uuid:$new_uuid@#g" $client_dir
-            # 只替换现有 vmess 链接里的 id，保留优选域名/端口/host/sni 等已有设置
-            local old_vmess new_vmess_b64
-            old_vmess=$(grep -m1 '^vmess://' "$client_dir")
-            if [ -n "$old_vmess" ]; then
-                new_vmess_b64=$(printf '%s' "${old_vmess#vmess://}" | base64 -d 2>/dev/null | jq -c --arg id "$new_uuid" '.id = $id' | base64 -w0)
-                if [ -n "$new_vmess_b64" ]; then
-                    sed -i -E "s#^vmess://.*#vmess://${new_vmess_b64}#" "$client_dir"
-                else
-                    yellow "vmess 链接解析失败，未更新 vmess 节点的 UUID"
-                fi
-            fi
+            isp=$(get_isp || echo "$(hostname)")
+            argodomain=$(grep -oE 'https://[[:alnum:]+\.-]+\.trycloudflare\.com' "${work_dir}/argo.log" | sed 's@https://@@')
+            VMESS="{ \"v\": \"2\", \"ps\": \"${isp}-VMess-Argo\", \"add\": \"${CFIP}\", \"port\": \"443\", \"id\": \"${new_uuid}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"\", \"allowInsecure\": \"false\"}"
+            encoded_vmess=$(echo "$VMESS" | base64 -w0)
+            sed -i -E '/vmess:\/\//{s@vmess://.*@vmess://'"$encoded_vmess"'@}' $client_dir
             update_subscription
             print_client_urls
             green "\nUUID已修改为：${purple}${new_uuid}${re}\n"
@@ -2354,7 +2333,7 @@ manage_argo() {
             ;;
         4)
             clear
-            yellow "\n固定隧道可为json或token，固定隧道端口为$(get_argo_port), 使用token请在cloudflare里设置一致\njson获取地址：${purple}https://fscarmen.cloudflare.now.cc${re}\n"
+            yellow "\n固定隧道可为json或token，固定隧道端口为8001, 使用token请在cloudflare里设置一致\njson获取地址：${purple}https://fscarmen.cloudflare.now.cc${re}\n"
             reading "\n请输入你的argo域名: " argo_domain
             ArgoDomain=$argo_domain
             reading "\n请输入你的argo密钥(token或json): " argo_auth
@@ -2367,7 +2346,7 @@ protocol: http2
 
 ingress:
   - hostname: $ArgoDomain
-    service: http://localhost:$(get_argo_port)
+    service: http://localhost:8001
     originRequest:
       noTLSVerify: true
   - service: http_status:404
@@ -2505,44 +2484,57 @@ change_cfip() {
 }
 
 test_warp_connectivity() {
-    local sb_bin="${work_dir}/sing-box"
-    local test_port tmp_dir pid
+    local inbounds_file="${conf_dir}/inbounds.json"
+    local route_file="${conf_dir}/route.json"
+    local test_port=10808
+    local had_socks=0
+    local route_bak="${route_file}.bak.warptest"
+    local inbounds_bak="${inbounds_file}.bak.warptest"
 
     clear
     green "=== 测试 WARP 连通性 ===\n"
-    yellow "说明：服务器本机直接 curl 不会经过 sing-box，因此会："
-    yellow "  1. 另起一个独立的临时 sing-box 进程(仅监听 127.0.0.1)"
-    yellow "  2. 该进程全局走 wireguard-out，用 curl 通过它测试出口"
-    yellow "  3. 测试结束后自动清理；正在运行的 sing-box 与现有配置不受任何影响\n"
+    yellow "说明：服务器本机直接 curl 不会经过 sing-box，因此会临时："
+    yellow "  1. 添加 127.0.0.1:${test_port} 的 socks 入站"
+    yellow "  2. 把路由临时改为全局走 wireguard-out"
+    yellow "  3. 用 curl 通过 socks 测试出口"
+    yellow "  4. 测试结束后自动恢复原配置\n"
 
     if ! ensure_warp_endpoint; then
         red "WARP 密钥不可用，无法测试连通性\n"; sleep 2; return
     fi
-    [ -x "$sb_bin" ] || { red "sing-box 二进制不存在\n"; sleep 2; return; }
 
-    test_port=$(get_free_port 20000 40000)
-    tmp_dir=$(mktemp -d /tmp/singbox-warptest.XXXXXX) || { red "创建临时目录失败\n"; return; }
+    cp "$route_file" "$route_bak"
+    cp "$inbounds_file" "$inbounds_bak"
 
-    cp "${conf_dir}/endpoints.json" "${tmp_dir}/endpoints.json"
-    if [ -f "${conf_dir}/dns.json" ]; then
-        cp "${conf_dir}/dns.json" "${tmp_dir}/dns.json"
+    if jq -e --argjson p "$test_port" '.inbounds[] | select(.type=="socks" and .listen_port==$p)' "$inbounds_file" >/dev/null 2>&1; then
+        had_socks=1
     else
-        jq -n '{dns:{servers:[{tag:"sys",type:"local"}],strategy:"prefer_ipv4"}}' > "${tmp_dir}/dns.json"
-    fi
-    jq -n --argjson p "$test_port" '{inbounds:[{type:"socks",tag:"socks-warptest",listen:"127.0.0.1",listen_port:$p}]}' > "${tmp_dir}/inbounds.json"
-    jq -n '{outbounds:[{type:"direct",tag:"direct"}]}' > "${tmp_dir}/outbounds.json"
-    jq -n '{log:{level:"warn",output:"box.log"}}' > "${tmp_dir}/log.json"
-    jq -n '{route:{rules:[{action:"sniff"}],final:"wireguard-out",default_domain_resolver:{server:"sys",strategy:"prefer_ipv4"}}}' > "${tmp_dir}/route.json"
-
-    local check_output
-    if ! check_output=$("$sb_bin" check -C "$tmp_dir" 2>&1); then
-        red "临时测试配置校验失败：\n"; echo "$check_output"
-        rm -rf "$tmp_dir"; sleep 2; return
+        jq_write "$inbounds_file" --argjson p "$test_port" '.inbounds += [{
+            "type": "socks",
+            "tag": "socks-warptest",
+            "listen": "127.0.0.1",
+            "listen_port": $p
+        }]'
     fi
 
-    (cd "$tmp_dir" && exec "$sb_bin" run -C "$tmp_dir" >/dev/null 2>&1) &
-    pid=$!
-    sleep 3
+    cat > "$route_file" << EOF
+{
+  "route": {
+    "rules": [
+      {"action": "sniff"},
+      {"outbound": "wireguard-out"}
+    ],
+    "final": "wireguard-out",
+    "default_domain_resolver": {
+      "server": "sys",
+      "strategy": "prefer_ipv4"
+    }
+  }
+}
+EOF
+
+    restart_singbox
+    sleep 2
 
     green "正在通过 socks5://127.0.0.1:${test_port} 测试 WARP 出口...\n"
     local ip_result warp_result
@@ -2556,7 +2548,7 @@ test_warp_connectivity() {
         red "获取出口 IP 失败（超时或连接失败）"
     fi
     if [ -n "$warp_result" ]; then
-        echo "$warp_result" | while read -r line; do
+        echo "$warp_result" | while read line; do
             if echo "$line" | grep -q "warp=on"; then
                 green "$line"
             else
@@ -2570,15 +2562,15 @@ test_warp_connectivity() {
     else
         red "\n❌ WARP 未生效。请检查："
         yellow "  - 是否已重新生成独立 WARP 密钥"
-        yellow "  - 临时进程日志: ${tmp_dir}/box.log (本次退出前显示如下)"
-        tail -n 10 "${tmp_dir}/box.log" 2>/dev/null
-        yellow "  - endpoints.json 中 peer 地址/端口是否可达"
+        yellow "  - /etc/sing-box/sb.log 中是否有 handshake 错误"
+        yellow "  - endpoints.json 中 peer 地址是否为 162.159.192.1"
     fi
 
-    kill "$pid" 2>/dev/null
-    wait "$pid" 2>/dev/null
-    rm -rf "$tmp_dir"
-    green "\n临时测试进程已清理，现有配置未改动。\n"
+    yellow "\n正在恢复原配置..."
+    mv "$route_bak" "$route_file"
+    mv "$inbounds_bak" "$inbounds_file"
+    restart_singbox
+    green "配置已恢复。\n"
     read -n 1 -s -r -p $'\033[1;91m按任意键返回...\033[0m\n'
     warp_manage
 }
@@ -2871,7 +2863,7 @@ finalize_rule_add() {
         green "'${rule_tag}' 已分流至出站 '${selected_out}'"
     fi
     if [ "$selected_out" = "wireguard-out" ]; then
-        yellow "提示：请用客户端连接节点后访问对应网站验证；也可到「7. 测试 WARP 连通性」一键检测。"
+        yellow "提示：请用客户端连接节点后访问对应网站验证；也可到「6. 测试 WARP 连通性」一键检测。"
     fi
     sleep 2; warp_manage
 }
@@ -2980,14 +2972,10 @@ restore_direct_outbound() {
 delete_rule_menu() {
     clear
     green "当前已启用的分流规则集:"
-    local rule_tags=() i
-    mapfile -t rule_tags < <(jq -r '[.route.rules[] | select(.rule_set != null) | .rule_set[]?] | map(select(. != "telegram-ip")) | .[]' "$route_file")
-    for i in "${!rule_tags[@]}"; do
-        printf '%2d. %s\n' "$((i+1))" "${rule_tags[$i]}"
-    done
+    jq -r '.route.rules[] | select(.rule_set != null) | .rule_set[]?' "$route_file" | grep -v '^telegram-ip$' | nl -w2 -s'. '
     reading "\n输入要删除的规则名称或序号: " del_input
     if [[ "$del_input" =~ ^[0-9]+$ ]]; then
-        tag="${rule_tags[$((del_input-1))]:-}"
+        tag=$(jq -r --arg idx "$del_input" '[.route.rules[] | select(.rule_set != null) | .rule_set[]] | .[(($idx | tonumber) - 1)]' "$route_file")
     else
         tag="$del_input"
     fi
@@ -4081,7 +4069,8 @@ update_singbox_core() {
 
     restart_singbox
     sleep 2
-    if ! service_is_running "sing-box"; then
+    check_singbox &>/dev/null
+    if [ $? -ne 0 ]; then
         red "\n新内核 ${new_ver} 配置校验通过，但服务实际启动失败，正在回滚到旧版本...\n"
         if [ -f "${work_dir}/sing-box.bak" ]; then
             mv "${work_dir}/sing-box.bak" "${work_dir}/sing-box" && chmod +x "${work_dir}/sing-box"
@@ -4393,7 +4382,7 @@ do_install_singbox() {
     fi
 
     ensure_core_deps || { red "依赖安装失败"; return 1; }
-    install_singbox || { red "安装失败，已中止"; return 1; }
+    install_singbox
     if command_exists systemctl; then
         main_systemd_services
     elif command_exists rc-update; then
@@ -4562,22 +4551,21 @@ menu() {
     green "1. 安装sing-box"
     red   "2. 卸载sing-box"
     echo "==============="
-    green "3. sing-box服务管理"
-    green "4. sing-box内核更新"
+    green "3. sing-box管理"
+    green "4. Argo隧道管理"
     echo "==============="
     green "5. 查看节点信息"
     green "6. 修改节点配置"
-    green "7. 增加/删除协议"
-    green "8. Argo隧道管理"
-    green "9. 域名证书管理"
+    green "7. WARP分流管理"
     echo "==============="
-    green "10. WARP分流管理"
-    green "11. WARP全局出站"
-    green "12. 双栈出站优先"
-    echo "==============="
-    green "13. 切换为BBR+fq"
-    green "14. 系统时间同步"
-    green "15. 调整虚拟内存"
+    green "8. 增加/删除协议"
+    green "9. 域名证书管理(hy2/tuic)"
+    green "10. 出站IPv4/IPv6优先级"
+    green "11. sing-box内核查看/更新"
+    green "12. 单栈VPS加装WARP全局出站"
+    green "13. 切换为 BBR+fq 拥塞控制"
+    green "14. 系统时间同步(校时/防卡顿)"
+    green "15. 调整虚拟内存(SWAP)"
     echo "==============="
     purple "20. ssh综合工具箱"
     echo "==============="
@@ -4631,15 +4619,15 @@ case "$1" in
                 1)  do_install_singbox || continue ;;
                 2)  uninstall_singbox;  need_pause=false ;;
                 3)  manage_singbox;     need_pause=false ;;
-                4)  manage_singbox_core; need_pause=false ;;
+                4)  manage_argo;        need_pause=true ;;
                 5)  check_nodes;        need_pause=true ;;
                 6)  change_config;      need_pause=true ;;
-                7)  manage_protocols;   need_pause=false ;;
-                8)  manage_argo;        need_pause=true ;;
+                7)  warp_manage;        need_pause=false ;;
+                8)  manage_protocols;   need_pause=false ;;
                 9)  manage_cert;        need_pause=false ;;
-                10) warp_manage;        need_pause=false ;;
-                11) system_warp_menu;   need_pause=false ;;
-                12) manage_outbound_strategy; need_pause=false ;;
+                10) manage_outbound_strategy; need_pause=false ;;
+                11) manage_singbox_core; need_pause=false ;;
+                12) system_warp_menu;   need_pause=false ;;
                 13) enable_bbr_fq;       need_pause=true ;;
                 14) time_sync_menu;      need_pause=false ;;
                 15) swap_manage_menu;    need_pause=false ;;
