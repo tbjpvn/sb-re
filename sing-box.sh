@@ -19,14 +19,12 @@ green() { echo -e "\e[1;32m$1\033[0m"; }
 yellow() { echo -e "\e[1;33m$1\033[0m"; }
 purple() { echo -e "\e[1;35m$1\033[0m"; }
 skyblue() { echo -e "\e[1;36m$1\033[0m"; }
-gray() { echo -e "\e[90m$1\033[0m"; }
-reading() { read -p "$(red "$1")" "$2"; }
+reading() { read -r -p "$(red "$1")" "$2"; }
 
 # 定义常量
 server_name="sing-box"
 work_dir="/etc/sing-box"
 conf_dir="${work_dir}/conf"
-inbounds_file="${conf_dir}/inbounds.json"
 client_dir="${work_dir}/url.txt"
 sys_warp_dir="/etc/wireguard"
 export vless_port=${PORT:-$(shuf -i 10000-65000 -n 1)}
@@ -34,96 +32,12 @@ export CFIP=${CFIP:-'cdns.doon.eu.org'}
 export ARGO_PORT=${ARGO_PORT:-'8001'} 
 export CFPORT=${CFPORT:-'443'} 
 
-# 四合一节点安装状态(默认全部安装；自定义安装或历史安装记录会覆盖以下默认值)
-INSTALL_VLESS=1
-INSTALL_VMESS=1
-INSTALL_HY2=1
-INSTALL_TUIC=1
-[ -f "${work_dir}/components.conf" ] && source "${work_dir}/components.conf"
-
 # 检查是否为root下运行
 [[ $EUID -ne 0 ]] && red "请在root用户下运行脚本，可输入 sudo -i 回车切换到root用户" && exit 1
 
 # 检查命令是否存在函数
 command_exists() {
     command -v "$1" >/dev/null 2>&1
-}
-
-# ==================== 服务控制小工具 (systemd / OpenRC 通用) ====================
-# 静默停止服务(忽略错误)
-svc_stop_q() {
-    command_exists rc-service && rc-service "$1" stop >/dev/null 2>&1
-    command_exists systemctl && systemctl stop "$1" >/dev/null 2>&1
-    return 0
-}
-
-# 取消开机自启(忽略错误)
-svc_disable() {
-    command_exists rc-update && rc-update del "$1" default >/dev/null 2>&1
-    command_exists systemctl && systemctl disable "$1" >/dev/null 2>&1
-    return 0
-}
-
-# 开机自启并立即启动(忽略错误)
-svc_enable_now() {
-    if command_exists systemctl; then
-        systemctl enable --now "$1" >/dev/null 2>&1
-    elif command_exists rc-update; then
-        rc-update add "$1" default >/dev/null 2>&1
-        rc-service "$1" start >/dev/null 2>&1
-    fi
-    return 0
-}
-
-# 停止并彻底移除服务(停止、取消自启、删除单元/init 脚本)，可一次传多个服务名
-svc_purge() {
-    local s
-    for s in "$@"; do
-        svc_stop_q "$s"
-        svc_disable "$s"
-        command_exists rc-service && rm -f "/etc/init.d/${s}"
-        command_exists systemctl && rm -f "/etc/systemd/system/${s}.service"
-    done
-    if command_exists systemctl; then
-        systemctl daemon-reload >/dev/null 2>&1 || true
-        for s in "$@"; do systemctl reset-failed "$s" >/dev/null 2>&1 || true; done
-    fi
-    return 0
-}
-
-# 输出重启某服务的命令字符串(供 acme.sh --reloadcmd 等使用)
-svc_restart_cmd() {
-    if command_exists systemctl; then
-        echo "systemctl restart $1"
-    elif command_exists rc-service; then
-        echo "rc-service $1 restart"
-    else
-        echo "true"
-    fi
-}
-
-# chrony 在不同发行版里服务名不同(chronyd / chrony)
-chrony_svc_name() {
-    if systemctl list-unit-files 2>/dev/null | grep -q '^chronyd\.service'; then
-        echo "chronyd"
-    else
-        echo "chrony"
-    fi
-}
-
-# 安装完成后按 init 类型拉起服务；不支持的 init 返回 1
-start_services_after_install() {
-    if command_exists systemctl; then
-        main_systemd_services
-    elif command_exists rc-update; then
-        alpine_openrc_services
-        change_hosts
-        restart_singbox
-        [ "${INSTALL_VMESS:-1}" -eq 1 ] && rc-service argo restart
-        return 0
-    else
-        return 1
-    fi
 }
 
 is_port_free() {
@@ -218,12 +132,24 @@ check_service() {
 
     [[ ! -f "${service_file}" ]] && { red "not installed"; return 2; }
 
-    if command_exists apk; then
-        rc-service "${service_name}" status | grep -q "started" && green "running" || yellow "not running"
+    # 仅用于展示：已安装返回0（运行与否看输出文字）。
+    # 需要判断“是否真的在运行”请用 service_is_running。
+    if service_is_running "${service_name}"; then
+        green "running"
     else
-        systemctl is-active "${service_name}" | grep -q "^active$" && green "running" || yellow "not running"
+        yellow "not running"
     fi
-    return $?
+    return 0
+}
+
+# 真实运行状态判断：运行中返回0，否则返回1（不依赖带颜色的输出文字）
+service_is_running() {
+    local name=$1
+    if command_exists rc-service && ! command_exists systemctl; then
+        rc-service "$name" status 2>/dev/null | grep -q "started"
+    else
+        systemctl is-active --quiet "$name" 2>/dev/null
+    fi
 }
 
 verify_udp_listening() {
@@ -268,22 +194,6 @@ verify_udp_listening() {
 # 检查sing-box状态
 check_singbox() {
     check_service "sing-box" "${work_dir}/${server_name}"
-}
-
-# 检查指定协议(vless/vmess/hysteria2/tuic)是否已安装(即inbounds.json中是否存在该类型的inbound)
-protocol_installed() {
-    local t="$1"
-    [ -f "$inbounds_file" ] || return 1
-    jq -e --arg t "$t" '.inbounds[]? | select(.type == $t)' "$inbounds_file" >/dev/null 2>&1
-}
-
-# 未安装指定协议时统一报错提示，返回1
-require_protocol() {
-    if ! protocol_installed "$1"; then
-        red "\n当前协议未安装\n"
-        return 1
-    fi
-    return 0
 }
 
 check_congestion() {
@@ -589,6 +499,21 @@ get_isp() {
     return 0
 }
 
+# 统一的 iptables 规则持久化（Alpine / Debian / RHEL）
+persist_iptables() {
+    if command_exists rc-service && ! command_exists systemctl; then
+        mkdir -p /etc/iptables
+        command_exists iptables && iptables-save > /etc/iptables/rules.v4 2>/dev/null
+        command_exists ip6tables && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
+    elif command_exists netfilter-persistent; then
+        netfilter-persistent save >/dev/null 2>&1
+    elif command_exists service; then
+        service iptables save >/dev/null 2>&1
+        service ip6tables save >/dev/null 2>&1
+    fi
+    return 0
+}
+
 # 处理防火墙
 allow_port() {
     has_ufw=0
@@ -602,17 +527,14 @@ allow_port() {
     command_exists ip6tables && has_ip6tables=1
 
     [ "$has_ufw" -eq 1 ] && ufw --force default allow outgoing >/dev/null 2>&1
-    [ "$has_firewalld" -eq 1 ] && firewall-cmd --permanent --zone=public --set-target=ACCEPT >/dev/null 2>&1
     [ "$has_iptables" -eq 1 ] && {
         iptables -C INPUT -i lo -j ACCEPT 2>/dev/null || iptables -I INPUT 3 -i lo -j ACCEPT
         iptables -C INPUT -p icmp -j ACCEPT 2>/dev/null || iptables -I INPUT 4 -p icmp -j ACCEPT
-        iptables -P FORWARD DROP 2>/dev/null || true
         iptables -P OUTPUT ACCEPT 2>/dev/null || true
     }
     [ "$has_ip6tables" -eq 1 ] && {
         ip6tables -C INPUT -i lo -j ACCEPT 2>/dev/null || ip6tables -I INPUT 3 -i lo -j ACCEPT
         ip6tables -C INPUT -p icmp -j ACCEPT 2>/dev/null || ip6tables -I INPUT 4 -p icmp -j ACCEPT
-        ip6tables -P FORWARD DROP 2>/dev/null || true
         ip6tables -P OUTPUT ACCEPT 2>/dev/null || true
     }
 
@@ -627,18 +549,11 @@ allow_port() {
 
     [ "$has_firewalld" -eq 1 ] && firewall-cmd --reload >/dev/null 2>&1
 
-    if command_exists rc-service 2>/dev/null; then
-        [ "$has_iptables" -eq 1 ] && iptables-save > /etc/iptables/rules.v4 2>/dev/null
-        [ "$has_ip6tables" -eq 1 ] && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
-    else
-        if ! command_exists netfilter-persistent; then
-            manage_packages install iptables-persistent || yellow "请手动安装netfilter-persistent或保存iptables规则"
-            netfilter-persistent save >/dev/null 2>&1
-        elif command_exists service; then
-            service iptables save 2>/dev/null
-            service ip6tables save 2>/dev/null
-        fi
+    # Debian/Ubuntu 上若尚未安装 netfilter-persistent，先装再保存
+    if ! command_exists rc-service && ! command_exists netfilter-persistent && command_exists apt; then
+        manage_packages install iptables-persistent || yellow "请手动安装netfilter-persistent或保存iptables规则"
     fi
+    persist_iptables
 }
 
 
@@ -681,21 +596,12 @@ deny_port() {
     [ "$has_firewalld" -eq 1 ] && firewall-cmd --reload >/dev/null 2>&1 || true
 
     # 持久化
-    if command_exists rc-service 2>/dev/null; then
-        [ "$has_iptables" -eq 1 ] && iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-        [ "$has_ip6tables" -eq 1 ] && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
-    else
-        if command_exists netfilter-persistent; then
-            netfilter-persistent save >/dev/null 2>&1 || true
-        elif command_exists service; then
-            service iptables save 2>/dev/null || true
-            service ip6tables save 2>/dev/null || true
-        fi
-    fi
+    persist_iptables
 }
 
 # 从配置收集本脚本节点端口（格式: port/proto）
 collect_node_ports() {
+    local inbounds_file="${conf_dir}/inbounds.json"
     local ports=() typ port
 
     [ -f "$inbounds_file" ] && command_exists jq || return 0
@@ -741,12 +647,7 @@ cleanup_port_hop_nat() {
         done
     fi
 
-    if command_exists rc-service 2>/dev/null; then
-        command_exists iptables && iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-        command_exists ip6tables && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
-    elif command_exists netfilter-persistent; then
-        netfilter-persistent save >/dev/null 2>&1 || true
-    fi
+    persist_iptables
 }
 
 # 回收申请证书时放行的80端口（仅在确认没有服务在用80时才关，避免误伤用户自己的网站）
@@ -1438,7 +1339,6 @@ write_install_configs() {
     local uuid=$1 private_key=$2
     local vless_port=$3 hy2_port=$4 tuic_port=$5 argo_port=$6
     local dns_strategy=$7 resolver_tag=$8 sys_dns_server=$9
-    local want_vless=${10:-1} want_vmess=${11:-1} want_hy2=${12:-1} want_tuic=${13:-1}
 
     jq -n \
         --arg out "${work_dir}/sb.log" \
@@ -1467,17 +1367,13 @@ write_install_configs() {
         --arg pk "$private_key" \
         --arg cert "${work_dir}/cert.pem" \
         --arg key "${work_dir}/private.key" \
-        --argjson vless_port "${vless_port:-0}" \
-        --argjson hy2_port "${hy2_port:-0}" \
-        --argjson tuic_port "${tuic_port:-0}" \
+        --argjson vless_port "$vless_port" \
+        --argjson hy2_port "$hy2_port" \
+        --argjson tuic_port "$tuic_port" \
         --argjson argo_port "$argo_port" \
-        --argjson want_vless "$([ "$want_vless" -eq 1 ] && echo true || echo false)" \
-        --argjson want_vmess "$([ "$want_vmess" -eq 1 ] && echo true || echo false)" \
-        --argjson want_hy2 "$([ "$want_hy2" -eq 1 ] && echo true || echo false)" \
-        --argjson want_tuic "$([ "$want_tuic" -eq 1 ] && echo true || echo false)" \
         '{
           inbounds: [
-            (if $want_vless then {
+            {
               type: "vless", tag: "vless-reality", listen: "::", listen_port: $vless_port,
               users: [{uuid: $uuid, flow: "xtls-rprx-vision"}],
               tls: {
@@ -1489,13 +1385,13 @@ write_install_configs() {
                   short_id: [""]
                 }
               }
-            } else empty end),
-            (if $want_vmess then {
+            },
+            {
               type: "vmess", tag: "vmess-ws", listen: "::", listen_port: $argo_port,
               users: [{uuid: $uuid}],
               transport: {type: "ws", path: "/vmess-argo", early_data_header_name: "Sec-WebSocket-Protocol"}
-            } else empty end),
-            (if $want_hy2 then {
+            },
+            {
               type: "hysteria2", tag: "hysteria2", listen: "::", listen_port: $hy2_port,
               users: [{password: $uuid}],
               ignore_client_bandwidth: false,
@@ -1504,26 +1400,19 @@ write_install_configs() {
                 enabled: true, alpn: ["h3"], min_version: "1.3", max_version: "1.3",
                 certificate_path: $cert, key_path: $key
               }
-            } else empty end),
-            (if $want_tuic then {
+            },
+            {
               type: "tuic", tag: "tuic", listen: "::", listen_port: $tuic_port,
               users: [{uuid: $uuid, password: $uuid}],
               congestion_control: "bbr",
               tls: {enabled: true, alpn: ["h3"], certificate_path: $cert, key_path: $key}
-            } else empty end)
+            }
           ]
         }' > "${conf_dir}/inbounds.json"
 
     jq -n '{outbounds:[{type:"direct", tag:"direct"}]}' > "${conf_dir}/outbounds.json"
 
     write_default_route_json "$resolver_tag" "$dns_strategy"
-
-    cat > "${work_dir}/components.conf" << EOF
-INSTALL_VLESS=$want_vless
-INSTALL_VMESS=$want_vmess
-INSTALL_HY2=$want_hy2
-INSTALL_TUIC=$want_tuic
-EOF
 }
 
 # 下载并安装 sing-box,cloudflared
@@ -1537,34 +1426,34 @@ install_singbox() {
         'aarch64' | 'arm64') ARCH='arm64' ;;
         'armv7l')  ARCH='armv7' ;;
         's390x')   ARCH='s390x' ;;
-        *) red "不支持的架构: ${ARCH_RAW}"; exit 1 ;;
+        *) red "不支持的架构: ${ARCH_RAW}"; return 1 ;;
     esac
 
     mkdir -p "${work_dir}" "${conf_dir}"
-    chmod 777 "${work_dir}" 2>/dev/null || true
+    chmod 755 "${work_dir}" 2>/dev/null || true
 
     if ! releases_json=$(gh_fetch_json "https://api.github.com/repos/SagerNet/sing-box/releases"); then
         red "获取 sing-box 最新版本号失败，请检查服务器是否能访问 api.github.com\n"
         gh_ipv6_hint
-        exit 1
+        return 1
     fi
     latest_version=$(echo "$releases_json" | jq -r '[.[] | select(.prerelease==false)][0].tag_name // empty' | sed 's/^v//')
     if [ -z "$latest_version" ] || [ "$latest_version" = "null" ]; then
         red "获取 sing-box 最新版本号失败，请检查服务器是否能访问 api.github.com\n"
-        exit 1
+        return 1
     fi
     if ! gh_download "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${ARCH}.tar.gz" "${work_dir}/${server_name}.tar.gz"; then
         red "从 GitHub 下载 sing-box 二进制失败，请检查服务器是否能访问 github.com\n"
         gh_ipv6_hint
-        exit 1
+        return 1
     fi
     if ! tar -xzf "${work_dir}/${server_name}.tar.gz" -C "${work_dir}/"; then
         red "解压 sing-box 失败\n"
-        exit 1
+        return 1
     fi
     if ! mv "${work_dir}/sing-box-${latest_version}-linux-${ARCH}/sing-box" "${work_dir}/"; then
         red "移动 sing-box 二进制失败\n"
-        exit 1
+        return 1
     fi
     rm -rf "${work_dir}/${server_name}.tar.gz" "${work_dir}/sing-box-${latest_version}-linux-${ARCH}"
 
@@ -1574,28 +1463,24 @@ install_singbox() {
             apk add --no-cache gcompat >/dev/null 2>&1
             if ! apk info -e gcompat >/dev/null 2>&1; then
                 red "gcompat 安装失败，官方sing-box二进制在Alpine上大概率无法运行，请手动执行: apk add gcompat 后重新运行本脚本安装\n"
-                exit 1
+                return 1
             fi
         fi
     fi
 
-    if [ "${INSTALL_VMESS:-1}" -eq 1 ]; then
-        case "${ARCH}" in
-            'amd64') CF_ARCH='amd64' ;;
-            '386')   CF_ARCH='386' ;;
-            'arm64') CF_ARCH='arm64' ;;
-            'armv7') CF_ARCH='arm' ;;
-            *) CF_ARCH='' ;;
-        esac
-        if [ -z "$CF_ARCH" ]; then
-            yellow "架构 ${ARCH} 官方 cloudflared 不提供预编译包，argo 隧道功能将不可用\n"
-            : > "${work_dir}/argo"
-        elif ! curl -fsSLo "${work_dir}/argo" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"; then
-            red "从 GitHub 下载 cloudflared 失败，请检查服务器是否能访问 github.com\n"
-            exit 1
-        fi
-    else
+    case "${ARCH}" in
+        'amd64') CF_ARCH='amd64' ;;
+        '386')   CF_ARCH='386' ;;
+        'arm64') CF_ARCH='arm64' ;;
+        'armv7') CF_ARCH='arm' ;;
+        *) CF_ARCH='' ;;
+    esac
+    if [ -z "$CF_ARCH" ]; then
+        yellow "架构 ${ARCH} 官方 cloudflared 不提供预编译包，argo 隧道功能将不可用\n"
         : > "${work_dir}/argo"
+    elif ! curl -fsSLo "${work_dir}/argo" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"; then
+        red "从 GitHub 下载 cloudflared 失败，请检查服务器是否能访问 github.com\n"
+        return 1
     fi
 
     curl -sLo "${work_dir}/qrencode" "https://github.com/eooce/test/releases/download/${ARCH}/qrencode-linux-${ARCH}" 2>/dev/null || true
@@ -1604,60 +1489,34 @@ install_singbox() {
     [ -f "${work_dir}/argo" ] && chmod +x "${work_dir}/argo" 2>/dev/null || true
     [ -f "${work_dir}/qrencode" ] && chmod +x "${work_dir}/qrencode" 2>/dev/null || true
 
-    if [ "${INSTALL_VLESS:-1}" -eq 1 ]; then
-        while ! is_port_free "$vless_port"; do
-            vless_port=$(shuf -i 10000-65000 -n 1)
-        done
-    else
-        vless_port=""
-    fi
-    if [ "${INSTALL_TUIC:-1}" -eq 1 ]; then
+    while ! is_port_free "$vless_port"; do
+        vless_port=$(shuf -i 10000-65000 -n 1)
+    done
+    tuic_port=$(get_free_port 10000 65000)
+    hy2_port=$(get_free_port 10000 65000)
+    while [ "$tuic_port" = "$vless_port" ] || [ "$hy2_port" = "$vless_port" ] || \
+          [ "$tuic_port" = "$hy2_port" ]; do
         tuic_port=$(get_free_port 10000 65000)
-    else
-        tuic_port=""
-    fi
-    if [ "${INSTALL_HY2:-1}" -eq 1 ]; then
         hy2_port=$(get_free_port 10000 65000)
-    else
-        hy2_port=""
-    fi
-    while { [ -n "$tuic_port" ] && [ -n "$vless_port" ] && [ "$tuic_port" = "$vless_port" ]; } || \
-          { [ -n "$hy2_port" ] && [ -n "$vless_port" ] && [ "$hy2_port" = "$vless_port" ]; } || \
-          { [ -n "$tuic_port" ] && [ -n "$hy2_port" ] && [ "$tuic_port" = "$hy2_port" ]; }; do
-        [ -n "$tuic_port" ] && tuic_port=$(get_free_port 10000 65000)
-        [ -n "$hy2_port" ] && hy2_port=$(get_free_port 10000 65000)
     done
     uuid=$(cat /proc/sys/kernel/random/uuid)
+    output=$(/etc/sing-box/sing-box generate reality-keypair)
+    private_key=$(echo "${output}" | awk '/PrivateKey:/ {print $2}')
+    public_key=$(echo "${output}" | awk '/PublicKey:/ {print $2}')
 
-    if [ "${INSTALL_VLESS:-1}" -eq 1 ]; then
-        output=$(/etc/sing-box/sing-box generate reality-keypair)
-        private_key=$(echo "${output}" | awk '/PrivateKey:/ {print $2}')
-        public_key=$(echo "${output}" | awk '/PublicKey:/ {print $2}')
-
-        if [ -z "$private_key" ] || [ -z "$public_key" ]; then
-            red "生成 reality 密钥对失败！/etc/sing-box/sing-box 二进制可能无法在本机正常执行。\n"
-            yellow "请先手动执行 /etc/sing-box/sing-box version 排查(Alpine系统常见原因是缺少gcompat，可执行 apk add gcompat 后重试)。\n"
-            exit 1
-        fi
-    else
-        private_key=""
-        public_key=""
+    if [ -z "$private_key" ] || [ -z "$public_key" ]; then
+        red "生成 reality 密钥对失败！/etc/sing-box/sing-box 二进制可能无法在本机正常执行。\n"
+        yellow "请先手动执行 /etc/sing-box/sing-box version 排查(Alpine系统常见原因是缺少gcompat，可执行 apk add gcompat 后重试)。\n"
+        return 1
     fi
 
-    local open_ports=()
-    [ -n "$vless_port" ] && open_ports+=("$vless_port/tcp")
-    [ -n "$tuic_port" ] && open_ports+=("$tuic_port/udp")
-    [ -n "$hy2_port" ] && open_ports+=("$hy2_port/udp")
-    [ "${#open_ports[@]}" -gt 0 ] && { allow_port "${open_ports[@]}" > /dev/null 2>&1 || true; }
+    allow_port $vless_port/tcp $tuic_port/udp $hy2_port/udp > /dev/null 2>&1 || true
 
-    if [ "${INSTALL_HY2:-1}" -eq 1 ] || [ "${INSTALL_TUIC:-1}" -eq 1 ]; then
-        openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key" || { red "生成证书私钥失败"; exit 1; }
-        openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
+    openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key" || { red "生成证书私钥失败"; return 1; }
+    openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
+    chmod 600 "${work_dir}/private.key"
 
-        fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
-    else
-        fingerprint=""
-    fi
+    fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
 
     dns_strategy=$(ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1 && echo "prefer_ipv4" || \
         (ping -c 1 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && echo "prefer_ipv6" || echo "prefer_ipv4"))
@@ -1674,8 +1533,7 @@ install_singbox() {
         esac
     fi
 
-    write_install_configs "$uuid" "$private_key" "$vless_port" "$hy2_port" "$tuic_port" "${ARGO_PORT}" "$dns_strategy" "$resolver_tag" "$sys_dns_server" \
-        "${INSTALL_VLESS:-1}" "${INSTALL_VMESS:-1}" "${INSTALL_HY2:-1}" "${INSTALL_TUIC:-1}"
+    write_install_configs "$uuid" "$private_key" "$vless_port" "$hy2_port" "$tuic_port" "${ARGO_PORT}" "$dns_strategy" "$resolver_tag" "$sys_dns_server"
 
 }
 
@@ -1703,8 +1561,7 @@ LimitNOFILE=infinity
 WantedBy=multi-user.target
 EOF
 
-    if [ "${INSTALL_VMESS:-1}" -eq 1 ]; then
-        cat > /etc/systemd/system/argo.service << EOF
+    cat > /etc/systemd/system/argo.service << EOF
 [Unit]
 Description=Cloudflare Tunnel
 Wants=network-online.target
@@ -1714,14 +1571,13 @@ After=network-online.target
 Type=simple
 NoNewPrivileges=yes
 TimeoutStartSec=0
-ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --url http://localhost:8001 --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1"
+ExecStart=/bin/sh -c "/etc/sing-box/argo tunnel --url http://localhost:$(get_argo_port) --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1"
 Restart=on-failure
 RestartSec=5s
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    fi
     if [ -f /etc/centos-release ]; then
         yum install -y chrony
         systemctl start chronyd
@@ -1733,10 +1589,8 @@ EOF
     systemctl daemon-reload
     systemctl enable sing-box
     systemctl start sing-box
-    if [ "${INSTALL_VMESS:-1}" -eq 1 ]; then
-        systemctl enable argo
-        systemctl start argo
-    fi
+    systemctl enable argo
+    systemctl start argo
 }
 
 # 适配alpine 守护进程
@@ -1755,15 +1609,11 @@ depend() {
 }
 EOF
 
-    chmod +x /etc/init.d/sing-box
-    rc-update add sing-box default > /dev/null 2>&1
-
-    if [ "${INSTALL_VMESS:-1}" -eq 1 ]; then
-        cat > /etc/init.d/argo << 'EOF'
+    cat > /etc/init.d/argo << EOF
 #!/sbin/openrc-run
 description="Cloudflare Tunnel"
 command="/bin/sh"
-command_args="-c '/etc/sing-box/argo tunnel --url http://localhost:8001 --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1'"
+command_args="-c '/etc/sing-box/argo tunnel --url http://localhost:$(get_argo_port) --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/sing-box/argo.log 2>&1'"
 command_background=true
 pidfile="/var/run/argo.pid"
 
@@ -1772,9 +1622,11 @@ depend() {
     after firewall
 }
 EOF
-        chmod +x /etc/init.d/argo
-        rc-update add argo default > /dev/null 2>&1
-    fi
+
+    chmod +x /etc/init.d/sing-box
+    chmod +x /etc/init.d/argo
+    rc-update add sing-box default > /dev/null 2>&1
+    rc-update add argo default     > /dev/null 2>&1
 }
 
 # 生成节点和订阅链接
@@ -1784,45 +1636,40 @@ get_info() {
     clear
     isp=$(get_isp || echo "$(hostname)")
 
-    if [ "${INSTALL_VMESS:-1}" -eq 1 ]; then
-        if [ -f "${work_dir}/argo.log" ]; then
-            for i in {1..5}; do
-                purple "第 $i 次尝试获取ArgoDoamin中..."
-                argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log")
-                [ -n "$argodomain" ] && break
-                sleep 2
-            done
-        else
-            restart_argo
-            sleep 6
+    if [ -f "${work_dir}/argo.log" ]; then
+        for i in {1..5}; do
+            purple "第 $i 次尝试获取ArgoDoamin中..."
             argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log")
-        fi
-
-        green "\nArgoDomain：${purple}$argodomain${re}\n"
-
-        VMESS="{ \"v\": \"2\", \"ps\": \"${isp}-VMess-Argo\", \"add\": \"${CFIP}\", \"port\": \"${CFPORT}\", \"id\": \"${uuid}\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"firefox\", \"allowInsecure\": \"false\"}"
+            [ -n "$argodomain" ] && break
+            sleep 2
+        done
+    else
+        restart_argo
+        sleep 6
+        argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log")
     fi
+
+    green "\nArgoDomain：${purple}$argodomain${re}\n"
+
+    VMESS="{ \"v\": \"2\", \"ps\": \"${isp}-VMess-Argo\", \"add\": \"${CFIP}\", \"port\": \"${CFPORT}\", \"id\": \"${uuid}\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"firefox\", \"allowInsecure\": \"false\"}"
 
     extra_lines=""
     if [ -f "${client_dir}" ]; then
         extra_lines=$(grep -vE '^(vless://|vmess://|hysteria2://|tuic://)' "${client_dir}" || true)
     fi
 
-    : > "${work_dir}/url.txt"
-    if [ "${INSTALL_VMESS:-1}" -eq 1 ]; then
-        { echo "vmess://$(echo "$VMESS" | base64 -w0)"; echo ""; } >> "${work_dir}/url.txt"
-    fi
-    if [ "${INSTALL_VLESS:-1}" -eq 1 ]; then
-        { echo "vless://${uuid}@${server_ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk=${public_key}&type=tcp&headerType=none#${isp}-Reality"; echo ""; } >> "${work_dir}/url.txt"
-    fi
-    if [ "${INSTALL_TUIC:-1}" -eq 1 ]; then
-        { echo "tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${isp}-TUIC5"; echo ""; } >> "${work_dir}/url.txt"
-    fi
-    if [ "${INSTALL_HY2:-1}" -eq 1 ]; then
-        { echo "hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none#${isp}-Hysteria2"; echo ""; } >> "${work_dir}/url.txt"
-    fi
+    cat > ${work_dir}/url.txt << EOF
+vmess://$(echo "$VMESS" | base64 -w0)
+
+vless://${uuid}@${server_ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk=${public_key}&type=tcp&headerType=none#${isp}-Reality
+
+tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${isp}-TUIC5
+
+hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none#${isp}-Hysteria2
+EOF
 
     if [ -n "$extra_lines" ]; then
+        echo "" >> "${work_dir}/url.txt"
         echo "$extra_lines" >> "${work_dir}/url.txt"
     fi
 
@@ -1838,14 +1685,21 @@ get_info() {
     green "如需以订阅方式导入，可将该文件内容复制粘贴到客户端的订阅内容中。\n"
 }
 
+# 获取 vmess-argo 实际监听端口（以 inbounds.json 为准，退回环境变量默认值）
+get_argo_port() {
+    local p
+    p=$(jq -r '.inbounds[]? | select(.type=="vmess") | .listen_port // empty' "${conf_dir}/inbounds.json" 2>/dev/null | head -1)
+    echo "${p:-${ARGO_PORT}}"
+}
+
 # 从已安装配置中获取UUID
 get_current_uuid() {
+    local inbounds_file="${conf_dir}/inbounds.json"
     if [ -f "$inbounds_file" ]; then
         local uuid
         uuid=$(jq -r '.inbounds[] | select(.type == "vless") | .users[0].uuid // empty' "$inbounds_file" 2>/dev/null | head -1)
         [ -z "$uuid" ] && uuid=$(jq -r '.inbounds[] | select(.type == "vmess") | .users[0].uuid // empty' "$inbounds_file" 2>/dev/null | head -1)
         [ -z "$uuid" ] && uuid=$(jq -r '.inbounds[] | select(.type == "hysteria2") | .users[0].password // empty' "$inbounds_file" 2>/dev/null | head -1)
-        [ -z "$uuid" ] && uuid=$(jq -r '.inbounds[] | select(.type == "tuic") | .users[0].uuid // empty' "$inbounds_file" 2>/dev/null | head -1)
         echo "$uuid"
     fi
 }
@@ -1859,34 +1713,39 @@ manage_service() {
         red "缺少服务名或操作参数\n"; return 1
     fi
 
-    local status=$(check_service "$service_name" 2>/dev/null)
+    # 用返回码判断状态（旧版解析带颜色转义的输出，判断恒不成立）
+    local svc_file="${work_dir}/${service_name}"
+    [ "$service_name" = "sing-box" ] && svc_file="${work_dir}/${server_name}"
+    local installed=1 running=0
+    [ -f "$svc_file" ] && installed=0
+    service_is_running "$service_name" && running=1
 
     case "$action" in
         "start")
-            [ "$status" == "running" ] && { yellow "${service_name} 正在运行\n"; return 0; }
-            [ "$status" == "not installed" ] && { yellow "${service_name} 尚未安装!\n"; return 1; }
+            [ "$installed" -ne 0 ] && { yellow "${service_name} 尚未安装!\n"; return 1; }
+            [ "$running" -eq 1 ] && { yellow "${service_name} 正在运行\n"; return 0; }
             yellow "正在启动 ${service_name} 服务\n"
             if command_exists rc-service; then rc-service "$service_name" start
             elif command_exists systemctl; then systemctl daemon-reload && systemctl start "$service_name"; fi
             [ $? -eq 0 ] && green "${service_name} 服务已成功启动\n" || red "${service_name} 服务启动失败\n"
             ;;
         "stop")
-            [ "$status" == "not installed" ] && { yellow "${service_name} 尚未安装！\n"; return 2; }
-            [ "$status" == "not running" ]   && { yellow "${service_name} 未运行\n"; return 1; }
+            [ "$installed" -ne 0 ] && { yellow "${service_name} 尚未安装！\n"; return 2; }
+            [ "$running" -eq 0 ] && { yellow "${service_name} 未运行\n"; return 1; }
             yellow "正在停止 ${service_name} 服务\n"
             if command_exists rc-service; then rc-service "$service_name" stop
             elif command_exists systemctl; then systemctl stop "$service_name"; fi
             [ $? -eq 0 ] && green "${service_name} 服务已成功停止\n" || red "${service_name} 服务停止失败\n"
             ;;
         "restart")
-            [ "$status" == "not installed" ] && { yellow "${service_name} 尚未安装！\n"; return 1; }
+            [ "$installed" -ne 0 ] && { yellow "${service_name} 尚未安装！\n"; return 1; }
             yellow "正在重启 ${service_name} 服务\n"
             if command_exists rc-service; then rc-service "$service_name" restart
             elif command_exists systemctl; then systemctl daemon-reload && systemctl restart "$service_name"; fi
             [ $? -eq 0 ] && green "${service_name} 服务已成功重启\n" || red "${service_name} 服务重启失败\n"
             ;;
         "reload")
-            [ "$status" == "not installed" ] && { yellow "${service_name} 尚未安装！\n"; return 1; }
+            [ "$installed" -ne 0 ] && { yellow "${service_name} 尚未安装！\n"; return 1; }
             yellow "正在重载 ${service_name} 配置\n"
             if command_exists systemctl; then
                 if systemctl is-active --quiet "$service_name" 2>/dev/null && systemctl reload "$service_name" 2>/dev/null; then
@@ -1950,7 +1809,7 @@ reload_singbox() {
 
 # 重启 sing-box 并确认确实起来了，起不来就重试/给出日志
 ensure_singbox_running() {
-    local i status
+    local i
     for i in 1 2 3; do
         if command_exists rc-service; then
             rc-service sing-box restart >/dev/null 2>&1
@@ -1958,8 +1817,7 @@ ensure_singbox_running() {
             systemctl restart sing-box >/dev/null 2>&1
         fi
         sleep 2
-        status=$(check_service "sing-box" "${work_dir}/${server_name}" 2>/dev/null)
-        if echo "$status" | grep -q "running"; then
+        if service_is_running "sing-box"; then
             green "sing-box 运行正常\n"
             return 0
         fi
@@ -1981,7 +1839,23 @@ restart_argo()   { manage_service "argo" "restart"; }
 # 卸载 sing-box（交互式）
 # 停止服务并删除单元文件
 stop_and_remove_services() {
-    svc_purge sing-box argo
+    if command_exists rc-service; then
+        rc-service sing-box stop >/dev/null 2>&1 || true
+        rc-service argo stop >/dev/null 2>&1 || true
+        rc-update del sing-box default >/dev/null 2>&1 || true
+        rc-update del argo default >/dev/null 2>&1 || true
+        rm -f /etc/init.d/sing-box /etc/init.d/argo
+    fi
+    if command_exists systemctl; then
+        systemctl stop sing-box >/dev/null 2>&1 || true
+        systemctl stop argo >/dev/null 2>&1 || true
+        systemctl disable sing-box >/dev/null 2>&1 || true
+        systemctl disable argo >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/argo.service
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl reset-failed sing-box >/dev/null 2>&1 || true
+        systemctl reset-failed argo >/dev/null 2>&1 || true
+    fi
 }
 
 # 清理脚本产生的残留（目录、快捷方式、缓存、BBR 配置等）
@@ -2039,14 +1913,14 @@ uninstall_singbox() {
 
             # 系统级 WARP
             if [ -f "${sys_warp_dir}/$(sys_warp_iface 4).conf" ] || [ -f "${sys_warp_dir}/$(sys_warp_iface 6).conf" ]; then
-                reading "检测到「单栈VPS加装WARP全局出站」(菜单12)仍在使用，是否一并卸载？(y/n): " warp_choice
+                reading "检测到「单栈VPS加装WARP全局出站」(菜单11)仍在使用，是否一并卸载？(y/n): " warp_choice
                 case "${warp_choice}" in
                     y|Y)
                         sys_warp_remove 4 >/dev/null 2>&1
                         sys_warp_remove 6 >/dev/null 2>&1
                         green "系统级WARP出站已一并卸载\n"
                         ;;
-                    *) yellow "已保留系统级WARP出站，如需手动卸载可重新运行脚本进入菜单12\n" ;;
+                    *) yellow "已保留系统级WARP出站，如需手动卸载可重新运行脚本进入菜单11\n" ;;
                 esac
             fi
 
@@ -2087,9 +1961,10 @@ EOF
 
 # 适配alpine
 change_hosts() {
-    sh -c 'echo "0 0" > /proc/sys/net/ipv4/ping_group_range'
-    sed -i '1s/.*/127.0.0.1   localhost/' /etc/hosts
-    sed -i '2s/.*/::1         localhost/' /etc/hosts
+    sh -c 'echo "0 0" > /proc/sys/net/ipv4/ping_group_range' 2>/dev/null || true
+    # 只在缺失时补 localhost 记录，不再盲改 /etc/hosts 的前两行
+    grep -qE '^127\.0\.0\.1[[:space:]]+localhost' /etc/hosts 2>/dev/null || echo "127.0.0.1   localhost" >> /etc/hosts
+    grep -qE '^::1[[:space:]]+localhost' /etc/hosts 2>/dev/null || echo "::1         localhost" >> /etc/hosts
 }
 
 # 非交互静默安装（-i 参数）
@@ -2102,9 +1977,19 @@ auto_install() {
 
     green "开始无交互式安装 sing-box..."
     ensure_core_deps || { red "依赖安装失败"; exit 1; }
-    install_singbox
+    install_singbox || { red "安装失败，已中止"; exit 1; }
 
-    start_services_after_install || { red "不支持的 init 系统，安装中止。"; exit 1; }
+    if command_exists systemctl; then
+        main_systemd_services
+    elif command_exists rc-update; then
+        alpine_openrc_services
+        change_hosts
+        restart_singbox
+        rc-service argo restart
+    else
+        red "不支持的 init 系统，安装中止。"
+        exit 1
+    fi
 
     verify_udp_listening
     get_info || yellow "节点信息生成出现问题，请稍后到菜单「查看节点信息」重试"
@@ -2181,64 +2066,57 @@ change_config() {
             purple "0. 返回上一级菜单"
             skyblue "------------"
             reading "请输入选择: " choice
+            local inbounds_file="${conf_dir}/inbounds.json"
             case "${choice}" in
                 1)
-                    if require_protocol "vless"; then
-                        new_port=$(prompt_port "\n请输入vless-reality端口 (回车跳过将使用随机端口): " 10000 65000 "" 1)
-                        jq_write "$inbounds_file" --arg port "$new_port" \
-                           '(.inbounds[] | select(.type == "vless").listen_port) = ($port | tonumber)'
-                        reload_singbox
-                        allow_port $new_port/tcp > /dev/null 2>&1
-                        sed -i -E 's#(vless://[^@]*@(\[[0-9a-fA-F:]+\]|[^:]*)):[0-9]+#\1:'"$new_port"'#' $client_dir
-                        update_subscription
-                        print_client_urls
-                        green "\nvless-reality端口已修改成：${purple}$new_port${re}\n"
-                    fi
+                    new_port=$(prompt_port "\n请输入vless-reality端口 (回车跳过将使用随机端口): " 10000 65000 "" 1)
+                    jq_write "$inbounds_file" --arg port "$new_port" \
+                       '(.inbounds[] | select(.type == "vless").listen_port) = ($port | tonumber)'
+                    reload_singbox
+                    allow_port $new_port/tcp > /dev/null 2>&1
+                    sed -i -E 's#(vless://[^@]*@(\[[0-9a-fA-F:]+\]|[^:]*)):[0-9]+#\1:'"$new_port"'#' $client_dir
+                    update_subscription
+                    print_client_urls
+                    green "\nvless-reality端口已修改成：${purple}$new_port${re}\n"
                     ;;
                 2)
-                    if require_protocol "hysteria2"; then
-                        new_port=$(prompt_port "\n请输入hysteria2端口 (回车跳过将使用随机端口): " 10000 65000 "" 1)
-                        jq_write "$inbounds_file" --arg port "$new_port" \
-                           '(.inbounds[] | select(.type == "hysteria2").listen_port) = ($port | tonumber)'
-                        reload_singbox
-                        allow_port $new_port/udp > /dev/null 2>&1
-                        sed -i -E 's#(hysteria2://[^@]*@(\[[0-9a-fA-F:]+\]|[^:]*)):[0-9]+#\1:'"$new_port"'#' $client_dir
-                        update_subscription
-                        print_client_urls
-                        green "\nhysteria2端口已修改为：${purple}${new_port}${re}\n"
-                    fi
+                    new_port=$(prompt_port "\n请输入hysteria2端口 (回车跳过将使用随机端口): " 10000 65000 "" 1)
+                    jq_write "$inbounds_file" --arg port "$new_port" \
+                       '(.inbounds[] | select(.type == "hysteria2").listen_port) = ($port | tonumber)'
+                    reload_singbox
+                    allow_port $new_port/udp > /dev/null 2>&1
+                    sed -i -E 's#(hysteria2://[^@]*@(\[[0-9a-fA-F:]+\]|[^:]*)):[0-9]+#\1:'"$new_port"'#' $client_dir
+                    update_subscription
+                    print_client_urls
+                    green "\nhysteria2端口已修改为：${purple}${new_port}${re}\n"
                     ;;
                 3)
-                    if require_protocol "tuic"; then
-                        new_port=$(prompt_port "\n请输入tuic端口 (回车跳过将使用随机端口): " 10000 65000 "" 1)
-                        jq_write "$inbounds_file" --arg port "$new_port" \
-                           '(.inbounds[] | select(.type == "tuic").listen_port) = ($port | tonumber)'
-                        reload_singbox
-                        allow_port $new_port/udp > /dev/null 2>&1
-                        sed -i -E 's#(tuic://[^@]*@(\[[0-9a-fA-F:]+\]|[^:]*)):[0-9]+#\1:'"$new_port"'#' $client_dir
-                        update_subscription
-                        print_client_urls
-                        green "\ntuic端口已修改为：${purple}${new_port}${re}\n"
-                    fi
+                    new_port=$(prompt_port "\n请输入tuic端口 (回车跳过将使用随机端口): " 10000 65000 "" 1)
+                    jq_write "$inbounds_file" --arg port "$new_port" \
+                       '(.inbounds[] | select(.type == "tuic").listen_port) = ($port | tonumber)'
+                    reload_singbox
+                    allow_port $new_port/udp > /dev/null 2>&1
+                    sed -i -E 's#(tuic://[^@]*@(\[[0-9a-fA-F:]+\]|[^:]*)):[0-9]+#\1:'"$new_port"'#' $client_dir
+                    update_subscription
+                    print_client_urls
+                    green "\ntuic端口已修改为：${purple}${new_port}${re}\n"
                     ;;
                 4)
-                    if require_protocol "vmess"; then
-                        new_port=$(prompt_port "\n请输入vmess-argo端口 (回车跳过将使用随机端口): " 10000 65000 "" 1)
-                        jq_write "$inbounds_file" --arg port "$new_port" \
-                           '(.inbounds[] | select(.type == "vmess").listen_port) = ($port | tonumber)'
-                        allow_port $new_port/tcp > /dev/null 2>&1
-                        if command_exists rc-service; then
-                            grep -q "localhost:" /etc/init.d/argo && \
-                                sed -i 's/localhost:[0-9]\{1,\}/localhost:'"$new_port"'/' /etc/init.d/argo && \
-                                get_quick_tunnel && change_argo_domain
-                        else
-                            grep -q "localhost:" /etc/systemd/system/argo.service && \
-                                sed -i 's/localhost:[0-9]\{1,\}/localhost:'"$new_port"'/' /etc/systemd/system/argo.service && \
-                                get_quick_tunnel && change_argo_domain
-                        fi
-                        reload_singbox
-                        green "\nvmess-argo端口已修改为：${purple}${new_port}${re}\n"
+                    new_port=$(prompt_port "\n请输入vmess-argo端口 (回车跳过将使用随机端口): " 10000 65000 "" 1)
+                    jq_write "$inbounds_file" --arg port "$new_port" \
+                       '(.inbounds[] | select(.type == "vmess").listen_port) = ($port | tonumber)'
+                    allow_port $new_port/tcp > /dev/null 2>&1
+                    if command_exists rc-service; then
+                        grep -q "localhost:" /etc/init.d/argo && \
+                            sed -i 's/localhost:[0-9]\{1,\}/localhost:'"$new_port"'/' /etc/init.d/argo && \
+                            get_quick_tunnel && change_argo_domain
+                    else
+                        grep -q "localhost:" /etc/systemd/system/argo.service && \
+                            sed -i 's/localhost:[0-9]\{1,\}/localhost:'"$new_port"'/' /etc/systemd/system/argo.service && \
+                            get_quick_tunnel && change_argo_domain
                     fi
+                    reload_singbox
+                    green "\nvmess-argo端口已修改为：${purple}${new_port}${re}\n"
                     ;;
                 0) change_config ;;
                 *) red "无效的选项，请输入 1 到 4" ;;
@@ -2253,39 +2131,42 @@ change_config() {
             reload_singbox
             sed -i -E 's/(vless:\/\/|hysteria2:\/\/|anytls:\/\/)[^@]*(@.*)/\1'"$new_uuid"'\2/' $client_dir
             sed -i -E "s#tuic://[0-9a-f-]{36}:[0-9a-f-]{36}@#tuic://$new_uuid:$new_uuid@#g" $client_dir
-            isp=$(get_isp || echo "$(hostname)")
-            argodomain=$(grep -oE 'https://[[:alnum:]+\.-]+\.trycloudflare\.com' "${work_dir}/argo.log" | sed 's@https://@@')
-            VMESS="{ \"v\": \"2\", \"ps\": \"${isp}-VMess-Argo\", \"add\": \"${CFIP}\", \"port\": \"443\", \"id\": \"${new_uuid}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"\", \"allowInsecure\": \"false\"}"
-            encoded_vmess=$(echo "$VMESS" | base64 -w0)
-            sed -i -E '/vmess:\/\//{s@vmess://.*@vmess://'"$encoded_vmess"'@}' $client_dir
+            # 只替换现有 vmess 链接里的 id，保留优选域名/端口/host/sni 等已有设置
+            local old_vmess new_vmess_b64
+            old_vmess=$(grep -m1 '^vmess://' "$client_dir")
+            if [ -n "$old_vmess" ]; then
+                new_vmess_b64=$(printf '%s' "${old_vmess#vmess://}" | base64 -d 2>/dev/null | jq -c --arg id "$new_uuid" '.id = $id' | base64 -w0)
+                if [ -n "$new_vmess_b64" ]; then
+                    sed -i -E "s#^vmess://.*#vmess://${new_vmess_b64}#" "$client_dir"
+                else
+                    yellow "vmess 链接解析失败，未更新 vmess 节点的 UUID"
+                fi
+            fi
             update_subscription
             print_client_urls
             green "\nUUID已修改为：${purple}${new_uuid}${re}\n"
             ;;
         3)
-            if require_protocol "vless"; then
-                clear
-                green "\n1. www.joom.com\n\n2. www.stengg.com\n\n3. www.wedgehr.com\n\n4. www.cerebrium.ai\n\n5. www.nazhumi.com\n"
-                reading "\n请输入新的Reality伪装域名(可自定义输入,回车留空将使用默认1): " new_sni
-                case "$new_sni" in
-                    ""|"1") new_sni="www.joom.com" ;;
-                    "2") new_sni="www.stengg.com" ;;
-                    "3") new_sni="www.wedgehr.com" ;;
-                    "4") new_sni="www.cerebrium.ai" ;;
-                    "5") new_sni="www.nazhumi.com" ;;
-                esac
-                jq_write "${conf_dir}/inbounds.json" --arg sni "$new_sni" \
-                   '(.inbounds[] | select(.type == "vless") | .tls.server_name) = $sni |
-                    (.inbounds[] | select(.type == "vless") | .tls.reality.handshake.server) = $sni'
-                reload_singbox
-                sed -i "s/\(vless:\/\/[^\?]*\?\([^\&]*\&\)*sni=\)[^&]*/\1$new_sni/" $client_dir
-                update_subscription
-                print_client_urls
-                green "\nReality sni已修改为：${purple}${new_sni}${re}\n"
-            fi
+            clear
+            green "\n1. www.joom.com\n\n2. www.stengg.com\n\n3. www.wedgehr.com\n\n4. www.cerebrium.ai\n\n5. www.nazhumi.com\n"
+            reading "\n请输入新的Reality伪装域名(可自定义输入,回车留空将使用默认1): " new_sni
+            case "$new_sni" in
+                ""|"1") new_sni="www.joom.com" ;;
+                "2") new_sni="www.stengg.com" ;;
+                "3") new_sni="www.wedgehr.com" ;;
+                "4") new_sni="www.cerebrium.ai" ;;
+                "5") new_sni="www.nazhumi.com" ;;
+            esac
+            jq_write "${conf_dir}/inbounds.json" --arg sni "$new_sni" \
+               '(.inbounds[] | select(.type == "vless") | .tls.server_name) = $sni |
+                (.inbounds[] | select(.type == "vless") | .tls.reality.handshake.server) = $sni'
+            reload_singbox
+            sed -i "s/\(vless:\/\/[^\?]*\?\([^\&]*\&\)*sni=\)[^&]*/\1$new_sni/" $client_dir
+            update_subscription
+            print_client_urls
+            green "\nReality sni已修改为：${purple}${new_sni}${re}\n"
             ;;
         4)
-            if require_protocol "hysteria2"; then
             purple "端口跳跃需确保跳跃区间的端口没有被占用\n"
             reading "请输入跳跃起始端口 (回车跳过将使用随机端口): " min_port
             [ -z "$min_port" ] && min_port=$(shuf -i 50000-65000 -n 1)
@@ -2342,10 +2223,8 @@ IEOF
                 print_client_urls
             fi
             green "\nhysteria2端口跳跃已开启：${purple}$min_port-$max_port${re}\n"
-            fi
             ;;
         5)
-            if require_protocol "hysteria2"; then
             iptables -t nat -F PREROUTING > /dev/null 2>&1
             command_exists ip6tables && ip6tables -t nat -F PREROUTING > /dev/null 2>&1
             if command_exists rc-service 2>/dev/null; then
@@ -2359,9 +2238,8 @@ IEOF
             sed -i '/hysteria2/s/&mport=[^#&]*//g' /etc/sing-box/url.txt
             update_subscription
             green "\n端口跳跃已删除\n"
-            fi
             ;;
-        6) if require_protocol "vmess"; then change_cfip; fi ;;
+        6) change_cfip ;;
         7)  
             local new_ipv4
             [ -f "$client_dir" ] || {
@@ -2442,14 +2320,6 @@ manage_singbox() {
 
 # Argo 管理
 manage_argo() {
-    check_singbox &>/dev/null
-    if [ $? -eq 2 ]; then
-        yellow "sing-box 尚未安装！请先安装 sing-box。"; sleep 2; menu; return
-    fi
-    if ! require_protocol "vmess"; then
-        sleep 1; menu; return
-    fi
-
     local argo_status=$(check_argo 2>/dev/null)
     clear; echo ""
     green "=== Argo 隧道管理 ===\n"
@@ -2484,7 +2354,7 @@ manage_argo() {
             ;;
         4)
             clear
-            yellow "\n固定隧道可为json或token，固定隧道端口为8001, 使用token请在cloudflare里设置一致\njson获取地址：${purple}https://fscarmen.cloudflare.now.cc${re}\n"
+            yellow "\n固定隧道可为json或token，固定隧道端口为$(get_argo_port), 使用token请在cloudflare里设置一致\njson获取地址：${purple}https://fscarmen.cloudflare.now.cc${re}\n"
             reading "\n请输入你的argo域名: " argo_domain
             ArgoDomain=$argo_domain
             reading "\n请输入你的argo密钥(token或json): " argo_auth
@@ -2497,7 +2367,7 @@ protocol: http2
 
 ingress:
   - hostname: $ArgoDomain
-    service: http://localhost:8001
+    service: http://localhost:$(get_argo_port)
     originRequest:
       noTLSVerify: true
   - service: http_status:404
@@ -2635,56 +2505,44 @@ change_cfip() {
 }
 
 test_warp_connectivity() {
-    local route_file="${conf_dir}/route.json"
-    local test_port=10808
-    local had_socks=0
-    local route_bak="${route_file}.bak.warptest"
-    local inbounds_bak="${inbounds_file}.bak.warptest"
+    local sb_bin="${work_dir}/sing-box"
+    local test_port tmp_dir pid
 
     clear
     green "=== 测试 WARP 连通性 ===\n"
-    yellow "说明：服务器本机直接 curl 不会经过 sing-box，因此会临时："
-    yellow "  1. 添加 127.0.0.1:${test_port} 的 socks 入站"
-    yellow "  2. 把路由临时改为全局走 wireguard-out"
-    yellow "  3. 用 curl 通过 socks 测试出口"
-    yellow "  4. 测试结束后自动恢复原配置\n"
+    yellow "说明：服务器本机直接 curl 不会经过 sing-box，因此会："
+    yellow "  1. 另起一个独立的临时 sing-box 进程(仅监听 127.0.0.1)"
+    yellow "  2. 该进程全局走 wireguard-out，用 curl 通过它测试出口"
+    yellow "  3. 测试结束后自动清理；正在运行的 sing-box 与现有配置不受任何影响\n"
 
     if ! ensure_warp_endpoint; then
         red "WARP 密钥不可用，无法测试连通性\n"; sleep 2; return
     fi
+    [ -x "$sb_bin" ] || { red "sing-box 二进制不存在\n"; sleep 2; return; }
 
-    cp "$route_file" "$route_bak"
-    cp "$inbounds_file" "$inbounds_bak"
+    test_port=$(get_free_port 20000 40000)
+    tmp_dir=$(mktemp -d /tmp/singbox-warptest.XXXXXX) || { red "创建临时目录失败\n"; return; }
 
-    if jq -e --argjson p "$test_port" '.inbounds[] | select(.type=="socks" and .listen_port==$p)' "$inbounds_file" >/dev/null 2>&1; then
-        had_socks=1
+    cp "${conf_dir}/endpoints.json" "${tmp_dir}/endpoints.json"
+    if [ -f "${conf_dir}/dns.json" ]; then
+        cp "${conf_dir}/dns.json" "${tmp_dir}/dns.json"
     else
-        jq_write "$inbounds_file" --argjson p "$test_port" '.inbounds += [{
-            "type": "socks",
-            "tag": "socks-warptest",
-            "listen": "127.0.0.1",
-            "listen_port": $p
-        }]'
+        jq -n '{dns:{servers:[{tag:"sys",type:"local"}],strategy:"prefer_ipv4"}}' > "${tmp_dir}/dns.json"
+    fi
+    jq -n --argjson p "$test_port" '{inbounds:[{type:"socks",tag:"socks-warptest",listen:"127.0.0.1",listen_port:$p}]}' > "${tmp_dir}/inbounds.json"
+    jq -n '{outbounds:[{type:"direct",tag:"direct"}]}' > "${tmp_dir}/outbounds.json"
+    jq -n '{log:{level:"warn",output:"box.log"}}' > "${tmp_dir}/log.json"
+    jq -n '{route:{rules:[{action:"sniff"}],final:"wireguard-out",default_domain_resolver:{server:"sys",strategy:"prefer_ipv4"}}}' > "${tmp_dir}/route.json"
+
+    local check_output
+    if ! check_output=$("$sb_bin" check -C "$tmp_dir" 2>&1); then
+        red "临时测试配置校验失败：\n"; echo "$check_output"
+        rm -rf "$tmp_dir"; sleep 2; return
     fi
 
-    cat > "$route_file" << EOF
-{
-  "route": {
-    "rules": [
-      {"action": "sniff"},
-      {"outbound": "wireguard-out"}
-    ],
-    "final": "wireguard-out",
-    "default_domain_resolver": {
-      "server": "sys",
-      "strategy": "prefer_ipv4"
-    }
-  }
-}
-EOF
-
-    restart_singbox
-    sleep 2
+    (cd "$tmp_dir" && exec "$sb_bin" run -C "$tmp_dir" >/dev/null 2>&1) &
+    pid=$!
+    sleep 3
 
     green "正在通过 socks5://127.0.0.1:${test_port} 测试 WARP 出口...\n"
     local ip_result warp_result
@@ -2698,7 +2556,7 @@ EOF
         red "获取出口 IP 失败（超时或连接失败）"
     fi
     if [ -n "$warp_result" ]; then
-        echo "$warp_result" | while read line; do
+        echo "$warp_result" | while read -r line; do
             if echo "$line" | grep -q "warp=on"; then
                 green "$line"
             else
@@ -2712,15 +2570,15 @@ EOF
     else
         red "\n❌ WARP 未生效。请检查："
         yellow "  - 是否已重新生成独立 WARP 密钥"
-        yellow "  - /etc/sing-box/sb.log 中是否有 handshake 错误"
-        yellow "  - endpoints.json 中 peer 地址是否为 162.159.192.1"
+        yellow "  - 临时进程日志: ${tmp_dir}/box.log (本次退出前显示如下)"
+        tail -n 10 "${tmp_dir}/box.log" 2>/dev/null
+        yellow "  - endpoints.json 中 peer 地址/端口是否可达"
     fi
 
-    yellow "\n正在恢复原配置..."
-    mv "$route_bak" "$route_file"
-    mv "$inbounds_bak" "$inbounds_file"
-    restart_singbox
-    green "配置已恢复。\n"
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    rm -rf "$tmp_dir"
+    green "\n临时测试进程已清理，现有配置未改动。\n"
     read -n 1 -s -r -p $'\033[1;91m按任意键返回...\033[0m\n'
     warp_manage
 }
@@ -3013,7 +2871,7 @@ finalize_rule_add() {
         green "'${rule_tag}' 已分流至出站 '${selected_out}'"
     fi
     if [ "$selected_out" = "wireguard-out" ]; then
-        yellow "提示：请用客户端连接节点后访问对应网站验证；也可到「6. 测试 WARP 连通性」一键检测。"
+        yellow "提示：请用客户端连接节点后访问对应网站验证；也可到「7. 测试 WARP 连通性」一键检测。"
     fi
     sleep 2; warp_manage
 }
@@ -3122,10 +2980,14 @@ restore_direct_outbound() {
 delete_rule_menu() {
     clear
     green "当前已启用的分流规则集:"
-    jq -r '.route.rules[] | select(.rule_set != null) | .rule_set[]?' "$route_file" | grep -v '^telegram-ip$' | nl -w2 -s'. '
+    local rule_tags=() i
+    mapfile -t rule_tags < <(jq -r '[.route.rules[] | select(.rule_set != null) | .rule_set[]?] | map(select(. != "telegram-ip")) | .[]' "$route_file")
+    for i in "${!rule_tags[@]}"; do
+        printf '%2d. %s\n' "$((i+1))" "${rule_tags[$i]}"
+    done
     reading "\n输入要删除的规则名称或序号: " del_input
     if [[ "$del_input" =~ ^[0-9]+$ ]]; then
-        tag=$(jq -r --arg idx "$del_input" '[.route.rules[] | select(.rule_set != null) | .rule_set[]] | .[(($idx | tonumber) - 1)]' "$route_file")
+        tag="${rule_tags[$((del_input-1))]:-}"
     else
         tag="$del_input"
     fi
@@ -3412,52 +3274,7 @@ delete_socks5_proxy() {
     sleep 1
 }
 
-# 协议管理模块 - 增加/删除 socks5 / anytls / shadowsocks-2022 以及四合一主协议(vless-reality / vmess-argo / hysteria2 / tuic5)
-# ---- 入站增删公共函数 ----
-# 备份 inbounds.json 后执行 jq 写入，sing-box 校验不通过则自动回滚。参数同 jq_write(去掉文件名)
-inbounds_edit() {
-    local bak; bak=$(mktemp) || return 1
-    cp -f "$inbounds_file" "$bak"
-    jq_write "$inbounds_file" "$@"
-    inbounds_commit_or_rollback "$bak"
-}
-
-# 打印节点链接和二维码
-print_node_link() {
-    green "节点链接:\n${purple}${1}${re}\n"
-    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "$1"
-}
-
-# 添加协议后的公共收尾：保存链接 -> 刷新订阅 -> 重载 -> 打印结果
-# 用法: finish_add <显示名> <节点链接> [详情行...]
-finish_add() {
-    local name="$1" url_line="$2" line
-    shift 2
-    add_url_line "$url_line"
-    update_sub
-    reload_singbox
-    green "\n${name} 协议已添加！"
-    for line in "$@"; do green "$line"; done
-    print_node_link "$url_line"
-}
-
-# 通用删除入站
-# 用法: remove_inbound_core <显示名> <tag|type> <值> <链接前缀> <放行协议,如 "tcp udp"> [删除后钩子函数]
-remove_inbound_core() {
-    local name="$1" field="$2" value="$3" prefix="$4" protos="$5" hook="$6" port p
-    port=$(jq -r --arg v "$value" ".inbounds[]? | select(.${field} == \$v) | .listen_port" "$inbounds_file" 2>/dev/null | head -1)
-    inbounds_edit --arg v "$value" "del(.inbounds[] | select(.${field} == \$v))" || { sleep 2; return 1; }
-
-    [ -n "$hook" ] && "$hook"
-    remove_url_by_tag "$prefix"
-    update_sub
-    if [ -n "$port" ]; then
-        for p in $protos; do deny_port "${port}/${p}" >/dev/null 2>&1; done
-    fi
-    reload_singbox
-    green "\n${name} 协议已删除\n"
-}
-
+# 协议管理模块 - 增加/删除 socks5 / anytls / shadowsocks-2022
 # 检查指定 tag 是否已在 inbounds 中存在
 proto_exists() {
     local tag="$1"
@@ -3477,6 +3294,7 @@ update_sub() {
 
 # ---- Socks5 入站 ----
 add_socks5_inbound() {
+    local inbounds_file="${conf_dir}/inbounds.json"
     local tag="socks5-in"
 
     if proto_exists "$tag"; then
@@ -3516,7 +3334,7 @@ add_socks5_inbound() {
         fi
     fi
 
-    inbounds_edit --arg tag "$tag" \
+    jq_write "$inbounds_file" --arg tag "$tag" \
        --argjson port "$sk_port" \
        --arg user "$sk_user" \
        --arg pass "$sk_pass" \
@@ -3526,29 +3344,49 @@ add_socks5_inbound() {
            "listen": "::",
            "listen_port": $port,
            "users": [{"username": $user, "password": $pass}]
-       }]' || { sleep 2; return; }
+       }]'
 
     allow_port ${sk_port}/tcp ${sk_port}/udp > /dev/null 2>&1
 
-    local server_ip isp url_line
+    local server_ip
     server_ip=$(get_realip)
+    local isp
     isp=$(get_isp || echo "Socks5")
-    url_line="socks://$(printf '%s' "${sk_user}:${sk_pass}" | base64 -w0)@${server_ip}:${sk_port}#${isp}-Socks5"
 
-    finish_add "Socks5" "$url_line" \
-        "端口: ${purple}${sk_port}${re}" \
-        "用户名: ${purple}${sk_user}${re}  ${green}密码:${re} ${purple}${sk_pass}${re}"
+    local url_line="socks://$(printf '%s' "${sk_user}:${sk_pass}" | base64 -w0)@${server_ip}:${sk_port}#${isp}-Socks5"
+
+    echo "" >> "${client_dir}"
+    echo "${url_line}" >> "${client_dir}"
+    update_sub
+
+    reload_singbox
+
+    green "\nSocks5 协议已添加！"
+    green "端口: ${purple}${sk_port}${re}"
+    green "用户名: ${purple}${sk_user}${re}  ${green}密码:${re} ${purple}${sk_pass}${re}"
+    green "节点链接: ${purple}${url_line}${re}\n"
+    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "$url_line"
 }
 
 remove_socks5_inbound() {
-    if ! proto_exists "socks5-in"; then
+    local inbounds_file="${conf_dir}/inbounds.json"
+    local tag="socks5-in"
+
+    if ! proto_exists "$tag"; then
         yellow "Socks5 协议未添加，无需删除。"; sleep 1; return
     fi
-    remove_inbound_core "Socks5" tag "socks5-in" "socks" "tcp udp"
+
+    jq_write "$inbounds_file" --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))'
+
+    remove_url_by_tag "socks"
+    update_sub
+    reload_singbox
+    green "\nSocks5 协议已删除\n"
 }
 
 # ---- AnyTLS ----
 add_anytls() {
+    local inbounds_file="${conf_dir}/inbounds.json"
     local tag="anytls"
 
     if proto_exists "$tag"; then
@@ -3563,7 +3401,7 @@ add_anytls() {
 
     at_port=$(prompt_port "请输入 AnyTLS 监听端口 (回车随机生成): " 10000 65000 "Anytls监听端口" 0)
 
-    inbounds_edit --arg tag "$tag" \
+    jq_write "$inbounds_file" --arg tag "$tag" \
        --argjson port "$at_port" \
        --arg pass "$current_uuid" \
        --arg cert "${work_dir}/cert.pem" \
@@ -3579,29 +3417,49 @@ add_anytls() {
                "certificate_path": $cert,
                "key_path": $key
            }
-       }]' || { sleep 2; return; }
+       }]'
 
     allow_port ${at_port}/tcp > /dev/null 2>&1
 
-    local server_ip isp url_line
+    local server_ip
     server_ip=$(get_realip)
+    local isp
     isp=$(get_isp || echo "AnyTLS")
-    url_line="anytls://${current_uuid}@${server_ip}:${at_port}?insecure=1&sni=bing.com#${isp}-AnyTLS"
 
-    finish_add "AnyTLS" "$url_line" \
-        "密码(UUID): ${purple}${current_uuid}${re}" \
-        "端口: ${purple}${at_port}${re}"
+    local url_line="anytls://${current_uuid}@${server_ip}:${at_port}?insecure=1&sni=bing.com#${isp}-AnyTLS"
+
+    echo "" >> "${client_dir}"
+    echo "${url_line}" >> "${client_dir}"
+    update_sub
+
+    reload_singbox
+
+    green "\nAnyTLS 协议已添加！"
+    green "密码(UUID): ${purple}${current_uuid}${re}"
+    green "端口: ${purple}${at_port}${re}"
+    green "节点链接:\n${purple}${url_line}${re}\n"
+    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "$url_line"
 }
 
 remove_anytls() {
-    if ! proto_exists "anytls"; then
+    local inbounds_file="${conf_dir}/inbounds.json"
+    local tag="anytls"
+
+    if ! proto_exists "$tag"; then
         yellow "AnyTLS 协议未添加，无需删除。"; sleep 1; return
     fi
-    remove_inbound_core "AnyTLS" tag "anytls" "anytls" "tcp"
+
+    jq_write "$inbounds_file" --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))'
+
+    remove_url_by_tag "anytls"
+    update_sub
+    reload_singbox
+    green "\nAnyTLS 协议已删除\n"
 }
 
 # ---- Shadowsocks-2022 ----
 add_ss2022() {
+    local inbounds_file="${conf_dir}/inbounds.json"
     local tag="shadowsocks-2022"
 
     if proto_exists "$tag"; then
@@ -3626,7 +3484,7 @@ add_ss2022() {
     local ss_key
     ss_key=$(dd if=/dev/urandom bs=1 count=${key_len} 2>/dev/null | base64 -w0)
 
-    inbounds_edit --arg tag "$tag" \
+    jq_write "$inbounds_file" --arg tag "$tag" \
        --argjson port "$ss_port" \
        --arg method "$ss_method" \
        --arg key "$ss_key" \
@@ -3638,31 +3496,52 @@ add_ss2022() {
            "method": $method,
            "password": $key,
            "multiplex": {"enabled": true}
-       }]' || { sleep 2; return; }
+       }]'
 
     allow_port ${ss_port}/tcp ${ss_port}/udp > /dev/null 2>&1
 
-    local server_ip isp ss_userinfo url_line
+    local server_ip
     server_ip=$(get_realip)
+    local isp
     isp=$(get_isp || echo "SS2022")
-    ss_userinfo=$(printf '%s:%s' "${ss_method}" "${ss_key}" | base64 -w0)
-    url_line="ss://${ss_userinfo}@${server_ip}:${ss_port}#${isp}-SS2022"
 
-    finish_add "Shadowsocks-2022" "$url_line" \
-        "加密方式: ${purple}${ss_method}${re}" \
-        "密钥(base64): ${purple}${ss_key}${re}" \
-        "端口: ${purple}${ss_port}${re}"
+    local ss_userinfo
+    ss_userinfo=$(printf '%s:%s' "${ss_method}" "${ss_key}" | base64 -w0)
+    local url_line="ss://${ss_userinfo}@${server_ip}:${ss_port}#${isp}-SS2022"
+
+    echo "" >> "${client_dir}"
+    echo "${url_line}" >> "${client_dir}"
+    update_sub
+
+    reload_singbox
+
+    green "\nShadowsocks-2022 协议已添加！"
+    green "加密方式: ${purple}${ss_method}${re}"
+    green "密钥(base64): ${purple}${ss_key}${re}"
+    green "端口: ${purple}${ss_port}${re}"
+    green "节点链接:\n${purple}${url_line}${re}\n"
+    [ -x "${work_dir}/qrencode" ] && "${work_dir}/qrencode" "$url_line"
 }
 
 remove_ss2022() {
-    if ! proto_exists "shadowsocks-2022"; then
+    local inbounds_file="${conf_dir}/inbounds.json"
+    local tag="shadowsocks-2022"
+
+    if ! proto_exists "$tag"; then
         yellow "Shadowsocks-2022 协议未添加，无需删除。"; sleep 1; return
     fi
-    remove_inbound_core "Shadowsocks-2022" tag "shadowsocks-2022" "ss" "tcp udp"
+
+    jq_write "$inbounds_file" --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))'
+
+    remove_url_by_tag "ss"
+    update_sub
+    reload_singbox
+    green "\nShadowsocks-2022 协议已删除\n"
 }
 
 # 显示当前已启用的额外协议状态
 show_extra_proto_status() {
+    local inbounds_file="${conf_dir}/inbounds.json"
     echo ""
     green "--- 额外协议状态 ---"
 
@@ -3696,472 +3575,6 @@ show_extra_proto_status() {
     echo ""
 }
 
-# ==================== 四合一主协议 增加/删除 ====================
-# 说明：以 inbounds.json 为准判断某个主协议是否已安装，
-# 每次增删后同步 components.conf 和当前会话里的 INSTALL_* 变量。
-sync_components_conf() {
-    protocol_installed vless     && INSTALL_VLESS=1 || INSTALL_VLESS=0
-    protocol_installed vmess     && INSTALL_VMESS=1 || INSTALL_VMESS=0
-    protocol_installed hysteria2 && INSTALL_HY2=1   || INSTALL_HY2=0
-    protocol_installed tuic      && INSTALL_TUIC=1  || INSTALL_TUIC=0
-    cat > "${work_dir}/components.conf" << EOF
-INSTALL_VLESS=$INSTALL_VLESS
-INSTALL_VMESS=$INSTALL_VMESS
-INSTALL_HY2=$INSTALL_HY2
-INSTALL_TUIC=$INSTALL_TUIC
-EOF
-}
-
-# 已安装的主协议数量(vless/vmess/hysteria2/tuic)
-main_proto_count() {
-    local n=0 t
-    for t in vless vmess hysteria2 tuic; do
-        protocol_installed "$t" && n=$((n+1))
-    done
-    echo "$n"
-}
-
-# 读取某类主协议的监听端口
-main_proto_port() {
-    jq -r --arg t "$1" '[.inbounds[]? | select(.type == $t)][0].listen_port // empty' \
-        "${conf_dir}/inbounds.json" 2>/dev/null
-}
-
-# 显示单个主协议状态：已安装正常显示，未安装显示暗灰色
-_show_main_proto_line() {
-    local type="$1" label="$2" port_label="$3" port padded
-    padded=$(printf '%-17s' "$label")
-    if protocol_installed "$type"; then
-        port=$(main_proto_port "$type")
-        echo -e " ${padded} ${green}已安装${re} (${port_label}: ${skyblue}${port:-N/A}${re})"
-    else
-        gray " ${padded} 未安装"
-    fi
-}
-
-show_main_proto_status() {
-    echo ""
-    green "--- 四合一主协议状态 ---"
-    _show_main_proto_line vless     "VLESS-Reality:"  "端口"
-    _show_main_proto_line vmess     "VMess-WS(Argo):" "本地端口"
-    _show_main_proto_line hysteria2 "Hysteria2:"      "端口"
-    _show_main_proto_line tuic      "TUIC5:"          "端口"
-}
-
-# 主协议共用 UUID：优先沿用现有配置，没有则新生成
-get_or_new_uuid() {
-    local u
-    u=$(get_current_uuid | tr -d '\n\r')
-    [ -z "$u" ] && u=$(cat /proc/sys/kernel/random/uuid)
-    echo "$u"
-}
-
-# 端口是否已被 inbounds.json 中的其他入站使用
-port_in_config() {
-    jq -e --argjson p "$1" '.inbounds[]? | select(.listen_port == $p)' \
-        "${conf_dir}/inbounds.json" >/dev/null 2>&1
-}
-
-# 输入端口：要求系统未占用，且不与现有入站端口重复
-prompt_main_port() {
-    local prompt="$1" label="$2" p
-    while true; do
-        p=$(prompt_port "$prompt" 10000 65000 "$label" 1)
-        if port_in_config "$p"; then
-            red "端口 $p 已被其他协议使用，请重新输入" >&2
-            continue
-        fi
-        echo "$p"
-        return 0
-    done
-}
-
-# 校验 sing-box 配置；不通过则用备份回滚 inbounds.json
-# 用法: inbounds_commit_or_rollback <备份文件>
-inbounds_commit_or_rollback() {
-    local bak="$1" out
-    out=$(validate_singbox_config)
-    if [ $? -ne 0 ]; then
-        red "\n配置校验未通过，已回滚，未做任何修改：\n"
-        echo "$out"
-        cp -f "$bak" "${conf_dir}/inbounds.json"
-        rm -f "$bak"
-        return 1
-    fi
-    rm -f "$bak"
-    return 0
-}
-
-# 追加一条节点链接到 url.txt(保持 "链接 + 空行" 的格式)
-add_url_line() {
-    touch "$client_dir"
-    if [ -s "$client_dir" ] && [ -n "$(tail -n1 "$client_dir")" ]; then
-        echo "" >> "$client_dir"
-    fi
-    echo "$1" >> "$client_dir"
-    echo "" >> "$client_dir"
-}
-
-# 确保证书存在(Hysteria2/TUIC5 需要)。已有证书(含域名证书)则直接沿用
-ensure_tls_cert() {
-    if [ -s "${work_dir}/cert.pem" ] && [ -s "${work_dir}/private.key" ]; then
-        return 0
-    fi
-    command_exists openssl || { red "缺少 openssl，无法生成证书"; return 1; }
-    openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key" 2>/dev/null \
-        || { red "生成证书私钥失败"; return 1; }
-    openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com" 2>/dev/null \
-        || { red "生成自签证书失败"; return 1; }
-    chmod 600 "${work_dir}/private.key" 2>/dev/null || true
-    return 0
-}
-
-# 删除主协议前的统一检查：未安装 / 最后一个 / 用户确认
-confirm_remove_main() {
-    local type="$1" label="$2" ans
-    if ! protocol_installed "$type"; then
-        yellow "${label} 协议未安装，无需删除。"; sleep 1; return 1
-    fi
-    if [ "$(main_proto_count)" -le 1 ]; then
-        red "${label} 是当前唯一的主协议，不能删除(至少保留一个主协议)。"
-        yellow "如需全部移除，请使用主菜单「卸载sing-box」。"; sleep 2; return 1
-    fi
-    reading "确定要删除 ${label} 吗? (y/n): " ans
-    if [ "$ans" != "y" ] && [ "$ans" != "Y" ]; then
-        yellow "已取消。"; sleep 1; return 1
-    fi
-    return 0
-}
-
-# ---- VLESS-Reality ----
-add_vless_reality() {
-    if protocol_installed vless; then
-        yellow "VLESS-Reality 协议已存在，无需重复添加。"; sleep 1; return
-    fi
-
-    local uuid port output private_key public_key
-    uuid=$(get_or_new_uuid)
-    port=$(prompt_main_port "请输入 VLESS-Reality 监听端口 (回车随机生成): " "vless-reality监听端口")
-
-    output=$("${work_dir}/${server_name}" generate reality-keypair 2>/dev/null)
-    private_key=$(echo "$output" | awk '/PrivateKey:/ {print $2}')
-    public_key=$(echo "$output" | awk '/PublicKey:/ {print $2}')
-    if [ -z "$private_key" ] || [ -z "$public_key" ]; then
-        red "生成 reality 密钥对失败，请先执行 ${work_dir}/${server_name} version 检查内核能否正常运行"; sleep 2; return
-    fi
-
-    inbounds_edit --arg uuid "$uuid" --arg pk "$private_key" --argjson port "$port" \
-       '.inbounds += [{
-           "type": "vless", "tag": "vless-reality", "listen": "::", "listen_port": $port,
-           "users": [{"uuid": $uuid, "flow": "xtls-rprx-vision"}],
-           "tls": {
-               "enabled": true, "server_name": "www.iij.ad.jp",
-               "reality": {
-                   "enabled": true,
-                   "handshake": {"server": "www.iij.ad.jp", "server_port": 443},
-                   "private_key": $pk,
-                   "short_id": [""]
-               }
-           }
-       }]' || { sleep 2; return; }
-
-    allow_port ${port}/tcp > /dev/null 2>&1
-
-    local server_ip isp url_line
-    server_ip=$(get_realip)
-    isp=$(get_isp || echo "$(hostname)")
-    url_line="vless://${uuid}@${server_ip}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk=${public_key}&type=tcp&headerType=none#${isp}-Reality"
-
-    finish_add "VLESS-Reality" "$url_line" "端口: ${purple}${port}${re}"
-    sync_components_conf
-}
-
-remove_vless_reality() {
-    confirm_remove_main vless "VLESS-Reality" || return
-    remove_inbound_core "VLESS-Reality" type vless "vless" "tcp" && sync_components_conf
-}
-
-# ---- VMess-WS-TLS(Argo) ----
-# 下载 cloudflared 到 ${work_dir}/argo(已有可用二进制则跳过)
-install_cloudflared() {
-    local arch_raw cf_arch
-    if [ -s "${work_dir}/argo" ]; then
-        chmod +x "${work_dir}/argo" 2>/dev/null
-        return 0
-    fi
-    arch_raw=$(uname -m)
-    case "$arch_raw" in
-        x86_64|amd64)  cf_arch="amd64" ;;
-        x86|i686|i386) cf_arch="386" ;;
-        aarch64|arm64) cf_arch="arm64" ;;
-        armv7l)        cf_arch="arm" ;;
-        *)             cf_arch="" ;;
-    esac
-    if [ -z "$cf_arch" ]; then
-        red "架构 ${arch_raw} 官方 cloudflared 不提供预编译包，无法添加 VMess-Argo"; return 1
-    fi
-    yellow "正在下载 cloudflared..."
-    if ! gh_download "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" "${work_dir}/argo"; then
-        rm -f "${work_dir}/argo"
-        red "从 GitHub 下载 cloudflared 失败，请检查服务器是否能访问 github.com\n"
-        gh_ipv6_hint
-        return 1
-    fi
-    chmod +x "${work_dir}/argo"
-    return 0
-}
-
-# 写入 argo 服务(systemd / openrc)，参数为本地转发端口
-write_argo_service() {
-    local port="$1"
-    if command_exists systemctl; then
-        cat > /etc/systemd/system/argo.service << EOF
-[Unit]
-Description=Cloudflare Tunnel
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-Type=simple
-NoNewPrivileges=yes
-TimeoutStartSec=0
-ExecStart=/bin/sh -c "${work_dir}/argo tunnel --url http://localhost:${port} --no-autoupdate --edge-ip-version auto --protocol http2 > ${work_dir}/argo.log 2>&1"
-Restart=on-failure
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload
-        systemctl enable argo >/dev/null 2>&1
-    elif command_exists rc-update; then
-        cat > /etc/init.d/argo << EOF
-#!/sbin/openrc-run
-description="Cloudflare Tunnel"
-command="/bin/sh"
-command_args="-c '${work_dir}/argo tunnel --url http://localhost:${port} --no-autoupdate --edge-ip-version auto --protocol http2 > ${work_dir}/argo.log 2>&1'"
-command_background=true
-pidfile="/var/run/argo.pid"
-
-depend() {
-    need net
-    after firewall
-}
-EOF
-        chmod +x /etc/init.d/argo
-        rc-update add argo default >/dev/null 2>&1
-    else
-        return 1
-    fi
-    return 0
-}
-
-add_vmess_argo() {
-    if protocol_installed vmess; then
-        yellow "VMess-WS(Argo) 协议已存在，无需重复添加。"; sleep 1; return
-    fi
-    if ! command_exists systemctl && ! command_exists rc-update; then
-        red "不支持的 init 系统，无法创建 argo 服务。"; sleep 2; return
-    fi
-
-    install_cloudflared || { sleep 2; return; }
-
-    local uuid argo_port
-    uuid=$(get_or_new_uuid)
-    argo_port="${ARGO_PORT:-8001}"
-    if ! is_port_free "$argo_port" || port_in_config "$argo_port"; then
-        argo_port=$(get_free_port 10000 65000)
-        yellow "默认 Argo 本地端口 ${ARGO_PORT:-8001} 已被占用，改用: ${argo_port}"
-    fi
-
-    inbounds_edit --arg uuid "$uuid" --argjson port "$argo_port" \
-       '.inbounds += [{
-           "type": "vmess", "tag": "vmess-ws", "listen": "::", "listen_port": $port,
-           "users": [{"uuid": $uuid}],
-           "transport": {"type": "ws", "path": "/vmess-argo", "early_data_header_name": "Sec-WebSocket-Protocol"}
-       }]' || { rm -f "${work_dir}/argo"; sleep 2; return; }
-    reload_singbox
-
-    rm -f "${work_dir}/argo.log"
-    write_argo_service "$argo_port"
-    get_quick_tunnel      # 重启 argo 并把临时域名写入 ArgoDomain
-
-    local isp vmess_json url_line
-    isp=$(get_isp || echo "$(hostname)")
-    vmess_json="{ \"v\": \"2\", \"ps\": \"${isp}-VMess-Argo\", \"add\": \"${CFIP}\", \"port\": \"${CFPORT}\", \"id\": \"${uuid}\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${ArgoDomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${ArgoDomain}\", \"alpn\": \"\", \"fp\": \"firefox\", \"allowInsecure\": \"false\" }"
-    url_line="vmess://$(echo "$vmess_json" | base64 -w0)"
-
-    add_url_line "$url_line"
-    update_sub
-    sync_components_conf
-
-    green "\nVMess-WS(Argo) 协议已添加！"
-    green "Argo本地端口: ${purple}${argo_port}${re}"
-    if [ -z "$ArgoDomain" ]; then
-        yellow "暂未获取到 Argo 临时域名，请稍后到「4. Argo隧道管理」重新获取，节点链接会自动更新。"
-    else
-        green "ArgoDomain: ${purple}${ArgoDomain}${re}"
-    fi
-    print_node_link "$url_line"
-}
-
-# 停止并移除 argo 服务及相关文件(含固定隧道遗留的 tunnel.json/tunnel.yml)
-purge_argo_service() {
-    svc_purge argo
-    rm -f "${work_dir}/argo" "${work_dir}/argo.log" "${work_dir}/tunnel.json" "${work_dir}/tunnel.yml"
-}
-
-remove_vmess_argo() {
-    confirm_remove_main vmess "VMess-WS(Argo)" || return
-    remove_inbound_core "VMess-WS(Argo)" type vmess "vmess" "tcp" purge_argo_service && sync_components_conf
-}
-
-# ---- Hysteria2 ----
-add_hysteria2() {
-    if protocol_installed hysteria2; then
-        yellow "Hysteria2 协议已存在，无需重复添加。"; sleep 1; return
-    fi
-
-    local uuid port
-    uuid=$(get_or_new_uuid)
-    port=$(prompt_main_port "请输入 Hysteria2 监听端口 (回车随机生成): " "hysteria2监听端口")
-    ensure_tls_cert || { sleep 2; return; }
-
-    inbounds_edit --arg uuid "$uuid" --argjson port "$port" \
-       --arg cert "${work_dir}/cert.pem" --arg key "${work_dir}/private.key" \
-       '.inbounds += [{
-           "type": "hysteria2", "tag": "hysteria2", "listen": "::", "listen_port": $port,
-           "users": [{"password": $uuid}],
-           "ignore_client_bandwidth": false,
-           "masquerade": "https://bing.com",
-           "tls": {
-               "enabled": true, "alpn": ["h3"], "min_version": "1.3", "max_version": "1.3",
-               "certificate_path": $cert, "key_path": $key
-           }
-       }]' || { sleep 2; return; }
-
-    allow_port ${port}/udp > /dev/null 2>&1
-
-    local server_ip isp url_line domain fingerprint
-    server_ip=$(get_realip)
-    isp=$(get_isp || echo "$(hostname)")
-    if [ -s "${work_dir}/cert_domain.txt" ]; then
-        domain=$(cat "${work_dir}/cert_domain.txt")
-        url_line="hysteria2://${uuid}@${server_ip}:${port}/?sni=${domain}&insecure=0&alpn=h3&obfs=none#${isp}-Hysteria2"
-    else
-        fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
-        url_line="hysteria2://${uuid}@${server_ip}:${port}/?sni=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none#${isp}-Hysteria2"
-    fi
-
-    finish_add "Hysteria2" "$url_line" "端口: ${purple}${port}${re} (UDP)"
-    sync_components_conf
-}
-
-remove_hysteria2() {
-    confirm_remove_main hysteria2 "Hysteria2" || return
-    # cleanup_port_hop_nat 要从节点链接里读取跳跃端口区间，所以作为钩子在删除链接之前执行
-    remove_inbound_core "Hysteria2" type hysteria2 "hysteria2" "udp" cleanup_port_hop_nat && sync_components_conf
-}
-
-# ---- TUIC5 ----
-add_tuic() {
-    if protocol_installed tuic; then
-        yellow "TUIC5 协议已存在，无需重复添加。"; sleep 1; return
-    fi
-
-    local uuid port
-    uuid=$(get_or_new_uuid)
-    port=$(prompt_main_port "请输入 TUIC5 监听端口 (回车随机生成): " "tuic监听端口")
-    ensure_tls_cert || { sleep 2; return; }
-
-    inbounds_edit --arg uuid "$uuid" --argjson port "$port" \
-       --arg cert "${work_dir}/cert.pem" --arg key "${work_dir}/private.key" \
-       '.inbounds += [{
-           "type": "tuic", "tag": "tuic", "listen": "::", "listen_port": $port,
-           "users": [{"uuid": $uuid, "password": $uuid}],
-           "congestion_control": "bbr",
-           "tls": {"enabled": true, "alpn": ["h3"], "certificate_path": $cert, "key_path": $key}
-       }]' || { sleep 2; return; }
-
-    allow_port ${port}/udp > /dev/null 2>&1
-
-    local server_ip isp url_line domain
-    server_ip=$(get_realip)
-    isp=$(get_isp || echo "$(hostname)")
-    if [ -s "${work_dir}/cert_domain.txt" ]; then
-        domain=$(cat "${work_dir}/cert_domain.txt")
-        url_line="tuic://${uuid}:${uuid}@${server_ip}:${port}?sni=${domain}&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=0#${isp}-TUIC5"
-    else
-        url_line="tuic://${uuid}:${uuid}@${server_ip}:${port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${isp}-TUIC5"
-    fi
-
-    finish_add "TUIC5" "$url_line" "端口: ${purple}${port}${re} (UDP)"
-    sync_components_conf
-}
-
-remove_tuic() {
-    confirm_remove_main tuic "TUIC5" || return
-    remove_inbound_core "TUIC5" type tuic "tuic" "udp" && sync_components_conf
-}
-
-# 四合一主协议：添加子菜单(已安装的显示暗灰色)
-add_main_protocol_menu() {
-    clear; echo ""
-    green "=== 添加四合一主协议 ===\n"
-    local names=("VLESS-Reality" "VMess-WS(Argo)" "Hysteria2" "TUIC5")
-    local types=(vless vmess hysteria2 tuic)
-    local i
-    for i in 0 1 2 3; do
-        if protocol_installed "${types[$i]}"; then
-            gray "$((i+1)). ${names[$i]} (已安装)"
-        else
-            green "$((i+1)). ${names[$i]}"
-        fi
-    done
-    skyblue "-----------------------------"
-    purple "0. 返回上一级"
-    skyblue "-----------------------------"
-    reading "请输入选择: " main_add_choice
-    echo ""
-    case "${main_add_choice}" in
-        1) add_vless_reality ;;
-        2) add_vmess_argo ;;
-        3) add_hysteria2 ;;
-        4) add_tuic ;;
-        0) return ;;
-        *) red "无效的选项！" ;;
-    esac
-}
-
-# 四合一主协议：删除子菜单(未安装的显示暗灰色)
-remove_main_protocol_menu() {
-    clear; echo ""
-    green "=== 删除四合一主协议 ===\n"
-    local names=("VLESS-Reality" "VMess-WS(Argo)" "Hysteria2" "TUIC5")
-    local types=(vless vmess hysteria2 tuic)
-    local i
-    for i in 0 1 2 3; do
-        if protocol_installed "${types[$i]}"; then
-            red "$((i+1)). ${names[$i]}"
-        else
-            gray "$((i+1)). ${names[$i]} (未安装)"
-        fi
-    done
-    skyblue "-----------------------------"
-    purple "0. 返回上一级"
-    skyblue "-----------------------------"
-    reading "请输入选择: " main_del_choice
-    echo ""
-    case "${main_del_choice}" in
-        1) remove_vless_reality ;;
-        2) remove_vmess_argo ;;
-        3) remove_hysteria2 ;;
-        4) remove_tuic ;;
-        0) return ;;
-        *) red "无效的选项！" ;;
-    esac
-}
-
 # 协议管理主菜单
 manage_protocols() {
     check_singbox &>/dev/null
@@ -4171,39 +3584,31 @@ manage_protocols() {
 
     clear; echo ""
     green "=== 协议管理 (增加/删除) ===\n"
-    show_main_proto_status
-    echo ""
-    green "--- 四合一主协议 ---"
-    green "1. 添加四合一主协议"
-    red   "2. 删除四合一主协议"
-    skyblue "-----------------------------"
     show_extra_proto_status
 
     green "--- Socks5 协议 ---"
-    green "3. 添加 Socks5 协议"
-    red   "4. 删除 Socks5 协议"
+    green "1. 添加 Socks5 协议"
+    red   "2. 删除 Socks5 协议"
     skyblue "-----------------------------"
     green "--- AnyTLS 协议 ---"
-    green "5. 添加 AnyTLS 协议"
-    red   "6. 删除 AnyTLS 协议"
+    green "3. 添加 AnyTLS 协议"
+    red   "4. 删除 AnyTLS 协议"
     skyblue "-----------------------------"
     green "--- Shadowsocks-2022 协议 ---"
-    green "7. 添加 Shadowsocks-2022 协议"
-    red   "8. 删除 Shadowsocks-2022 协议"
+    green "5. 添加 Shadowsocks-2022 协议"
+    red   "6. 删除 Shadowsocks-2022 协议"
     skyblue "-----------------------------"
     purple "0. 返回主菜单"
     skyblue "-----------------------------"
     reading "请输入选择: " proto_choice
     echo ""
     case "${proto_choice}" in
-        1) add_main_protocol_menu ;;
-        2) remove_main_protocol_menu ;;
-        3) add_socks5_inbound ;;
-        4) remove_socks5_inbound ;;
-        5) add_anytls ;;
-        6) remove_anytls ;;
-        7) add_ss2022 ;;
-        8) remove_ss2022 ;;
+        1) add_socks5_inbound ;;
+        2) remove_socks5_inbound ;;
+        3) add_anytls ;;
+        4) remove_anytls ;;
+        5) add_ss2022 ;;
+        6) remove_ss2022 ;;
         0) menu; return ;;
         *) red "无效的选项！" ;;
     esac
@@ -4218,13 +3623,14 @@ install_acme() {
     # 无论 acme.sh 是否已安装，都确保 cron 在跑，否则自动续期不会触发
     if command_exists apt; then
         manage_packages install cron >/dev/null 2>&1
-        svc_enable_now cron
+        systemctl enable --now cron >/dev/null 2>&1
     elif command_exists dnf || command_exists yum; then
         manage_packages install cronie >/dev/null 2>&1
-        svc_enable_now crond
+        systemctl enable --now crond >/dev/null 2>&1
     elif command_exists apk; then
         manage_packages install dcron >/dev/null 2>&1
-        svc_enable_now dcron
+        rc-update add dcron default >/dev/null 2>&1
+        rc-service dcron start >/dev/null 2>&1
     fi
 
     if [ -f "${HOME}/.acme.sh/acme.sh" ]; then
@@ -4412,7 +3818,13 @@ apply_domain_cert() {
     fi
 
     local reload_cmd
-    reload_cmd=$(svc_restart_cmd sing-box)
+    if command_exists systemctl; then
+        reload_cmd="systemctl restart sing-box"
+    elif command_exists rc-service; then
+        reload_cmd="rc-service sing-box restart"
+    else
+        reload_cmd="true"
+    fi
 
     "$acme" --install-cert -d "$domain" --ecc \
         --key-file "${work_dir}/private.key" \
@@ -4491,9 +3903,6 @@ manage_cert() {
     check_singbox &>/dev/null
     if [ $? -eq 2 ]; then
         yellow "sing-box 尚未安装！请先安装 sing-box。"; sleep 2; menu; return
-    fi
-    if ! protocol_installed "hysteria2" && ! protocol_installed "tuic"; then
-        red "\n当前协议未安装\n"; sleep 1; menu; return
     fi
 
     clear; echo ""
@@ -4672,8 +4081,7 @@ update_singbox_core() {
 
     restart_singbox
     sleep 2
-    check_singbox &>/dev/null
-    if [ $? -ne 0 ]; then
+    if ! service_is_running "sing-box"; then
         red "\n新内核 ${new_ver} 配置校验通过，但服务实际启动失败，正在回滚到旧版本...\n"
         if [ -f "${work_dir}/sing-box.bak" ]; then
             mv "${work_dir}/sing-box.bak" "${work_dir}/sing-box" && chmod +x "${work_dir}/sing-box"
@@ -4814,7 +4222,7 @@ time_sync_status() {
     if command_exists chronyd || command_exists chronyc; then
         installed=1
         if command_exists systemctl; then
-            svc=$(chrony_svc_name)
+            systemctl list-unit-files 2>/dev/null | grep -q '^chronyd\.service' && svc="chronyd"
             systemctl is-active "$svc" &>/dev/null && running=1
         elif command_exists rc-service; then
             rc-service chronyd status &>/dev/null && running=1
@@ -4857,8 +4265,8 @@ remove_system_time_sync() {
     fi
 
     if command_exists systemctl; then
-        local svc
-        svc=$(chrony_svc_name)
+        local svc="chrony"
+        systemctl list-unit-files 2>/dev/null | grep -q '^chronyd\.service' && svc="chronyd"
         systemctl disable --now "$svc" &>/dev/null
     elif command_exists rc-service; then
         rc-service chronyd stop &>/dev/null
@@ -4949,8 +4357,8 @@ sync_system_time() {
             yellow "检测到 systemd-timesyncd 正在运行，为避免与 chrony 冲突，先将其停用...\n"
             systemctl disable --now systemd-timesyncd &>/dev/null
         fi
-        local svc
-        svc=$(chrony_svc_name)
+        local svc="chrony"
+        systemctl list-unit-files 2>/dev/null | grep -q '^chronyd\.service' && svc="chronyd"
         systemctl enable --now "$svc" &>/dev/null
         yellow "正在强制校准一次系统时间...\n"
         command_exists chronyc && chronyc -a makestep &>/dev/null
@@ -4976,72 +4384,6 @@ sync_system_time() {
     return 0
 }
 
-# 选择安装模式：默认四合一 或 自定义安装(自选1~4个节点)
-select_install_components() {
-    INSTALL_VLESS=1
-    INSTALL_VMESS=1
-    INSTALL_HY2=1
-    INSTALL_TUIC=1
-
-    clear; echo ""
-    green "请选择安装模式："
-    echo -e "  ${green}1.${re} 默认安装 ${skyblue}(四合一: VLESS-Reality + VMess-WS-TLS(Argo) + Hysteria2 + TUIC5)${re}"
-    echo -e "  ${green}2.${re} 自定义安装 ${skyblue}(自选1~4个节点)${re}"
-    reading "\n请输入选择 [1-2，直接回车默认1]: " install_mode_choice
-
-    [ "$install_mode_choice" != "2" ] && return 0
-
-    while true; do
-        clear; echo ""
-        green "自定义安装，请选择需要安装的节点(可多选)："
-        echo -e "  ${green}1.${re} VLESS-Reality"
-        echo -e "  ${green}2.${re} VMess-WS-TLS(Argo)"
-        echo -e "  ${green}3.${re} Hysteria2"
-        echo -e "  ${green}4.${re} TUIC5"
-        yellow "\n多个编号请用空格或逗号分隔，例如: 1 3 或 2,4"
-        reading "请输入选择(1-4): " comp_choice
-
-        if [ -z "$comp_choice" ]; then
-            yellow "输入不能为空，至少选择1个节点\n"; sleep 1.5; continue
-        fi
-
-        local normalized sel_vless=0 sel_vmess=0 sel_hy2=0 sel_tuic=0 invalid=0 c
-        normalized=$(echo "$comp_choice" | tr ',，' '  ')
-        for c in $normalized; do
-            case "$c" in
-                1) sel_vless=1 ;;
-                2) sel_vmess=1 ;;
-                3) sel_hy2=1 ;;
-                4) sel_tuic=1 ;;
-                *) invalid=1 ;;
-            esac
-        done
-
-        if [ "$invalid" -eq 1 ]; then
-            red "输入包含无效编号，请输入1-4之间的数字\n"; sleep 1.5; continue
-        fi
-        if [ "$sel_vless" -eq 0 ] && [ "$sel_vmess" -eq 0 ] && [ "$sel_hy2" -eq 0 ] && [ "$sel_tuic" -eq 0 ]; then
-            red "至少需要选择1个节点\n"; sleep 1.5; continue
-        fi
-
-        INSTALL_VLESS=$sel_vless
-        INSTALL_VMESS=$sel_vmess
-        INSTALL_HY2=$sel_hy2
-        INSTALL_TUIC=$sel_tuic
-
-        local names=""
-        [ "$INSTALL_VLESS" -eq 1 ] && names="${names}VLESS-Reality "
-        [ "$INSTALL_VMESS" -eq 1 ] && names="${names}VMess-WS(Argo) "
-        [ "$INSTALL_HY2" -eq 1 ]   && names="${names}Hysteria2 "
-        [ "$INSTALL_TUIC" -eq 1 ]  && names="${names}TUIC5 "
-        green "\n已选择安装: ${purple}${names}${re}"
-        reading "确认安装以上节点？[Y/n]: " confirm_sel
-        if [ -z "$confirm_sel" ] || [ "$confirm_sel" = "y" ] || [ "$confirm_sel" = "Y" ]; then
-            break
-        fi
-    done
-}
-
 do_install_singbox() {
     local singbox_check
     check_singbox &>/dev/null; singbox_check=$?
@@ -5050,10 +4392,18 @@ do_install_singbox() {
         return 0
     fi
 
-    select_install_components
     ensure_core_deps || { red "依赖安装失败"; return 1; }
-    install_singbox
-    start_services_after_install || { echo "Unsupported init system"; exit 1; }
+    install_singbox || { red "安装失败，已中止"; return 1; }
+    if command_exists systemctl; then
+        main_systemd_services
+    elif command_exists rc-update; then
+        alpine_openrc_services
+        change_hosts
+        restart_singbox
+        rc-service argo restart
+    else
+        echo "Unsupported init system"; exit 1
+    fi
     verify_udp_listening
     get_info
     create_shortcut
@@ -5212,21 +4562,22 @@ menu() {
     green "1. 安装sing-box"
     red   "2. 卸载sing-box"
     echo "==============="
-    green "3. sing-box管理"
-    green "4. Argo隧道管理"
+    green "3. sing-box服务管理"
+    green "4. sing-box内核更新"
     echo "==============="
     green "5. 查看节点信息"
     green "6. 修改节点配置"
-    green "7. WARP分流管理"
+    green "7. 增加/删除协议"
+    green "8. Argo隧道管理"
+    green "9. 域名证书管理"
     echo "==============="
-    green "8. 增加/删除协议"
-    green "9. 域名证书管理(hy2/tuic)"
-    green "10. 出站IPv4/IPv6优先级"
-    green "11. sing-box内核查看/更新"
-    green "12. 单栈VPS加装WARP全局出站"
-    green "13. 切换为 BBR+fq 拥塞控制"
-    green "14. 系统时间同步(校时/防卡顿)"
-    green "15. 调整虚拟内存(SWAP)"
+    green "10. WARP分流管理"
+    green "11. WARP全局出站"
+    green "12. 双栈出站优先"
+    echo "==============="
+    green "13. 切换为BBR+fq"
+    green "14. 系统时间同步"
+    green "15. 调整虚拟内存"
     echo "==============="
     purple "20. ssh综合工具箱"
     echo "==============="
@@ -5280,15 +4631,15 @@ case "$1" in
                 1)  do_install_singbox || continue ;;
                 2)  uninstall_singbox;  need_pause=false ;;
                 3)  manage_singbox;     need_pause=false ;;
-                4)  manage_argo;        need_pause=true ;;
+                4)  manage_singbox_core; need_pause=false ;;
                 5)  check_nodes;        need_pause=true ;;
                 6)  change_config;      need_pause=true ;;
-                7)  warp_manage;        need_pause=false ;;
-                8)  manage_protocols;   need_pause=false ;;
+                7)  manage_protocols;   need_pause=false ;;
+                8)  manage_argo;        need_pause=true ;;
                 9)  manage_cert;        need_pause=false ;;
-                10) manage_outbound_strategy; need_pause=false ;;
-                11) manage_singbox_core; need_pause=false ;;
-                12) system_warp_menu;   need_pause=false ;;
+                10) warp_manage;        need_pause=false ;;
+                11) system_warp_menu;   need_pause=false ;;
+                12) manage_outbound_strategy; need_pause=false ;;
                 13) enable_bbr_fq;       need_pause=true ;;
                 14) time_sync_menu;      need_pause=false ;;
                 15) swap_manage_menu;    need_pause=false ;;
