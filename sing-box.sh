@@ -1913,14 +1913,14 @@ uninstall_singbox() {
 
             # 系统级 WARP
             if [ -f "${sys_warp_dir}/$(sys_warp_iface 4).conf" ] || [ -f "${sys_warp_dir}/$(sys_warp_iface 6).conf" ]; then
-                reading "检测到「单栈VPS加装WARP全局出站」(菜单12)仍在使用，是否一并卸载？(y/n): " warp_choice
+                reading "检测到「单栈VPS加装WARP全局出站」(菜单11)仍在使用，是否一并卸载？(y/n): " warp_choice
                 case "${warp_choice}" in
                     y|Y)
                         sys_warp_remove 4 >/dev/null 2>&1
                         sys_warp_remove 6 >/dev/null 2>&1
                         green "系统级WARP出站已一并卸载\n"
                         ;;
-                    *) yellow "已保留系统级WARP出站，如需手动卸载可重新运行脚本进入菜单12\n" ;;
+                    *) yellow "已保留系统级WARP出站，如需手动卸载可重新运行脚本进入菜单11\n" ;;
                 esac
             fi
 
@@ -2871,7 +2871,7 @@ finalize_rule_add() {
         green "'${rule_tag}' 已分流至出站 '${selected_out}'"
     fi
     if [ "$selected_out" = "wireguard-out" ]; then
-        yellow "提示：请用客户端连接节点后访问对应网站验证；也可到「6. 测试 WARP 连通性」一键检测。"
+        yellow "提示：请用客户端连接节点后访问对应网站验证；也可到「7. 测试 WARP 连通性」一键检测。"
     fi
     sleep 2; warp_manage
 }
@@ -4562,18 +4562,19 @@ menu() {
     green "1. 安装sing-box"
     red   "2. 卸载sing-box"
     echo "==============="
-    green "3. sing-box管理"
-    green "4. Argo隧道管理"
+    green "3. sing-box服务管理"
+    green "4. sing-box内核更新"
     echo "==============="
     green "5. 查看节点信息"
     green "6. 修改节点配置"
-    green "7. WARP分流管理"
-    echo "==============="
-    green "8. 增加/删除协议"
+    green "7. 增加/删除协议"
+    green "8. Argo隧道管理"
     green "9. 域名证书管理"
-    green "10. 双栈出站优先"
-    green "11. sing-box内核更新"
-    green "12. WARP全局出站"
+    echo "==============="
+    green "10. WARP分流管理"
+    green "11. WARP全局出站"
+    green "12. 双栈出站优先"
+    echo "==============="
     green "13. 切换为BBR+fq"
     green "14. 系统时间同步"
     green "15. 调整虚拟内存"
@@ -4630,15 +4631,15 @@ case "$1" in
                 1)  do_install_singbox || continue ;;
                 2)  uninstall_singbox;  need_pause=false ;;
                 3)  manage_singbox;     need_pause=false ;;
-                4)  manage_argo;        need_pause=true ;;
+                4)  manage_singbox_core; need_pause=false ;;
                 5)  check_nodes;        need_pause=true ;;
                 6)  change_config;      need_pause=true ;;
-                7)  warp_manage;        need_pause=false ;;
-                8)  manage_protocols;   need_pause=false ;;
+                7)  manage_protocols;   need_pause=false ;;
+                8)  manage_argo;        need_pause=true ;;
                 9)  manage_cert;        need_pause=false ;;
-                10) manage_outbound_strategy; need_pause=false ;;
-                11) manage_singbox_core; need_pause=false ;;
-                12) system_warp_menu;   need_pause=false ;;
+                10) warp_manage;        need_pause=false ;;
+                11) system_warp_menu;   need_pause=false ;;
+                12) manage_outbound_strategy; need_pause=false ;;
                 13) enable_bbr_fq;       need_pause=true ;;
                 14) time_sync_menu;      need_pause=false ;;
                 15) swap_manage_menu;    need_pause=false ;;
