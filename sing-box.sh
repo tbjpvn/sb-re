@@ -2,7 +2,6 @@
 
 # =========================
 # 老王sing-box四合一安装脚本
-# vless-reality|vmess-ws-tls(Argo)|hysteria2|tuic5|[可额外添加Anytls，socks5，ss2022等协议]
 # =========================
 
 
@@ -132,8 +131,6 @@ check_service() {
 
     [[ ! -f "${service_file}" ]] && { red "not installed"; return 2; }
 
-    # 仅用于展示：已安装返回0（运行与否看输出文字）。
-    # 需要判断“是否真的在运行”请用 service_is_running。
     if service_is_running "${service_name}"; then
         green "running"
     else
@@ -142,7 +139,6 @@ check_service() {
     return 0
 }
 
-# 真实运行状态判断：运行中返回0，否则返回1（不依赖带颜色的输出文字）
 service_is_running() {
     local name=$1
     if command_exists rc-service && ! command_exists systemctl; then
@@ -499,7 +495,6 @@ get_isp() {
     return 0
 }
 
-# 统一的 iptables 规则持久化（Alpine / Debian / RHEL）
 persist_iptables() {
     if command_exists rc-service && ! command_exists systemctl; then
         mkdir -p /etc/iptables
@@ -549,7 +544,6 @@ allow_port() {
 
     [ "$has_firewalld" -eq 1 ] && firewall-cmd --reload >/dev/null 2>&1
 
-    # Debian/Ubuntu 上若尚未安装 netfilter-persistent，先装再保存
     if ! command_exists rc-service && ! command_exists netfilter-persistent && command_exists apt; then
         manage_packages install iptables-persistent || yellow "请手动安装netfilter-persistent或保存iptables规则"
     fi
@@ -557,7 +551,6 @@ allow_port() {
 }
 
 
-# 关闭/删除防火墙中指定端口规则（与 allow_port 对应）
 deny_port() {
     local has_ufw=0 has_firewalld=0 has_iptables=0 has_ip6tables=0
     local rule port proto
@@ -595,11 +588,9 @@ deny_port() {
 
     [ "$has_firewalld" -eq 1 ] && firewall-cmd --reload >/dev/null 2>&1 || true
 
-    # 持久化
     persist_iptables
 }
 
-# 从配置收集本脚本节点端口（格式: port/proto）
 collect_node_ports() {
     local inbounds_file="${conf_dir}/inbounds.json"
     local ports=() typ port
@@ -620,12 +611,10 @@ collect_node_ports() {
     fi
 }
 
-# 仅删除本脚本添加的 hy2 端口跳跃 DNAT（不清空整张 PREROUTING）
 cleanup_port_hop_nat() {
     local mport listen_port min_port max_port
     [ -f "$client_dir" ] || return 0
 
-    # 订阅里: mport=主端口,起始-结束
     mport=$(grep -oE 'mport=[0-9]+,[0-9]+-[0-9]+' "$client_dir" 2>/dev/null | head -1 | sed 's/mport=//')
     [ -n "$mport" ] || return 0
 
@@ -650,7 +639,6 @@ cleanup_port_hop_nat() {
     persist_iptables
 }
 
-# 回收申请证书时放行的80端口（仅在确认没有服务在用80时才关，避免误伤用户自己的网站）
 close_port80_if_unused() {
     [ -f "${work_dir}/cert_domain.txt" ] || [ -f "${work_dir}/port80-prehook.sh" ] || return 0
     if is_port_free 80; then
@@ -660,14 +648,12 @@ close_port80_if_unused() {
     fi
 }
 
-# 卸载前：只关本脚本节点端口 + 跳跃端口规则
 close_node_firewall_ports() {
     local port_list
     port_list=$(collect_node_ports)
     if [ -z "$port_list" ]; then
         return 0
     fi
-    # shellcheck disable=SC2086
     deny_port $port_list
     cleanup_port_hop_nat
     green "已关闭本脚本添加的端口防火墙规则\n"
@@ -1685,7 +1671,6 @@ EOF
     green "如需以订阅方式导入，可将该文件内容复制粘贴到客户端的订阅内容中。\n"
 }
 
-# 获取 vmess-argo 实际监听端口（以 inbounds.json 为准，退回环境变量默认值）
 get_argo_port() {
     local p
     p=$(jq -r '.inbounds[]? | select(.type=="vmess") | .listen_port // empty' "${conf_dir}/inbounds.json" 2>/dev/null | head -1)
@@ -1713,7 +1698,6 @@ manage_service() {
         red "缺少服务名或操作参数\n"; return 1
     fi
 
-    # 用返回码判断状态（旧版解析带颜色转义的输出，判断恒不成立）
     local svc_file="${work_dir}/${service_name}"
     [ "$service_name" = "sing-box" ] && svc_file="${work_dir}/${server_name}"
     local installed=1 running=0
@@ -1807,7 +1791,6 @@ reload_singbox() {
     manage_service "sing-box" "reload"
 }
 
-# 重启 sing-box 并确认确实起来了，起不来就重试/给出日志
 ensure_singbox_running() {
     local i
     for i in 1 2 3; do
@@ -1837,7 +1820,6 @@ stop_argo()      { manage_service "argo" "stop"; }
 restart_argo()   { manage_service "argo" "restart"; }
 
 # 卸载 sing-box（交互式）
-# 停止服务并删除单元文件
 stop_and_remove_services() {
     if command_exists rc-service; then
         rc-service sing-box stop >/dev/null 2>&1 || true
@@ -1858,24 +1840,18 @@ stop_and_remove_services() {
     fi
 }
 
-# 清理脚本产生的残留（目录、快捷方式、缓存、BBR 配置等）
 cleanup_singbox_residuals() {
-    # 工作目录（二进制、配置、证书、日志、tunnel、订阅等）
     rm -rf "${work_dir}" 2>/dev/null || true
 
-    # 快捷命令
     rm -f /usr/bin/sb 2>/dev/null || true
 
-    # IP 探测缓存
     rm -rf "${TMPDIR:-/tmp}/sb-ip-cache" 2>/dev/null || true
 
-    # 菜单 13 写入的 BBR+fq 持久配置
     if [ -f /etc/sysctl.d/99-bbr-fq.conf ]; then
         rm -f /etc/sysctl.d/99-bbr-fq.conf
         sysctl --system >/dev/null 2>&1 || true
     fi
 
-    # 端口跳跃时在 Alpine 上可能写入的自定义 iptables OpenRC 脚本（仅删除本脚本特征文件）
     if [ -f /etc/init.d/iptables ] && grep -q 'iptables-restore < /etc/iptables/rules.v4' /etc/init.d/iptables 2>/dev/null; then
         if command_exists rc-update; then
             rc-update del iptables default >/dev/null 2>&1 || true
@@ -1884,7 +1860,6 @@ cleanup_singbox_residuals() {
     fi
 }
 
-# 可选：清理本脚本申请的 acme.sh 域名证书
 cleanup_acme_if_needed() {
     local domain="$1"
     local acme="${HOME}/.acme.sh/acme.sh"
@@ -1900,18 +1875,15 @@ uninstall_singbox() {
         y|Y)
             yellow "正在卸载 sing-box"
 
-            # 卸载前先记下域名证书，便于后续清理 acme
             local cert_domain=""
             [ -f "${work_dir}/cert_domain.txt" ] && cert_domain=$(cat "${work_dir}/cert_domain.txt" 2>/dev/null)
 
-            # 先根据配置关闭防火墙端口（需在删除工作目录之前）
             close_node_firewall_ports
             close_port80_if_unused
 
             stop_and_remove_services
             cleanup_singbox_residuals
 
-            # 系统级 WARP
             if [ -f "${sys_warp_dir}/$(sys_warp_iface 4).conf" ] || [ -f "${sys_warp_dir}/$(sys_warp_iface 6).conf" ]; then
                 reading "检测到「单栈VPS加装WARP全局出站」(菜单11)仍在使用，是否一并卸载？(y/n): " warp_choice
                 case "${warp_choice}" in
@@ -1924,7 +1896,6 @@ uninstall_singbox() {
                 esac
             fi
 
-            # acme.sh 域名证书（若曾申请过）
             if [ -n "$cert_domain" ] && [ -f "${HOME}/.acme.sh/acme.sh" ]; then
                 reading "检测到曾用 acme.sh 申请过域名证书(${cert_domain})，是否一并删除该证书？(y/n): " acme_choice
                 case "${acme_choice}" in
@@ -1933,8 +1904,6 @@ uninstall_singbox() {
                         green "acme.sh 中 ${cert_domain} 证书已删除\n"
                         ;;
                     *)
-                        # 保留证书时必须摘掉指向 /etc/sing-box 的 pre/post hook，
-                        # 否则工作目录被删后续期会因找不到钩子脚本而失败
                         local dconf="${HOME}/.acme.sh/${cert_domain}_ecc/${cert_domain}.conf"
                         [ -f "$dconf" ] && sed -i "/^Le_PreHook=/d;/^Le_PostHook=/d;/^Le_ReloadCmd=/d" "$dconf" 2>/dev/null
                         yellow "已保留 acme.sh 证书，可手动执行: ~/.acme.sh/acme.sh --remove -d ${cert_domain} --ecc\n"
@@ -1962,7 +1931,6 @@ EOF
 # 适配alpine
 change_hosts() {
     sh -c 'echo "0 0" > /proc/sys/net/ipv4/ping_group_range' 2>/dev/null || true
-    # 只在缺失时补 localhost 记录，不再盲改 /etc/hosts 的前两行
     grep -qE '^127\.0\.0\.1[[:space:]]+localhost' /etc/hosts 2>/dev/null || echo "127.0.0.1   localhost" >> /etc/hosts
     grep -qE '^::1[[:space:]]+localhost' /etc/hosts 2>/dev/null || echo "::1         localhost" >> /etc/hosts
 }
@@ -1997,25 +1965,21 @@ auto_install() {
     green "\nsing-box 安装完成\n"
 }
 
-# 无交互静默卸载（-u 参数）
 auto_uninstall() {
     green "开始无交互式卸载sing-box..."
 
     local cert_domain=""
     [ -f "${work_dir}/cert_domain.txt" ] && cert_domain=$(cat "${work_dir}/cert_domain.txt" 2>/dev/null)
 
-    # 先关闭节点防火墙端口（需在删除工作目录之前）
     close_node_firewall_ports >/dev/null 2>&1 || true
     close_port80_if_unused >/dev/null 2>&1 || true
 
     stop_and_remove_services
     cleanup_singbox_residuals
 
-    # 静默清理系统级 WARP
     sys_warp_remove 4 >/dev/null 2>&1
     sys_warp_remove 6 >/dev/null 2>&1
 
-    # 静默清理本脚本申请的域名证书（不删整个 acme.sh）
     cleanup_acme_if_needed "$cert_domain"
 
     green "\nsing-box 已完全卸载!\n"
@@ -2131,7 +2095,6 @@ change_config() {
             reload_singbox
             sed -i -E 's/(vless:\/\/|hysteria2:\/\/|anytls:\/\/)[^@]*(@.*)/\1'"$new_uuid"'\2/' $client_dir
             sed -i -E "s#tuic://[0-9a-f-]{36}:[0-9a-f-]{36}@#tuic://$new_uuid:$new_uuid@#g" $client_dir
-            # 只替换现有 vmess 链接里的 id，保留优选域名/端口/host/sni 等已有设置
             local old_vmess new_vmess_b64
             old_vmess=$(grep -m1 '^vmess://' "$client_dir")
             if [ -n "$old_vmess" ]; then
@@ -2200,8 +2163,6 @@ IEOF
                 command_exists ip6tables && service ip6tables save > /dev/null 2>&1
                 systemctl enable ip6tables > /dev/null 2>&1 && systemctl start ip6tables > /dev/null 2>&1
             fi
-            # 不重建整条链接，只在原有 hysteria2 行上追加/替换 mport，
-            # 这样 sni、证书、insecure、IPv6 中括号等原有参数都不会丢
             local hy2_line new_hy2 tmp_url
             hy2_line=$(grep -m1 '^hysteria2://' "$client_dir")
             if [ -z "$hy2_line" ]; then
@@ -2770,8 +2731,6 @@ finalize_rule_add() {
         yellow "规则集 '${rule_tag}' 已启用。"; sleep 1; warp_manage; return
     fi
 
-    # 防止生成"引用存在但定义缺失"的悬空规则(sing-box会因此启动失败)：
-    # 添加引用前先确认 rule_set 定义存在，缺失则尝试从内置定义自动补回。
     if ! jq -e --arg tag "$rule_tag" '.route.rule_set[]? | select(.tag == $tag)' "$route_file" > /dev/null 2>&1; then
         local builtin_defs matched_count
         builtin_defs=$(default_route_rule_sets_json 2>/dev/null)
@@ -2902,8 +2861,6 @@ set_global_outbound() {
     fi
     local selected_out="${proxy_tags[$((out_choice-1))]}"
 
-    # 保留 direct 出站与 route.json（含分流规则、default_domain_resolver），
-    # 仅把兜底出站 final 指向所选代理；校验失败自动回滚。
     if [ ! -s "$route_file" ] || \
        ! jq -e '.route.default_domain_resolver' "$route_file" >/dev/null 2>&1; then
         repair_default_route || { red "生成默认路由配置失败"; sleep 2; warp_manage; return; }
@@ -2934,7 +2891,6 @@ set_global_outbound() {
     sleep 2; warp_manage
 }
 
-# 重写默认 route.json（补回 direct、DNS 兜底、default_domain_resolver）
 repair_default_route() {
     local cur_dns_strategy
     cur_dns_strategy=$(jq -r '.dns.strategy // "prefer_ipv4"' "${conf_dir}/dns.json" 2>/dev/null)
@@ -2959,8 +2915,6 @@ repair_default_route() {
     write_default_route_json "$cur_resolver_tag" "$cur_dns_strategy"
 }
 
-# 恢复服务器原IP出站：route.json 正常时只把 final 改回 direct（保留分流规则）；
-# route.json 缺失/损坏时重写默认配置
 restore_direct_outbound() {
     yellow "\n正在恢复服务器原IP出站...\n"
 
@@ -3266,7 +3220,6 @@ delete_socks5_proxy() {
 
     jq_write "$outbound_file" --arg tag "$tag" 'del(.outbounds[] | select(.tag == $tag))'
     jq_write "$route_file" --arg tag "$tag" '.route.rules = [.route.rules[] | select(.outbound != $tag)]'
-    # 若被删除的出站正是全局代理(final)，把 final 改回 direct，避免悬空引用导致校验失败
     jq_write "$route_file" --arg tag "$tag" 'if .route.final == $tag then .route.final = "direct" else . end'
 
     reload_singbox
@@ -3620,7 +3573,6 @@ install_acme() {
     local acme_email="$1"
     [ -z "$acme_email" ] && acme_email="admin@gmail.com"
 
-    # 无论 acme.sh 是否已安装，都确保 cron 在跑，否则自动续期不会触发
     if command_exists apt; then
         manage_packages install cron >/dev/null 2>&1
         systemctl enable --now cron >/dev/null 2>&1
@@ -3705,7 +3657,6 @@ for svc in nginx apache2 httpd caddy reality-80; do
         rc-service "$svc" stop >/dev/null 2>&1
     fi
 done
-# 强杀占用80端口的残留进程，但绝不杀 sing-box 自己
 port80_pids() {
     if command -v fuser >/dev/null 2>&1; then
         fuser 80/tcp 2>/dev/null
@@ -3797,13 +3748,10 @@ apply_domain_cert() {
 
     yellow "\n正在申请证书，请稍候...\n"
     local issue_log
-    # 只有域名仅有 AAAA 记录时才让 acme.sh 监听 IPv6，
-    # 纯 IPv4 机器上强行 --listen-v6 会导致绑定失败
     local listen_opts=""
     if [ -z "$resolved_ip4" ] && [ -n "$resolved_ip6" ]; then
         listen_opts="--listen-v6"
     fi
-    # shellcheck disable=SC2086
     issue_log=$("$acme" --issue -d "$domain" --standalone $listen_opts -k ec-256 --force \
         --pre-hook "${work_dir}/port80-prehook.sh" \
         --post-hook "${work_dir}/port80-posthook.sh" 2>&1)
@@ -3811,7 +3759,6 @@ apply_domain_cert() {
     echo "$issue_log" | tail -20
 
     if [ "$issue_result" -ne 0 ]; then
-        # acme.sh 失败时不一定会执行 post-hook，这里手动兜底，避免 nginx/caddy 被停掉后不再拉起
         [ -f "${work_dir}/.port80_state" ] && bash "${work_dir}/port80-posthook.sh" >/dev/null 2>&1
         red "\n证书申请失败！以上是acme.sh的详细输出，请检查域名解析是否生效、80端口是否仍被占用。\n"
         sleep 2; return
@@ -3839,8 +3786,6 @@ apply_domain_cert() {
     chmod 600 "${work_dir}/private.key"
     echo "$domain" > "${work_dir}/cert_domain.txt"
 
-    # acme.sh 的 reloadcmd 可能已经重启过一次，这里稍等再统一重启并确认状态，
-    # 避免两次重启相互抢端口导致 sing-box 停在未运行状态
     sleep 2
     ensure_singbox_running || { sleep 2; return; }
 
@@ -4209,14 +4154,10 @@ EOF
     fi
 }
 
-# 通过HTTPS响应头的Date字段获取网络时间，与本机时间比较得出偏差秒数
-# 不依赖是否已安装chrony/ntp等工具，成功回显偏差(整数，正数=本机偏快)，失败返回非0
-# 将 HTTP Date 头解析为 unix 时间戳（兼容 GNU date / BusyBox date / python3）
 http_date_to_epoch() {
     local s="$1" epoch
     [ -z "$s" ] && return 1
     epoch=$(date -d "$s" +%s 2>/dev/null) && { echo "$epoch"; return 0; }
-    # BusyBox: 用 -D 指定输入格式（HTTP Date 多为 GMT）
     epoch=$(date -D '%a, %d %b %Y %H:%M:%S GMT' -d "$s" +%s 2>/dev/null) && { echo "$epoch"; return 0; }
     epoch=$(date -D '%a, %d %b %Y %H:%M:%S %Z' -d "$s" +%s 2>/dev/null) && { echo "$epoch"; return 0; }
     if command -v python3 >/dev/null 2>&1; then
@@ -4238,7 +4179,6 @@ get_time_offset() {
     return 0
 }
 
-# 展示校时服务安装状态、本机时间，并给出偏差诊断
 time_sync_status() {
     local installed=0 running=0 svc="chrony" offset abs_offset
 
@@ -4278,7 +4218,6 @@ time_sync_status() {
     return 0
 }
 
-# 卸载时间同步服务(chrony)，若系统原生带systemd-timesyncd则恢复它作为基础兜底
 remove_system_time_sync() {
     clear; echo ""
     purple "=== 卸载时间同步服务 ===\n"
@@ -4307,7 +4246,6 @@ remove_system_time_sync() {
     return 0
 }
 
-# 仅执行一次性时间校准，不安装任何软件包(基于HTTPS响应头Date字段，用date -s直接改系统时间)
 quick_time_sync() {
     clear; echo ""
     purple "=== 仅校准一次(不安装chrony) ===\n"
@@ -4437,11 +4375,9 @@ do_install_singbox() {
     return 0
 }
 
-# ===== 虚拟内存(SWAP)管理 =====
 swap_file="/swapfile"
 
 get_swap_size_mb() {
-    # 返回当前 swap_file 对应的 swap 大小(MB)，未启用返回0
     if swapon --show=NAME 2>/dev/null | grep -qx "$swap_file"; then
         local kb
         kb=$(awk -v f="$swap_file" '$1==f{print $3}' /proc/swaps 2>/dev/null)
@@ -4465,8 +4401,6 @@ check_swap_status() {
     fi
 }
 
-# 系统当前所有已启用的swap汇总(不限于本脚本创建的swap_file，
-# 面板/系统自带方式创建的swap也会统计在内，避免误判为"未启用")
 system_swap_summary() {
     local total_kb
     total_kb=$(awk 'NR>1{sum+=$3} END{print sum+0}' /proc/swaps 2>/dev/null)
@@ -4478,7 +4412,6 @@ system_swap_summary() {
 }
 
 create_swap() {
-    # $1 = 大小(MB)
     local size_mb="$1"
     if ! [[ "$size_mb" =~ ^[0-9]+$ ]] || [ "$size_mb" -le 0 ]; then
         red "无效的大小，请输入正整数(单位M)\n"
