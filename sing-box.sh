@@ -3846,6 +3846,45 @@ restore_selfsigned_cert() {
     green "\n已恢复为bing.com自签证书\n"
 }
 
+# 显示当前证书是否在有效期内及有效期时间
+show_cert_validity() {
+    local cert="${work_dir}/cert.pem"
+    if [ ! -s "$cert" ] || ! command_exists openssl; then
+        yellow "证书有效期: 无法读取证书文件"
+        return 1
+    fi
+
+    local not_before not_after start_epoch end_epoch now_epoch days_left
+    not_before=$(openssl x509 -noout -startdate -in "$cert" 2>/dev/null | cut -d= -f2)
+    not_after=$(openssl x509 -noout -enddate -in "$cert" 2>/dev/null | cut -d= -f2)
+    if [ -z "$not_after" ]; then
+        yellow "证书有效期: 解析失败"
+        return 1
+    fi
+
+    local fmt_start="$not_before" fmt_end="$not_after"
+    start_epoch=$(date -d "$not_before" +%s 2>/dev/null)
+    end_epoch=$(date -d "$not_after" +%s 2>/dev/null)
+    [ -n "$start_epoch" ] && fmt_start=$(date -d "@${start_epoch}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$not_before")
+    [ -n "$end_epoch" ] && fmt_end=$(date -d "@${end_epoch}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$not_after")
+
+    if ! openssl x509 -noout -checkend 0 -in "$cert" >/dev/null 2>&1; then
+        red "证书有效性: 已过期"
+    elif [ -n "$end_epoch" ]; then
+        now_epoch=$(date +%s)
+        days_left=$(( (end_epoch - now_epoch) / 86400 ))
+        if [ "$days_left" -le 7 ]; then
+            yellow "证书有效性: 有效期内 (仅剩 ${days_left} 天，即将到期)"
+        else
+            green "证书有效性: 有效期内 (剩余 ${days_left} 天)"
+        fi
+    else
+        green "证书有效性: 有效期内"
+    fi
+    echo -e "${skyblue}有效期: ${fmt_start} ~ ${fmt_end}${re}"
+    return 0
+}
+
 manage_cert() {
     check_singbox &>/dev/null
     if [ $? -eq 2 ]; then
@@ -3859,6 +3898,7 @@ manage_cert() {
     else
         yellow "当前证书状态: bing.com 自签证书"
     fi
+    show_cert_validity
     echo ""
     green "1. 申请/更换域名证书"
     red   "2. 恢复自签证书"
