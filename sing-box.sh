@@ -3039,7 +3039,7 @@ add_socks5_proxy() {
     reading "请输入代理URL (支持socks://,socks5://,http://,ss://(ss2022) 支持v2rayN导出的节点链接): " proxy_url
     [ -z "$proxy_url" ] && { red "输入为空！"; sleep 1; return; }
 
-    proto=$(echo "$proxy_url" | grep -oP '^[a-zA-Z0-9]+(?=://)')
+    proto="${proxy_url%%://*}"
     [[ ! "$proto" =~ ^(socks5|socks|http|ss|ss2022|shadowsocks)$ ]] && { red "不支持的协议"; sleep 2; return; }
     case "$proto" in
         socks|socks5)           outbound_type="socks" ;;
@@ -4201,6 +4201,20 @@ EOF
 
 # 通过HTTPS响应头的Date字段获取网络时间，与本机时间比较得出偏差秒数
 # 不依赖是否已安装chrony/ntp等工具，成功回显偏差(整数，正数=本机偏快)，失败返回非0
+# 将 HTTP Date 头解析为 unix 时间戳（兼容 GNU date / BusyBox date / python3）
+http_date_to_epoch() {
+    local s="$1" epoch
+    [ -z "$s" ] && return 1
+    epoch=$(date -d "$s" +%s 2>/dev/null) && { echo "$epoch"; return 0; }
+    # BusyBox: 用 -D 指定输入格式（HTTP Date 多为 GMT）
+    epoch=$(date -D '%a, %d %b %Y %H:%M:%S GMT' -d "$s" +%s 2>/dev/null) && { echo "$epoch"; return 0; }
+    epoch=$(date -D '%a, %d %b %Y %H:%M:%S %Z' -d "$s" +%s 2>/dev/null) && { echo "$epoch"; return 0; }
+    if command -v python3 >/dev/null 2>&1; then
+        epoch=$(HTTP_DATE="$s" python3 -c 'import os; from email.utils import parsedate_to_datetime; print(int(parsedate_to_datetime(os.environ["HTTP_DATE"]).timestamp()))' 2>/dev/null) && { echo "$epoch"; return 0; }
+    fi
+    return 1
+}
+
 get_time_offset() {
     local url remote_str remote_epoch local_epoch
     for url in "https://www.cloudflare.com" "https://www.qq.com" "https://www.baidu.com"; do
@@ -4208,8 +4222,7 @@ get_time_offset() {
         [ -n "$remote_str" ] && break
     done
     [ -z "$remote_str" ] && return 1
-    remote_epoch=$(date -d "$remote_str" +%s 2>/dev/null)
-    [ -z "$remote_epoch" ] && return 1
+    remote_epoch=$(http_date_to_epoch "$remote_str") || return 1
     local_epoch=$(date +%s)
     echo $((local_epoch - remote_epoch))
     return 0
@@ -4301,10 +4314,14 @@ quick_time_sync() {
         return 1
     fi
 
-    if date -s "$remote_str" &>/dev/null; then
+    local remote_epoch
+    remote_epoch=$(http_date_to_epoch "$remote_str")
+    if [ -n "$remote_epoch" ] && date -s @"$remote_epoch" &>/dev/null; then
+        green "已根据网络时间校准系统时间\n"
+    elif date -s "$remote_str" &>/dev/null; then
         green "已根据网络时间校准系统时间\n"
     else
-        red "校准失败，请确认当前是root权限，或系统date命令是否支持 -s 参数\n"
+        red "校准失败，请确认当前是root权限；Alpine/BusyBox 可尝试安装: apk add coreutils，或改用菜单「2. 安装并立即同步时间」\n"
         return 1
     fi
 
@@ -4559,30 +4576,30 @@ menu() {
     purple "singbox 状态: ${singbox_status}"
     purple "拥塞控制算法: ${congestion_status}"
     purple "-双栈IP 状态: ${dualstack_status}\n"
-    green " 1. 安装sing-box"
-    red   " 2. 卸载sing-box"
-    echo "================"
-    green " 3. sing-box管理"
-    green " 4. sing-box更新"
-    echo "================"
-    green " 5. 查看节点信息"
-    green " 6. 修改节点配置"
-    green " 7. 增加删除协议"
-    green " 8. Argo隧道管理"
-    green " 9. 域名证书管理"
-    echo "================"
+    green "1. 安装sing-box"
+    red   "2. 卸载sing-box"
+    echo "==============="
+    green "3. sing-box服务管理"
+    green "4. sing-box内核更新"
+    echo "==============="
+    green "5. 查看节点信息"
+    green "6. 修改节点配置"
+    green "7. 增加/删除协议"
+    green "8. Argo隧道管理"
+    green "9. 域名证书管理"
+    echo "==============="
     green "10. WARP分流管理"
     green "11. WARP全局出站"
     green "12. 双栈出站优先"
-    echo "================"
+    echo "==============="
     green "13. 切换为BBR+fq"
     green "14. 系统时间同步"
     green "15. 调整虚拟内存"
-    echo "================"
+    echo "==============="
     purple "20. ssh综合工具箱"
-    echo "================"
-    red " 0. 退出脚本"
-    echo "============"
+    echo "==============="
+    red "0. 退出脚本"
+    echo "==========="
 }
 
 # 捕获 Ctrl+C
