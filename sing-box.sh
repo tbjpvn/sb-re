@@ -2,6 +2,7 @@
 
 # =========================
 # 老王sing-box四合一安装脚本
+# vless-reality|vmess-ws-tls(Argo)|hysteria2|tuic5|[可额外添加Anytls，socks5，ss2022等协议]
 # =========================
 
 
@@ -1843,6 +1844,7 @@ stop_and_remove_services() {
 cleanup_singbox_residuals() {
     rm -rf "${work_dir}" 2>/dev/null || true
 
+    # 快捷命令
     rm -f /usr/bin/sb 2>/dev/null || true
 
     rm -rf "${TMPDIR:-/tmp}/sb-ip-cache" 2>/dev/null || true
@@ -1965,6 +1967,7 @@ auto_install() {
     green "\nsing-box 安装完成\n"
 }
 
+# 无交互静默卸载（-u 参数）
 auto_uninstall() {
     green "开始无交互式卸载sing-box..."
 
@@ -2915,6 +2918,8 @@ repair_default_route() {
     write_default_route_json "$cur_resolver_tag" "$cur_dns_strategy"
 }
 
+# 恢复服务器原IP出站：route.json 正常时只把 final 改回 direct（保留分流规则）；
+# route.json 缺失/损坏时重写默认配置
 restore_direct_outbound() {
     yellow "\n正在恢复服务器原IP出站...\n"
 
