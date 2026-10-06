@@ -1887,15 +1887,9 @@ uninstall_singbox() {
             cleanup_singbox_residuals
 
             if [ -f "${sys_warp_dir}/$(sys_warp_iface 4).conf" ] || [ -f "${sys_warp_dir}/$(sys_warp_iface 6).conf" ]; then
-                reading "检测到「单栈VPS加装WARP全局出站」(菜单11)仍在使用，是否一并卸载？(y/n): " warp_choice
-                case "${warp_choice}" in
-                    y|Y)
-                        sys_warp_remove 4 >/dev/null 2>&1
-                        sys_warp_remove 6 >/dev/null 2>&1
-                        green "系统级WARP出站已一并卸载\n"
-                        ;;
-                    *) yellow "已保留系统级WARP出站，如需手动卸载可重新运行脚本进入菜单11\n" ;;
-                esac
+                sys_warp_remove 4 >/dev/null 2>&1
+                sys_warp_remove 6 >/dev/null 2>&1
+                green "系统级WARP出站已一并卸载\n"
             fi
 
             if [ -n "$cert_domain" ] && [ -f "${HOME}/.acme.sh/acme.sh" ]; then
