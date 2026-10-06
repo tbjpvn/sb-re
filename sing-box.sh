@@ -1967,7 +1967,6 @@ auto_install() {
     green "\nsing-box 安装完成\n"
 }
 
-# 无交互静默卸载（-u 参数）
 auto_uninstall() {
     green "开始无交互式卸载sing-box..."
 
