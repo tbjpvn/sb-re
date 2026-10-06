@@ -4106,17 +4106,14 @@ manage_singbox_core() {
     green "=== sing-box 内核查看与更新 ===\n"
     local cur_ver
     cur_ver=$("${work_dir}/sing-box" version 2>/dev/null | head -1)
-    green "当前内核版本: ${purple}${cur_ver:-未知}${re}"
-    local latest_stable_ver stable_json
-    if stable_json=$(gh_fetch_json "https://api.github.com/repos/SagerNet/sing-box/releases"); then
-        latest_stable_ver=$(echo "$stable_json" | jq -r '[.[] | select(.prerelease==false and .draft==false)][0].tag_name // empty' | sed 's/^v//')
-    fi
-    green "当前可更新稳定正式版: ${purple}${latest_stable_ver:+v}${latest_stable_ver:-获取失败}${re}\n"
-    green "1. 更新到最新稳定正式版"
+    green "当前内核版本: ${purple}${cur_ver:-未知}${re}\n"
+    green "1. 查看当前可用最新正式版"
     skyblue "-----------------------------"
-    green "2. 更新到最新测试版(Beta/RC/Pre-release)"
+    green "2. 更新到最新稳定正式版"
     skyblue "-----------------------------"
-    green "3. 更新到指定版本"
+    green "3. 更新到最新测试版(Beta/RC/Pre-release)"
+    skyblue "-----------------------------"
+    green "4. 更新到指定版本"
     skyblue "-----------------------------"
     purple "0. 返回主菜单"
     skyblue "-----------------------------"
@@ -4124,6 +4121,19 @@ manage_singbox_core() {
     echo ""
     case "${core_choice}" in
         1)
+            yellow "正在获取最新稳定正式版信息...\n"
+            local check_json check_version
+            if check_json=$(gh_fetch_json "https://api.github.com/repos/SagerNet/sing-box/releases"); then
+                check_version=$(echo "$check_json" | jq -r '[.[] | select(.prerelease==false and .draft==false)][0].tag_name // empty' | sed 's/^v//')
+            fi
+            if [ -z "$check_version" ]; then
+                red "获取版本信息失败，请检查网络！\n"
+                gh_ipv6_hint
+            else
+                green "当前可用最新稳定正式版: ${purple}v${check_version}${re}\n"
+            fi
+            ;;
+        2)
             yellow "正在获取最新稳定正式版信息...\n"
             local releases_json latest_version
             if releases_json=$(gh_fetch_json "https://api.github.com/repos/SagerNet/sing-box/releases"); then
@@ -4137,7 +4147,7 @@ manage_singbox_core() {
                 [[ "$confirm" == "y" || "$confirm" == "Y" ]] && update_singbox_core "$latest_version" "最新稳定正式版"
             fi
             ;;
-        2)
+        3)
             yellow "正在获取最新测试版信息...\n"
             local releases_json beta_version
             if releases_json=$(gh_fetch_json "https://api.github.com/repos/SagerNet/sing-box/releases"); then
@@ -4151,7 +4161,7 @@ manage_singbox_core() {
                 [[ "$confirm" == "y" || "$confirm" == "Y" ]] && update_singbox_core "$beta_version" "最新测试版"
             fi
             ;;
-        3)
+        4)
             reading "请输入要更新到的版本号 (如 1.11.4，不需要带v前缀): " spec_version
             spec_version=$(echo "$spec_version" | sed 's/^v//')
             if [ -z "$spec_version" ]; then
