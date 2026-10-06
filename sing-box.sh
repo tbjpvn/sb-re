@@ -2917,8 +2917,6 @@ repair_default_route() {
     write_default_route_json "$cur_resolver_tag" "$cur_dns_strategy"
 }
 
-# 恢复服务器原IP出站：route.json 正常时只把 final 改回 direct（保留分流规则）；
-# route.json 缺失/损坏时重写默认配置
 restore_direct_outbound() {
     yellow "\n正在恢复服务器原IP出站...\n"
 
