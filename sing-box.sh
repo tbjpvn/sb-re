@@ -3365,7 +3365,12 @@ add_anytls() {
     local isp
     isp=$(get_isp || echo "AnyTLS")
 
-    local url_line="anytls://${current_uuid}@${server_ip}:${at_port}?insecure=1&sni=bing.com#${isp}-AnyTLS"
+    local at_sni="bing.com" at_insecure=1
+    if [ -s "${work_dir}/cert_domain.txt" ]; then
+        at_sni=$(cat "${work_dir}/cert_domain.txt")
+        at_insecure=0
+    fi
+    local url_line="anytls://${current_uuid}@${server_ip}:${at_port}?insecure=${at_insecure}&sni=${at_sni}#${isp}-AnyTLS"
 
     echo "" >> "${client_dir}"
     echo "${url_line}" >> "${client_dir}"
@@ -3778,6 +3783,7 @@ apply_domain_cert() {
     if [ -f "$client_dir" ]; then
         sed -i -E "s#(hysteria2://[^?]*\?)sni=[^&]*&insecure=1&pinSHA256=[^&]*#\1sni=${domain}\&insecure=0#" "$client_dir"
         sed -i -E "s#(tuic://[^?]*\?)sni=[^&]*#\1sni=${domain}#" "$client_dir"
+        sed -i -E "s|(anytls://[^?]*\?)insecure=1&sni=[^&#]*|\1insecure=0\&sni=${domain}|" "$client_dir"
         sed -i -E "s#(tuic://[^#]*)allow_insecure=1#\1allow_insecure=0#" "$client_dir"
         update_subscription
     fi
@@ -3823,6 +3829,7 @@ restore_selfsigned_cert() {
     if [ -f "$client_dir" ]; then
         sed -i -E "s#(hysteria2://[^?]*\?)sni=[^&]*&insecure=0#\1sni=www.bing.com\&insecure=1\&pinSHA256=${fingerprint}#" "$client_dir"
         sed -i -E "s#(tuic://[^?]*\?)sni=[^&]*#\1sni=www.bing.com#" "$client_dir"
+        sed -i -E "s|(anytls://[^?]*\?)insecure=0&sni=[^&#]*|\1insecure=1\&sni=www.bing.com|" "$client_dir"
         sed -i -E "s#(tuic://[^#]*)allow_insecure=0#\1allow_insecure=1#" "$client_dir"
         update_subscription
     fi
