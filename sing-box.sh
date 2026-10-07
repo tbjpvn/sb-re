@@ -1893,18 +1893,8 @@ uninstall_singbox() {
             fi
 
             if [ -n "$cert_domain" ] && [ -f "${HOME}/.acme.sh/acme.sh" ]; then
-                reading "检测到曾用 acme.sh 申请过域名证书(${cert_domain})，是否一并删除该证书？(y/n): " acme_choice
-                case "${acme_choice}" in
-                    y|Y)
-                        cleanup_acme_if_needed "$cert_domain"
-                        green "acme.sh 中 ${cert_domain} 证书已删除\n"
-                        ;;
-                    *)
-                        local dconf="${HOME}/.acme.sh/${cert_domain}_ecc/${cert_domain}.conf"
-                        [ -f "$dconf" ] && sed -i "/^Le_PreHook=/d;/^Le_PostHook=/d;/^Le_ReloadCmd=/d" "$dconf" 2>/dev/null
-                        yellow "已保留 acme.sh 证书，可手动执行: ~/.acme.sh/acme.sh --remove -d ${cert_domain} --ecc\n"
-                        ;;
-                esac
+                cleanup_acme_if_needed "$cert_domain"
+                green "acme.sh 中 ${cert_domain} 证书已删除\n"
             fi
 
             green "\nsing-box 卸载成功\n\n" && exit 0
