@@ -2568,7 +2568,7 @@ warp_manage() {
       | select(($tags | length) > 0)
       | "\($tags | join(", "))\t\($r.outbound)"
     ' "$route_file" 2>/dev/null | while IFS=$'\t' read -r tags outb; do
-        echo -e " - ${skyblue}${tags}${re} ${purple}->${re} ${green}${outb}${re}"
+        echo -e " - ${skyblue}${tags}${re} ${purple}->${re} ${yellow}${outb}${re}"
     done
     if ! jq -e '.route.rules[]? | select(.rule_set != null and .outbound != null)' "$route_file" >/dev/null 2>&1; then
         echo "  无"
@@ -2578,7 +2578,13 @@ warp_manage() {
         echo -e "\n${green}全局代理出站(其余流量): ${purple}${cur_final}${re}"
     fi
     green "\n已添加的出站(代理socks/http/ss2022 及 本地IP直出):"
-    jq -r '.outbounds[] | select(.tag != "direct") | " - \(.tag) [\(.type)]"' "$outbound_file" 2>/dev/null || echo "  无"
+    if jq -e '.outbounds' "$outbound_file" >/dev/null 2>&1; then
+        jq -r '.outbounds[] | select(.tag != "direct") | "\(.tag)\t\(.type)"' "$outbound_file" 2>/dev/null | while IFS=$'\t' read -r o_tag o_type; do
+            echo -e " - ${yellow}${o_tag}${re} [${o_type}]"
+        done
+    else
+        echo "  无"
+    fi
 
     echo ""
     green "1. 设置分流服务 (未添加代理出站直接设置则使用WARP)"
