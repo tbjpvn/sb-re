@@ -2945,7 +2945,7 @@ delete_rule_menu() {
     local rule_tags=() i
     mapfile -t rule_tags < <(jq -r '[.route.rules[] | select(.rule_set != null) | .rule_set[]?] | map(select(. != "telegram-ip")) | .[]' "$route_file")
     for i in "${!rule_tags[@]}"; do
-        printf '%2d. %s\n' "$((i+1))" "${rule_tags[$i]}"
+        printf '%2d. %b%s%b\n' "$((i+1))" "$skyblue" "${rule_tags[$i]}" "$re"
     done
     reading "\n输入要删除的规则名称或序号: " del_input
     if [[ "$del_input" =~ ^[0-9]+$ ]]; then
@@ -3212,9 +3212,11 @@ add_local_ip_outbound() {
 delete_socks5_proxy() {
     clear
     green "当前可用出站列表:"
-    local out_list=$(jq -r '[.outbounds[] | select(.tag != "direct")] | to_entries | .[] | "\(.key+1). \(.value.tag) [\(.value.type)]"' "$outbound_file" 2>/dev/null)
+    local out_list=$(jq -r '[.outbounds[] | select(.tag != "direct")] | to_entries | .[] | "\(.key+1)\t\(.value.tag)\t\(.value.type)"' "$outbound_file" 2>/dev/null)
     [ -z "$out_list" ] && { yellow "没有可删除的出站。"; sleep 2; return; }
-    echo "$out_list"
+    echo "$out_list" | while IFS=$'\t' read -r o_idx o_tag o_type; do
+        echo -e "${o_idx}. ${yellow}${o_tag}${re} [${o_type}]"
+    done
 
     reading "输入要删除的出站编号或标签: " del_input
     if [[ "$del_input" =~ ^[0-9]+$ ]]; then
