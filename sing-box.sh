@@ -1998,7 +1998,7 @@ change_config() {
             [ -n "$_jump" ] && _pl="${_pl}(${yellow}跳跃:${re}${purple}${_jump}${re})"
         fi
     fi
-    echo -e "${green}节点端口: ${re}${_pl:-无}\n"
+    echo -e "${green}节点端口: ${re}${_pl:-无}\n\n"
     green "1. 修改端口"
     skyblue "------------"
     green "2. 修改UUID"
