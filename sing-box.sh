@@ -2947,7 +2947,9 @@ delete_rule_menu() {
     for i in "${!rule_tags[@]}"; do
         printf '%b%2d.%b %b%s%b\n' "$green" "$((i+1))" "$re" "$skyblue" "${rule_tags[$i]}" "$re"
     done
+    echo -e "${red}0. 返回上级菜单${re}"
     reading "\n输入要删除的规则名称或序号: " del_input
+    [ "$del_input" = "0" ] && { warp_manage; return; }
     if [[ "$del_input" =~ ^[0-9]+$ ]]; then
         tag="${rule_tags[$((del_input-1))]:-}"
     else
@@ -3217,8 +3219,10 @@ delete_socks5_proxy() {
     echo "$out_list" | while IFS=$'\t' read -r o_idx o_tag o_type; do
         echo -e "${green}${o_idx}.${re} ${yellow}${o_tag}${re} [${o_type}]"
     done
+    echo -e "${red}0. 返回上级菜单${re}"
 
-    reading "输入要删除的出站编号或标签: " del_input
+    reading "\n输入要删除的出站编号或标签: " del_input
+    [ "$del_input" = "0" ] && { warp_manage; return; }
     if [[ "$del_input" =~ ^[0-9]+$ ]]; then
         tag=$(jq -r --arg idx "$del_input" '.outbounds | map(select(.tag != "direct")) | .[($idx | tonumber)-1].tag // empty' "$outbound_file")
         [ -z "$tag" ] && { red "编号无效！"; sleep 1; return; }
@@ -3945,13 +3949,13 @@ manage_outbound_strategy() {
     clear; echo ""
     green "=== 出站 IPv4/IPv6 优先级设置 ===\n"
     green "当前策略: ${purple}${current_strategy}${re}\n"
-    green "1. IPv4单独出站 (ipv4_only)"
+    green "1. IPV4单独出站 (ipv4_only)"
     skyblue "-----------------------------"
-    green "2. IPv4优先出站 (prefer_ipv4)"
+    green "2. IPV4优先出站 (prefer_ipv4)"
     skyblue "-----------------------------"
-    green "3. IPv6单独出站 (ipv6_only)"
+    green "3. IPV6单独出站 (ipv6_only)"
     skyblue "-----------------------------"
-    green "4. IPv6优先出站 (prefer_ipv6)"
+    green "4. IPV6优先出站 (prefer_ipv6)"
     skyblue "-----------------------------"
     purple "0. 返回主菜单"
     skyblue "-----------------------------"
