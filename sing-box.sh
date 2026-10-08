@@ -1982,7 +1982,7 @@ change_config() {
 
     clear; echo ""
     green "=== 修改节点配置 ===\n"
-    green "sing-box当前状态: $singbox_status"
+    green "sing-box当前状态: $singbox_status\n"
     local _inb="${conf_dir}/inbounds.json" _pl="" _p _jump
     if [ -f "$_inb" ]; then
         _p=$(jq -r '[.inbounds[]? | select(.type=="vmess") | .listen_port][0] // empty' "$_inb" 2>/dev/null)
