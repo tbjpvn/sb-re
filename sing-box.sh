@@ -2947,7 +2947,7 @@ delete_rule_menu() {
     for i in "${!rule_tags[@]}"; do
         printf '%b%2d.%b %b%s%b\n' "$green" "$((i+1))" "$re" "$skyblue" "${rule_tags[$i]}" "$re"
     done
-    echo -e "${purple}0. 返回上级菜单${re}"
+    echo -e "${purple} 0. 返回上级菜单${re}"
     reading "\n输入要删除的规则名称或序号: " del_input
     [ "$del_input" = "0" ] && { warp_manage; return; }
     if [[ "$del_input" =~ ^[0-9]+$ ]]; then
