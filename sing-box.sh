@@ -2783,7 +2783,7 @@ finalize_rule_add() {
         for i in "${!out_tags[@]}"; do
             echo -e "  ${green}$((i+1)). ${skyblue}${out_tags[$i]}${re}"
         done
-        echo -e "  ${red}0. 返回上级菜单${re}"
+        echo -e "  ${purple}0. 返回上级菜单${re}"
         reading "请输入编号: " out_choice
         if [ -z "$out_choice" ]; then
             if ! ensure_warp_endpoint; then
@@ -3140,7 +3140,7 @@ add_local_ip_outbound() {
         echo -e "  ${green}${i}. ${skyblue}${ip}${re}"
         i=$((i+1))
     done
-    echo -e "  ${red}0. 返回上级菜单${re}"
+    echo -e "  ${purple}0. 返回上级菜单${re}"
 
     reading "\n请输入编号选择出口IP(也可直接手动输入未列出的IP): " ip_choice
     local selected_ip
