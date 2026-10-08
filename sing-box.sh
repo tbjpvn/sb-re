@@ -1986,19 +1986,19 @@ change_config() {
     local _inb="${conf_dir}/inbounds.json" _pl="" _p _jump
     if [ -f "$_inb" ]; then
         _p=$(jq -r '[.inbounds[]? | select(.type=="vmess") | .listen_port][0] // empty' "$_inb" 2>/dev/null)
-        [ -n "$_p" ] && _pl="${_pl}argo:${purple}${_p}${re}  "
+        [ -n "$_p" ] && _pl="${_pl}${yellow}argo:${re}${purple}${_p}${re}  "
         _p=$(jq -r '[.inbounds[]? | select(.type=="vless") | .listen_port][0] // empty' "$_inb" 2>/dev/null)
-        [ -n "$_p" ] && _pl="${_pl}reality:${purple}${_p}${re}  "
+        [ -n "$_p" ] && _pl="${_pl}${yellow}reality:${re}${purple}${_p}${re}  "
         _p=$(jq -r '[.inbounds[]? | select(.type=="tuic") | .listen_port][0] // empty' "$_inb" 2>/dev/null)
-        [ -n "$_p" ] && _pl="${_pl}tuic5:${purple}${_p}${re}  "
+        [ -n "$_p" ] && _pl="${_pl}${yellow}tuic5:${re}${purple}${_p}${re}  "
         _p=$(jq -r '[.inbounds[]? | select(.type=="hysteria2") | .listen_port][0] // empty' "$_inb" 2>/dev/null)
         if [ -n "$_p" ]; then
             _jump=$(grep -m1 '^hysteria2://' "$client_dir" 2>/dev/null | sed -n 's/.*[&?]mport=\([^#&]*\).*/\1/p' | sed 's/^[0-9]*,//')
-            _pl="${_pl}hysteria2:${purple}${_p}${re}"
-            [ -n "$_jump" ] && _pl="${_pl}(跳跃:${purple}${_jump}${re})"
+            _pl="${_pl}${yellow}hysteria2:${re}${purple}${_p}${re}"
+            [ -n "$_jump" ] && _pl="${_pl}(${yellow}跳跃:${re}${purple}${_jump}${re})"
         fi
     fi
-    green "节点端口: ${_pl:-无}\n"
+    echo -e "${green}节点端口: ${re}${_pl:-无}\n"
     green "1. 修改端口"
     skyblue "------------"
     green "2. 修改UUID"
