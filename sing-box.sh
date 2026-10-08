@@ -4107,7 +4107,6 @@ manage_singbox_core() {
                 gh_ipv6_hint
             else
                 cur_num=$(echo "$cur_ver" | awk '{print $3}' | sed 's/^v//')
-                green "当前内核版本: ${purple}v${cur_num:-未知}${re}"
                 green "最新稳定正式版: ${purple}v${latest_version}${re}\n"
                 if [ "$cur_num" = "$latest_version" ]; then
                     green "已经是最新正式版，无需更新！\n"
