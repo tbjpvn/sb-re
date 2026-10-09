@@ -4734,7 +4734,7 @@ menu() {
     purple "拥塞控制算法: ${congestion_status}"
     purple "-双栈IP 状态: ${dualstack_status}\n"
     green " 1. 安装sing-box"
-    green " 2. 自定义安装(四合一中任选1-4个协议)"
+    green " 2. *自定义安装*"
     red   " 3. 卸载sing-box"
     echo "================"
     green " 4. sing-box管理"
