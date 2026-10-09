@@ -182,11 +182,11 @@ verify_udp_listening() {
 
     local ok=1
     if [ "$tuic_seen" -eq 0 ]; then
-        red "警告：等待 ${max_wait} 秒后，tuic端口 ${tuic_port}/udp 仍未监听，节点大概率不通，请到「6.修改节点配置->1.修改端口->3.修改tuic端口」重新分配。"
+        red "警告：等待 ${max_wait} 秒后，tuic端口 ${tuic_port}/udp 仍未监听，节点大概率不通，请到「7.修改节点配置->1.修改端口->3.修改tuic端口」重新分配。"
         ok=0
     fi
     if [ "$hy2_seen" -eq 0 ]; then
-        red "警告：等待 ${max_wait} 秒后，hysteria2端口 ${hy2_port}/udp 仍未监听，节点大概率不通，请到「6.修改节点配置->1.修改端口->4.修改hysteria2端口」重新分配。"
+        red "警告：等待 ${max_wait} 秒后，hysteria2端口 ${hy2_port}/udp 仍未监听，节点大概率不通，请到「7.修改节点配置->1.修改端口->4.修改hysteria2端口」重新分配。"
         ok=0
     fi
     if [ "$ok" -eq 1 ]; then
@@ -4734,25 +4734,25 @@ menu() {
     purple "拥塞控制算法: ${congestion_status}"
     purple "-双栈IP 状态: ${dualstack_status}\n"
     green " 1. 安装sing-box"
-    green "16. 自定义安装(四合一中任选1-4个协议)"
-    red   " 2. 卸载sing-box"
+    green " 2. 自定义安装(四合一中任选1-4个协议)"
+    red   " 3. 卸载sing-box"
     echo "================"
-    green " 3. sing-box管理"
-    green " 4. sing-box更新"
+    green " 4. sing-box管理"
+    green " 5. sing-box更新"
     echo "================"
-    green " 5. 查看节点信息"
-    green " 6. 修改节点配置"
-    green " 7. 增加删除协议"
-    green " 8. Argo隧道管理"
-    green " 9. 域名证书管理"
+    green " 6. 查看节点信息"
+    green " 7. 修改节点配置"
+    green " 8. 增加删除协议"
+    green " 9. Argo隧道管理"
+    green "10. 域名证书管理"
     echo "================"
-    green "10. WARP分流管理"
-    green "11. WARP全局出站"
-    green "12. 双栈出站优先"
+    green "11. WARP分流管理"
+    green "12. WARP全局出站"
+    green "13. 双栈出站优先"
     echo "================"
-    green "13. 切换为BBR+fq"
-    green "14. 系统时间同步"
-    green "15. 调整虚拟内存"
+    green "14. 切换为BBR+fq"
+    green "15. 系统时间同步"
+    green "16. 调整虚拟内存"
     echo "================"
     purple "20. ssh综合工具箱"
     echo "================"
@@ -4804,21 +4804,21 @@ case "$1" in
             need_pause=true  
             case "${choice}" in
                 1)  do_install_singbox || continue ;;
-                16) custom_install_singbox || continue ;;
-                2)  uninstall_singbox;  need_pause=false ;;
-                3)  manage_singbox;     need_pause=false ;;
-                4)  manage_singbox_core; need_pause=false ;;
-                5)  check_nodes;        need_pause=true ;;
-                6)  change_config;      [ $? -eq 10 ] && need_pause=false || need_pause=true ;;
-                7)  manage_protocols;   need_pause=false ;;
-                8)  manage_argo;        [ $? -eq 10 ] && need_pause=false || need_pause=true ;;
-                9)  manage_cert;        need_pause=false ;;
-                10) warp_manage;        need_pause=false ;;
-                11) system_warp_menu;   need_pause=false ;;
-                12) manage_outbound_strategy; need_pause=false ;;
-                13) enable_bbr_fq;       need_pause=true ;;
-                14) time_sync_menu;      need_pause=false ;;
-                15) swap_manage_menu;    need_pause=false ;;
+                2)  custom_install_singbox || continue ;;
+                3)  uninstall_singbox;  need_pause=false ;;
+                4)  manage_singbox;     need_pause=false ;;
+                5)  manage_singbox_core; need_pause=false ;;
+                6)  check_nodes;        need_pause=true ;;
+                7)  change_config;      [ $? -eq 10 ] && need_pause=false || need_pause=true ;;
+                8)  manage_protocols;   need_pause=false ;;
+                9)  manage_argo;        [ $? -eq 10 ] && need_pause=false || need_pause=true ;;
+                10) manage_cert;        need_pause=false ;;
+                11) warp_manage;        need_pause=false ;;
+                12) system_warp_menu;   need_pause=false ;;
+                13) manage_outbound_strategy; need_pause=false ;;
+                14) enable_bbr_fq;       need_pause=true ;;
+                15) time_sync_menu;      need_pause=false ;;
+                16) swap_manage_menu;    need_pause=false ;;
                 20)
                     clear
                     bash <(curl -Ls ssh_tool.eooce.com)
