@@ -4468,6 +4468,13 @@ system_swap_summary() {
     fi
 }
 
+# 是否存在非本脚本创建的系统默认swap
+has_system_swap() {
+    local n
+    n=$(awk -v f="$swap_file" 'NR>1 && $1!=f{c++} END{print c+0}' /proc/swaps 2>/dev/null)
+    [ -n "$n" ] && [ "$n" -gt 0 ]
+}
+
 create_swap() {
     local size_mb="$1"
     if ! [[ "$size_mb" =~ ^[0-9]+$ ]] || [ "$size_mb" -le 0 ]; then
@@ -4526,15 +4533,13 @@ swap_manage_menu() {
     clear; echo ""
     purple "=== 调整虚拟内存(SWAP) ===\n"
     green "系统当前SWAP状态: $(system_swap_summary)"
-    local all_swap
-    all_swap=$(swapon --show 2>/dev/null)
-    if [ -n "$all_swap" ]; then
-        echo "$all_swap"
-    fi
-    if swapon --show=NAME 2>/dev/null | grep -qx "$swap_file"; then
-        green "其中本脚本管理的 ${swap_file}: $(check_swap_status)\n"
+    if has_system_swap; then
+        if swapon --show=NAME 2>/dev/null | grep -qx "$swap_file"; then
+            green "扩展虚拟内存(SWAP): $(check_swap_status)"
+        fi
+        yellow "系统默认已配置虚拟内存(SWAP)，继续操作将会作为系统虚拟内存(SWAP)的扩展部分\n"
     else
-        yellow "提示: 上方swap非本脚本创建，选择档位会额外新增一份\n"
+        echo ""
     fi
     green  "1. 512M"
     green  "2. 1024M"
