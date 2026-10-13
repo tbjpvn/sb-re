@@ -1857,6 +1857,7 @@ cleanup_singbox_residuals() {
         rm -f /etc/sysctl.d/99-bbr-fq.conf
         sysctl --system >/dev/null 2>&1 || true
     fi
+    rm -f /etc/modules-load.d/tcp_bbr.conf 2>/dev/null || true
 
     if [ -f /etc/init.d/iptables ] && grep -q 'iptables-restore < /etc/iptables/rules.v4' /etc/init.d/iptables 2>/dev/null; then
         if command_exists rc-update; then
@@ -4699,33 +4700,66 @@ manage_singbox_core() {
 
 enable_bbr_fq() {
     local sysctl_conf="/etc/sysctl.d/99-bbr-fq.conf"
+    local modload_conf="/etc/modules-load.d/tcp_bbr.conf"
+    local old_cc old_qdisc cc qdisc iface real_qdisc conflicts
 
-    if ! sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw "bbr"; then
+    old_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    old_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+
+    if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw "bbr"; then
         modprobe tcp_bbr 2>/dev/null || true
     fi
 
-    if ! sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw "bbr"; then
-        red "当前内核不支持 BBR，切换失败。"
+    if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw "bbr"; then
+        red "当前内核不支持 BBR（OpenVZ/LXC 等容器需宿主机开启），切换失败。"
         return 1
     fi
 
+    # 先改运行时参数，成功后再写配置文件，避免失败时残留无效配置
+    if ! sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || \
+       ! sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; then
+        [ -n "$old_qdisc" ] && sysctl -w net.core.default_qdisc="$old_qdisc" >/dev/null 2>&1
+        [ -n "$old_cc" ] && sysctl -w net.ipv4.tcp_congestion_control="$old_cc" >/dev/null 2>&1
+        red "写入内核参数失败（可能是容器环境禁止修改 sysctl），已回滚。"
+        return 1
+    fi
+
+    mkdir -p /etc/sysctl.d
     cat > "$sysctl_conf" << 'EOF'
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
 
-    sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1
-    sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1
+    # 开机提前加载 tcp_bbr 模块，避免 sysctl 先于模块加载而失效
+    if [ -d /etc/modules-load.d ]; then
+        echo "tcp_bbr" > "$modload_conf"
+    fi
 
-    local cc qdisc
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
 
-    if [ "$cc" = "bbr" ] && [ "$qdisc" = "fq" ]; then
-        green "已成功切换为 BBR + fq，并已设置为永久生效。"
-    else
+    if [ "$cc" != "bbr" ] || [ "$qdisc" != "fq" ]; then
         red "切换失败，当前为: ${cc:-unknown}+${qdisc:-unknown}"
         return 1
+    fi
+
+    green "已成功切换为 BBR + fq，并已设置为永久生效。"
+
+    # 检查是否有其它配置文件会覆盖本设置（/etc/sysctl.conf 最后加载，优先级最高）
+    conflicts=$(grep -lE '^[[:space:]]*net\.(ipv4\.tcp_congestion_control|core\.default_qdisc)' \
+        /etc/sysctl.conf /etc/sysctl.d/*.conf 2>/dev/null | grep -vxF "$sysctl_conf")
+    if [ -n "$conflicts" ]; then
+        yellow "检测到以下文件也设置了拥塞控制/队列算法，重启后可能覆盖本设置，请检查："
+        echo "$conflicts"
+    fi
+
+    # default_qdisc 只对新建的队列生效，这里显示网卡当前实际的 qdisc
+    if command -v tc >/dev/null 2>&1; then
+        iface=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
+        real_qdisc=$(tc qdisc show dev "$iface" 2>/dev/null | awk 'NR==1 {print $2}')
+        if [ -n "$real_qdisc" ] && [ "$real_qdisc" != "fq" ] && [ "$real_qdisc" != "mq" ]; then
+            yellow "网卡 ${iface} 当前实际队列为 ${real_qdisc}，fq 将在重启后对该网卡生效（BBR 本身已即时生效）。"
+        fi
     fi
 }
 
