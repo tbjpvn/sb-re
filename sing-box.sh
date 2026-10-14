@@ -4698,10 +4698,90 @@ manage_singbox_core() {
     manage_singbox_core
 }
 
+# 检查是否有其它 sysctl 配置会在重启后覆盖 BBR+fq：
+# 只报「值不一致」且「加载顺序晚于本配置」的文件；软链接按真实路径去重
+check_sysctl_conflicts() {
+    local ours="$1" ours_real f real base line key val expected found=0
+    local seen=" "
+
+    ours_real=$(readlink -f "$ours" 2>/dev/null || echo "$ours")
+
+    for f in /etc/sysctl.d/*.conf /etc/sysctl.conf; do
+        [ -f "$f" ] || continue
+        real=$(readlink -f "$f" 2>/dev/null || echo "$f")
+        [ "$real" = "$ours_real" ] && continue
+        case "$seen" in *" $real "*) continue ;; esac
+        seen="$seen$real "
+
+        # /etc/sysctl.conf 最后加载；sysctl.d 内按文件名排序，排在本配置之前的会被本配置覆盖，无需关心
+        if [ "$f" != "/etc/sysctl.conf" ] && [ "$real" != "/etc/sysctl.conf" ]; then
+            base=$(basename "$f")
+            [ "$(printf '%s\n%s\n' "$base" "$(basename "$ours")" | LC_ALL=C sort | tail -n1)" = "$base" ] || continue
+        fi
+
+        while IFS= read -r line; do
+            key=$(echo "$line" | sed -E 's/^[[:space:]]*([^=[:space:]]+).*/\1/')
+            val=$(echo "$line" | sed -E 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*$//')
+            case "$key" in
+                net.ipv4.tcp_congestion_control) expected="bbr" ;;
+                net.core.default_qdisc) expected="fq" ;;
+                *) continue ;;
+            esac
+            if [ "$val" != "$expected" ]; then
+                if [ "$found" -eq 0 ]; then
+                    yellow "检测到以下配置与 BBR+fq 不一致，重启后可能覆盖本设置，请检查："
+                    found=1
+                fi
+                echo "  $real: $key = $val"
+            fi
+        done < <(grep -E '^[[:space:]]*net\.(ipv4\.tcp_congestion_control|core\.default_qdisc)[[:space:]]*=' "$f" 2>/dev/null)
+    done
+}
+
+# 让网卡立即用上 fq：单队列网卡直接替换（无需重启），多队列(mq)只提示，虚拟网卡(noqueue)跳过
+apply_fq_to_nics() {
+    local iface root_qdisc ifaces
+
+    command -v tc >/dev/null 2>&1 || return 0
+    command -v ip >/dev/null 2>&1 || return 0
+
+    # 默认路由出口 + 物理/半虚拟化网卡（/sys/class/net/xxx/device 存在）
+    ifaces=$( {
+        ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}'
+        ip -6 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}'
+        for d in /sys/class/net/*; do
+            [ -e "$d/device" ] && basename "$d"
+        done
+    } | sort -u)
+
+    for iface in $ifaces; do
+        [ "$iface" = "lo" ] && continue
+        root_qdisc=$(tc qdisc show dev "$iface" 2>/dev/null | awk '/ root/ {print $2; exit}')
+        case "$root_qdisc" in
+            ""|noqueue)
+                # 虚拟网卡（隧道/NAT64/veth 等），本身不排队，无需处理
+                ;;
+            fq)
+                green "网卡 ${iface} 当前队列已是 fq。"
+                ;;
+            mq|mqprio)
+                yellow "网卡 ${iface} 是多队列网卡（${root_qdisc}），其子队列将在重启后变为 fq；不重启也不影响 BBR 工作。"
+                ;;
+            *)
+                if tc qdisc replace dev "$iface" root fq 2>/dev/null; then
+                    green "网卡 ${iface} 队列已从 ${root_qdisc} 即时切换为 fq（无需重启）。"
+                else
+                    yellow "网卡 ${iface} 队列（${root_qdisc}）切换 fq 失败，fq 将在重启后生效；BBR 本身已即时生效。"
+                fi
+                ;;
+        esac
+    done
+}
+
 enable_bbr_fq() {
     local sysctl_conf="/etc/sysctl.d/99-bbr-fq.conf"
     local modload_conf="/etc/modules-load.d/tcp_bbr.conf"
-    local old_cc old_qdisc cc qdisc iface real_qdisc conflicts
+    local old_cc old_qdisc cc qdisc
 
     old_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     old_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
@@ -4745,22 +4825,10 @@ EOF
 
     green "已成功切换为 BBR + fq，并已设置为永久生效。"
 
-    # 检查是否有其它配置文件会覆盖本设置（/etc/sysctl.conf 最后加载，优先级最高）
-    conflicts=$(grep -lE '^[[:space:]]*net\.(ipv4\.tcp_congestion_control|core\.default_qdisc)' \
-        /etc/sysctl.conf /etc/sysctl.d/*.conf 2>/dev/null | grep -vxF "$sysctl_conf")
-    if [ -n "$conflicts" ]; then
-        yellow "检测到以下文件也设置了拥塞控制/队列算法，重启后可能覆盖本设置，请检查："
-        echo "$conflicts"
-    fi
+    check_sysctl_conflicts "$sysctl_conf"
 
-    # default_qdisc 只对新建的队列生效，这里显示网卡当前实际的 qdisc
-    if command -v tc >/dev/null 2>&1; then
-        iface=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
-        real_qdisc=$(tc qdisc show dev "$iface" 2>/dev/null | awk 'NR==1 {print $2}')
-        if [ -n "$real_qdisc" ] && [ "$real_qdisc" != "fq" ] && [ "$real_qdisc" != "mq" ]; then
-            yellow "网卡 ${iface} 当前实际队列为 ${real_qdisc}，fq 将在重启后对该网卡生效（BBR 本身已即时生效）。"
-        fi
-    fi
+    # default_qdisc 只对新建的队列生效，这里让现有网卡立即切换
+    apply_fq_to_nics
 }
 
 http_date_to_epoch() {
