@@ -2608,7 +2608,7 @@ warp_manage() {
     skyblue "----------------------"
     green "8. 代理流量限制 (定时流量上限，超限切断)"
     skyblue "----------------------"
-    green "9. 添加公共ProxyIP分流 (仅限CF托管站点，输入域名/IP即可)"
+    green "9. 公共ProxyIP分流 (添加/删除，仅限CF托管站点)"
     skyblue "----------------------"
     purple "0. 返回主菜单"
     skyblue "------------"
@@ -2624,7 +2624,7 @@ warp_manage() {
         6)  regenerate_warp_keys; warp_manage ;;
         7)  test_warp_connectivity ;;
         8)  quota_menu ;;
-        9)  add_proxyip_route ;;
+        9)  proxyip_menu ;;
         0)  menu ;;
         00) exit 0 ;;
         *)  red "无效选项"; sleep 1; warp_manage ;;
@@ -3016,6 +3016,96 @@ _pip_trace() {
     curl "${args[@]}" "https://${host}/cdn-cgi/trace" 2>/dev/null | grep -E '^(ip|colo)=' | tr '\n' ' '
 }
 
+# 列出已添加的 ProxyIP 分流规则: 输出 "规则名<TAB>ProxyIP<TAB>域名列表"
+_pip_list_rules() {
+    jq -r '
+      . as $root
+      | .route.rules[]?
+      | select(.override_address != null and (.rule_set | type) == "array")
+      | .rule_set[0] as $t
+      | (first($root.route.rule_set[]? | select(.tag == $t) | .rules[0].domain_suffix | join(" ")) // "") as $d
+      | "\($t)\t\(.override_address)\t\($d)"
+    ' "$route_file" 2>/dev/null
+}
+
+proxyip_menu() {
+    clear
+    green "=== 公共 ProxyIP 分流 ===\n"
+    green "当前已添加的 ProxyIP 分流:"
+    local rows
+    rows=$(_pip_list_rules)
+    if [ -z "$rows" ]; then
+        echo "  无"
+    else
+        local t a d
+        while IFS=$'\t' read -r t a d; do
+            echo -e " - ${skyblue}${t}${re} ${purple}->${re} ${yellow}${a}${re}  ${d}"
+        done <<< "$rows"
+    fi
+    echo ""
+    green "1. 添加 ProxyIP 分流"
+    red   "2. 删除 ProxyIP 分流"
+    purple "0. 返回上级菜单"
+    reading "请输入选择: " pip_menu_choice
+    case "$pip_menu_choice" in
+        1) add_proxyip_route ;;
+        2) delete_proxyip_route ;;
+        0) warp_manage ;;
+        *) red "无效选项"; sleep 1; proxyip_menu ;;
+    esac
+}
+
+delete_proxyip_route() {
+    clear
+    green "=== 删除 ProxyIP 分流 ===\n"
+    local tags=() addrs=() doms=() t a d i
+    while IFS=$'\t' read -r t a d; do
+        [ -z "$t" ] && continue
+        tags+=("$t"); addrs+=("$a"); doms+=("$d")
+    done < <(_pip_list_rules)
+    if [ ${#tags[@]} -eq 0 ]; then
+        yellow "当前没有 ProxyIP 分流规则"; sleep 2; proxyip_menu; return
+    fi
+    for i in "${!tags[@]}"; do
+        printf '%b%2d.%b %b%s%b -> %s  %s\n' "$green" "$((i+1))" "$re" "$skyblue" "${tags[$i]}" "$re" "${addrs[$i]}" "${doms[$i]}"
+    done
+    echo -e "${purple} 0. 返回${re}"
+    reading "\n输入要删除的序号: " pip_del
+    [ -z "$pip_del" ] || [ "$pip_del" = "0" ] && { proxyip_menu; return; }
+    if ! [[ "$pip_del" =~ ^[0-9]+$ ]] || [ "$pip_del" -lt 1 ] || [ "$pip_del" -gt "${#tags[@]}" ]; then
+        red "无效的选择"; sleep 1; proxyip_menu; return
+    fi
+    local tag="${tags[$((pip_del-1))]}"
+
+    cp -f "$route_file" "${route_file}.bak"
+    jq_write "$route_file" --arg tag "$tag" '
+      .route.rules = (
+        [{"action":"sniff"}]
+        + [
+            .route.rules[]?
+            | select(.action != "sniff")
+            | if .rule_set != null then .rule_set = [.rule_set[] | select(. != $tag)] else . end
+            | select((.rule_set | type) != "array" or (.rule_set | length) > 0)
+          ]
+      )
+      | .route.rule_set = [(.route.rule_set // [])[] | select(.tag != $tag)]
+    '
+
+    local check_output
+    check_output=$(validate_singbox_config)
+    if [ $? -ne 0 ]; then
+        cp -f "${route_file}.bak" "$route_file"
+        red "\n配置校验未通过，已自动回滚：\n"
+        echo "$check_output"
+        sleep 3; proxyip_menu; return
+    fi
+    rm -f "${route_file}.bak"
+
+    reload_singbox
+    green "\n已删除 ProxyIP 分流 '${tag}'，相关域名恢复原有出站。"
+    sleep 2; proxyip_menu
+}
+
 add_proxyip_route() {
     clear
     green "=== 添加公共 ProxyIP 分流 ===\n"
@@ -3139,7 +3229,7 @@ add_proxyip_route() {
     green "\n已添加 ProxyIP 分流 '${tag}' -> ${pip_addr}，域名: ${ok_domains[*]}"
     yellow "提示：已同时拦截这些域名的 UDP/443(QUIC)，让浏览器回退到 TCP，否则 QUIC 会绕过 ProxyIP。"
     yellow "验证：客户端连上节点后访问 https://chatgpt.com/cdn-cgi/trace 之类 (对应站点的 /cdn-cgi/trace)，查看 ip= 是否为 ProxyIP 的出口。"
-    sleep 3; warp_manage
+    sleep 3; proxyip_menu
 }
 
 urldecode() {
