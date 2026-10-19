@@ -1291,53 +1291,9 @@ regenerate_warp_keys() {
     sleep 2
 }
 
-# Gemini 分流域名（网页版 + 手机 App 后端）。手机 App 除 gemini.google.com 外
-# 还会访问 proactivebackend-pa / geller-pa / alkalicore-pa 等后端域名，
-# 若漏掉会走直连，导致同一会话出口 IP 不一致而被 Google 拒绝。
-gemini_domains_json() {
-    jq -n '[
-      "gemini.google.com",
-      "bard.google.com",
-      "generativelanguage.googleapis.com",
-      "aistudio.google.com",
-      "ai.google.dev",
-      "makersuite.google.com",
-      "alkalimakersuite-pa.clients6.google.com",
-      "alkalicore-pa.clients6.google.com",
-      "proactivebackend-pa.googleapis.com",
-      "geller-pa.googleapis.com",
-      "deepmind.google",
-      "generativeai.google"
-    ]'
-}
-
-# 同步已有 route.json 中的 gemini 规则集：只追加缺失域名，不删除用户已有域名；有变化才重载
-sync_gemini_ruleset() {
-    local rf="${conf_dir}/route.json" gd before after
-    [ -s "$rf" ] || return 0
-    jq -e '.route.rule_set[]? | select(.tag=="gemini" and .type=="inline")' "$rf" >/dev/null 2>&1 || return 0
-    gd=$(gemini_domains_json) || return 0
-    before=$(jq -c '.route.rule_set[] | select(.tag=="gemini") | .rules' "$rf")
-    jq_write "$rf" --argjson gd "$gd" '
-      .route.rule_set |= map(
-        if .tag == "gemini" and .type == "inline" then
-          .rules |= (
-            if length == 0 then [{"domain_suffix": $gd}]
-            else (.[0].domain_suffix = (((.[0].domain_suffix // []) + $gd) | unique)) end
-          )
-        else . end)' || return 0
-    after=$(jq -c '.route.rule_set[] | select(.tag=="gemini") | .rules' "$rf")
-    if [ "$before" != "$after" ]; then
-        green "已自动补全 Gemini 分流域名(含手机App后端域名)"
-        reload_singbox
-    fi
-}
-
 default_route_rule_sets_json() {
-    local gd
-    gd=$(gemini_domains_json) || return 1
-    jq -n --argjson gd "$gd" '[
-      {"tag":"gemini","type":"inline","rules":[{"domain_suffix":$gd}]},
+    jq -n '[
+      {"tag":"gemini","type":"inline","rules":[{"domain_suffix":["gemini.google.com","generativelanguage.googleapis.com","aistudio.google.com","alkalimakersuite-pa.clients6.google.com"]}]},
       {"tag":"claude","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/anthropic.srs","download_detour":"direct"},
       {"tag":"openai","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/openai.srs","download_detour":"direct"},
       {"tag":"tiktok","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/tiktok.srs","download_detour":"direct"},
@@ -2605,7 +2561,6 @@ warp_manage() {
     clear
     route_file="${conf_dir}/route.json"
     outbound_file="${conf_dir}/outbounds.json"
-    sync_gemini_ruleset
 
     echo ""
     green "=== WARP 分流管理 ===\n"
