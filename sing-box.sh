@@ -1300,7 +1300,9 @@ regenerate_warp_keys() {
 
 default_route_rule_sets_json() {
     jq -n '[
-      {"tag":"gemini","type":"inline","rules":[{"domain_suffix":["gemini.google.com","generativelanguage.googleapis.com","aistudio.google.com","alkalimakersuite-pa.clients6.google.com"]}]},
+      {"tag":"gemini","type":"inline","rules":[{"domain_suffix":["gemini.google.com","gemini.google","bard.google.com","aistudio.google.com","ai.google.dev","makersuite.google.com","generativeai.google","generativelanguage.googleapis.com","alkalimakersuite-pa.clients6.google.com","alkalicore-pa.clients6.google.com","webchannel-alkalimakersuite-pa.clients6.google.com","geminiweb-pa.clients6.google.com","geminiweb-pa.clients.google.com","waa-pa.clients6.google.com","people-pa.clients6.google.com","robinfrontend-pa.googleapis.com","proactivebackend-pa.googleapis.com","geller-pa.googleapis.com","gemini.gstatic.com","notebooklm.google.com","notebooklm.google","labs.google","aisandbox-pa.googleapis.com","jules.google.com","cloudaicompanion.googleapis.com","cloudcode-pa.googleapis.com"]}]},
+      {"tag":"gemini-dm","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/google-deepmind.srs","download_detour":"direct"},
+      {"tag":"gemini-gm","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/google-gemini.srs","download_detour":"direct"},
       {"tag":"claude","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/anthropic.srs","download_detour":"direct"},
       {"tag":"openai","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/openai.srs","download_detour":"direct"},
       {"tag":"tiktok","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo-lite/geosite/tiktok.srs","download_detour":"direct"},
@@ -2294,6 +2296,117 @@ manage_singbox() {
 }
 
 # Argo 管理
+# 更新 Argo 内核 (cloudflared)
+update_argo_core() {
+    clear; echo ""
+    green "=== Argo 内核 (cloudflared) 更新 ===\n"
+    local argo_bin="${work_dir}/argo"
+
+    local cf_arch
+    case "$(uname -m)" in
+        x86_64|amd64)  cf_arch="amd64" ;;
+        x86|i686|i386) cf_arch="386" ;;
+        aarch64|arm64) cf_arch="arm64" ;;
+        armv7l)        cf_arch="arm" ;;
+        *) red "架构 $(uname -m) 官方 cloudflared 不提供预编译包，无法更新。"; return 1 ;;
+    esac
+
+    local cur_ver="未安装"
+    if [ -s "$argo_bin" ]; then
+        cur_ver=$("$argo_bin" --version 2>/dev/null | head -1 | awk '{print $3}')
+        [ -z "$cur_ver" ] && cur_ver="未知"
+    fi
+    green "当前 Argo 内核版本: ${purple}${cur_ver}${re}"
+
+    local rel_json latest
+    if ! rel_json=$(gh_fetch_json "https://api.github.com/repos/cloudflare/cloudflared/releases/latest"); then
+        red "获取 cloudflared 最新版本失败，请检查服务器是否能访问 api.github.com\n"
+        gh_ipv6_hint
+        return 1
+    fi
+    latest=$(echo "$rel_json" | jq -r '.tag_name // empty' | sed 's/^v//')
+    if [ -z "$latest" ]; then
+        red "未获取到有效的版本号！"; return 1
+    fi
+    green "最新 Argo 内核版本: ${purple}${latest}${re}\n"
+
+    if [ "$cur_ver" = "$latest" ]; then
+        green "当前已是最新版本，无需更新。\n"
+        return 0
+    fi
+
+    reading "确认更新到 ${latest}? (y/n，默认y): " go_up
+    if [[ "$go_up" == "n" || "$go_up" == "N" ]]; then
+        yellow "已取消。"; return 0
+    fi
+
+    local is_quick=false
+    if command_exists rc-service 2>/dev/null; then
+        grep -Fq -- '--url http://localhost' /etc/init.d/argo 2>/dev/null && is_quick=true
+    else
+        grep -q 'ExecStart=.*--url http://localhost' /etc/systemd/system/argo.service 2>/dev/null && is_quick=true
+    fi
+    if [ "$is_quick" = true ]; then
+        yellow "\n检测到当前使用的是临时隧道：更新后重启会生成新的 trycloudflare 域名，脚本会自动同步到订阅。"
+    fi
+
+    local url="https://github.com/cloudflare/cloudflared/releases/download/${latest}/cloudflared-linux-${cf_arch}"
+    local tmp_bin
+    tmp_bin=$(mktemp)
+    yellow "\n正在下载 cloudflared ${latest} (${cf_arch})...\n"
+    local prefix ok=false
+    for prefix in "" "https://gh-proxy.com/" "https://ghfast.top/" "https://github.moeyy.xyz/"; do
+        if curl -fsSL --retry 2 -m 300 -o "$tmp_bin" "${prefix}${url}" 2>/dev/null && [ -s "$tmp_bin" ]; then
+            ok=true; break
+        fi
+    done
+    if [ "$ok" != true ]; then
+        red "下载失败！请检查网络，或确认版本 ${latest} 是否存在对应架构的发行包。\n"
+        gh_ipv6_hint
+        rm -f "$tmp_bin"; return 1
+    fi
+
+    chmod +x "$tmp_bin"
+    local new_ver
+    new_ver=$("$tmp_bin" --version 2>/dev/null | head -1 | awk '{print $3}')
+    if [ -z "$new_ver" ]; then
+        red "新内核无法运行（文件损坏或与本机不兼容），已放弃更新，当前内核保持不变。\n"
+        rm -f "$tmp_bin"; return 1
+    fi
+
+    local was_running=false
+    service_is_running "argo" && was_running=true
+    [ -s "$argo_bin" ] && cp -f "$argo_bin" "${argo_bin}.bak"
+    stop_argo >/dev/null 2>&1
+    mv -f "$tmp_bin" "$argo_bin"
+    chmod +x "$argo_bin"
+
+    if [ "$was_running" = true ] || [ "$is_quick" = true ]; then
+        if [ "$is_quick" = true ]; then
+            get_quick_tunnel
+        else
+            restart_argo
+            sleep 3
+        fi
+        if ! service_is_running "argo"; then
+            red "\n新内核启动失败，正在回滚到旧版本...\n"
+            if [ -f "${argo_bin}.bak" ]; then
+                mv -f "${argo_bin}.bak" "$argo_bin"; chmod +x "$argo_bin"
+            fi
+            restart_argo
+            yellow "已回滚到更新前的版本。"
+            return 1
+        fi
+    fi
+
+    rm -f "${argo_bin}.bak"
+    green "\nArgo 内核已更新: ${purple}${cur_ver} -> ${new_ver}${re}\n"
+    if [ "$is_quick" = true ] && [ -n "$ArgoDomain" ]; then
+        change_argo_domain
+    fi
+    return 0
+}
+
 manage_argo() {
     local argo_status=$(check_argo 2>/dev/null)
     clear; echo ""
@@ -2311,6 +2424,8 @@ manage_argo() {
     skyblue "------------------"
     green "6. 重新获取Argo临时域名"
     skyblue "-------------------"
+    green "7. Argo内核更新"
+    skyblue "---------------"
     purple "0. 返回主菜单"
     skyblue "-----------"
     reading "\n请输入选择: " choice
@@ -2379,6 +2494,7 @@ EOF
                     { yellow "当前使用固定隧道，无法获取临时隧道"; sleep 2; menu; }
             fi
             ;;
+        7) update_argo_core ;;
         0) return 10 ;;
         *) red "无效的选项！" ;;
     esac
@@ -2568,6 +2684,7 @@ warp_manage() {
     clear
     route_file="${conf_dir}/route.json"
     outbound_file="${conf_dir}/outbounds.json"
+    upgrade_gemini_rules
 
     echo ""
     green "=== WARP 分流管理 ===\n"
@@ -2576,7 +2693,7 @@ warp_manage() {
       .route.rules[]
       | select(.rule_set != null and .outbound != null)
       | . as $r
-      | ($r.rule_set - ["telegram-ip"]) as $tags
+      | ($r.rule_set - ["telegram-ip","gemini-dm","gemini-gm"]) as $tags
       | select(($tags | length) > 0)
       | "\($tags | join(", "))\t\($r.outbound)"
     ' "$route_file" 2>/dev/null | while IFS=$'\t' read -r tags outb; do
@@ -2630,6 +2747,35 @@ warp_manage() {
         00) exit 0 ;;
         *)  red "无效选项"; sleep 1; warp_manage ;;
     esac
+}
+
+# 让 gemini 规则排在 google 等宽泛规则之前（sing-box 按顺序匹配，先命中先生效）
+sort_gemini_first() {
+    jq_write "$route_file" '
+      .route.rules = (
+        [.route.rules[]? | select(.action == "sniff")]
+        + ([.route.rules[]? | select(.action != "sniff")]
+           | sort_by(if ((.rule_set // []) | index("gemini")) != null then 0 else 1 end))
+      )'
+}
+
+# 旧版 route.json 里 gemini 只有 4 个域名：自动升级为新版（扩充域名 + google-deepmind/google-gemini）
+upgrade_gemini_rules() {
+    local rf="${conf_dir}/route.json" defs
+    [ -s "$rf" ] || return 0
+    jq -e '.route.rules[]? | select(.rule_set != null) | .rule_set[]? | select(. == "gemini")' "$rf" >/dev/null 2>&1 || return 0
+    jq -e '.route.rules[]? | select(.rule_set != null) | .rule_set[]? | select(. == "gemini-dm")' "$rf" >/dev/null 2>&1 && return 0
+    defs=$(default_route_rule_sets_json 2>/dev/null) || return 0
+    jq_write "$rf" --argjson defs "$defs" '
+      .route.rule_set = (
+        [.route.rule_set[]? | select(.tag != "gemini" and .tag != "gemini-dm" and .tag != "gemini-gm")]
+        + [$defs[] | select(.tag == "gemini" or .tag == "gemini-dm" or .tag == "gemini-gm")]
+      )
+      | .route.rules = (.route.rules | map(
+          if ((.rule_set | type) == "array") and ((.rule_set | index("gemini")) != null)
+          then .rule_set += ["gemini-dm","gemini-gm"] else . end))' || return 0
+    sort_gemini_first
+    reload_singbox
 }
 
 add_rule_menu() {
@@ -2690,7 +2836,7 @@ custom_rule_menu() {
     fi
 
     case "$custom_tag" in
-        openai|claude|gemini|google|tiktok|twitter|youtube|netflix|telegram|telegram-ip)
+        openai|claude|gemini|gemini-dm|gemini-gm|google|tiktok|twitter|youtube|netflix|telegram|telegram-ip)
             red "该名称与内置服务保留字冲突，请换一个名称"; sleep 1; custom_rule_menu; return ;;
     esac
 
@@ -2822,6 +2968,17 @@ finalize_rule_add() {
         fi
     fi
 
+    if [ "$rule_tag" = "gemini" ]; then
+        tags_to_add=("gemini" "gemini-dm" "gemini-gm")
+        local gem_defs
+        gem_defs=$(default_route_rule_sets_json 2>/dev/null)
+        jq_write "$route_file" --argjson defs "$gem_defs" '
+          .route.rule_set = (
+            [.route.rule_set[]? | select(.tag != "gemini" and .tag != "gemini-dm" and .tag != "gemini-gm")]
+            + [$defs[] | select(.tag == "gemini" or .tag == "gemini-dm" or .tag == "gemini-gm")]
+          )'
+    fi
+
     for tag in "${tags_to_add[@]}"; do
         if jq -e --arg tag "$tag" \
             '.route.rules[] | select(.rule_set != null) | .rule_set[]? | select(. == $tag)' \
@@ -2843,6 +3000,7 @@ finalize_rule_add() {
         '
     done
 
+    sort_gemini_first
     reload_singbox
     if [ "$rule_tag" = "telegram" ]; then
         green "'telegram' 已分流至出站 '${selected_out}'（已自动包含 IP 规则）"
@@ -2955,7 +3113,7 @@ delete_rule_menu() {
     clear
     green "当前已启用的分流规则集:"
     local rule_tags=() i
-    mapfile -t rule_tags < <(jq -r '[.route.rules[] | select(.rule_set != null) | .rule_set[]?] | map(select(. != "telegram-ip")) | .[]' "$route_file")
+    mapfile -t rule_tags < <(jq -r '[.route.rules[] | select(.rule_set != null) | .rule_set[]?] | map(select(. != "telegram-ip" and . != "gemini-dm" and . != "gemini-gm")) | .[]' "$route_file")
     for i in "${!rule_tags[@]}"; do
         printf '%b%2d.%b %b%s%b\n' "$green" "$((i+1))" "$re" "$skyblue" "${rule_tags[$i]}" "$re"
     done
@@ -2973,6 +3131,9 @@ delete_rule_menu() {
     local tags_to_del=("$tag")
     if [ "$tag" = "telegram" ] || [ "$tag" = "telegram-ip" ]; then
         tags_to_del=("telegram" "telegram-ip")
+    fi
+    if [ "$tag" = "gemini" ] || [ "$tag" = "gemini-dm" ] || [ "$tag" = "gemini-gm" ]; then
+        tags_to_del=("gemini" "gemini-dm" "gemini-gm")
     fi
     for t in "${tags_to_del[@]}"; do
         jq_write "$route_file" --arg tag "$t" '
@@ -3603,7 +3764,6 @@ manage_protocols() {
 
 install_acme() {
     local acme_email="$1"
-    [ -z "$acme_email" ] && acme_email="admin@gmail.com"
 
     if command_exists apt; then
         manage_packages install cron >/dev/null 2>&1
@@ -3625,7 +3785,11 @@ install_acme() {
     yellow "正在安装 acme.sh...\n"
 
     local install_log
-    install_log=$(curl -s https://get.acme.sh | sh -s email="$acme_email" --force 2>&1)
+    if [ -n "$acme_email" ]; then
+        install_log=$(curl -s https://get.acme.sh | sh -s email="$acme_email" --force 2>&1)
+    else
+        install_log=$(curl -s https://get.acme.sh | sh 2>&1)
+    fi
 
     if [ ! -f "${HOME}/.acme.sh/acme.sh" ]; then
         yellow "官方源安装失败，尝试使用Gitee镜像安装...\n"
@@ -3633,7 +3797,11 @@ install_acme() {
         local tmp_acme_dir
         tmp_acme_dir=$(mktemp -d)
         if git clone -q --depth=1 https://gitee.com/neilpang/acme.sh.git "${tmp_acme_dir}/acme.sh" 2>/dev/null; then
-            ( cd "${tmp_acme_dir}/acme.sh" && ./acme.sh --install -m "$acme_email" --force >/dev/null 2>&1 )
+            if [ -n "$acme_email" ]; then
+                ( cd "${tmp_acme_dir}/acme.sh" && ./acme.sh --install -m "$acme_email" --force >/dev/null 2>&1 )
+            else
+                ( cd "${tmp_acme_dir}/acme.sh" && ./acme.sh --install --force >/dev/null 2>&1 )
+            fi
         fi
         rm -rf "$tmp_acme_dir"
     fi
@@ -3740,8 +3908,7 @@ apply_domain_cert() {
     if [ -z "$domain" ]; then
         red "域名不能为空！"; sleep 1; return
     fi
-    reading "请输入联系邮箱 (回车默认使用 admin@gmail.com): " cert_email
-    [ -z "$cert_email" ] && cert_email="admin@gmail.com"
+    reading "请输入联系邮箱 (可选，直接回车跳过；Let's Encrypt 已不再使用邮箱): " cert_email
 
     yellow "\n正在检测域名解析..."
     local server_ip4 server_ip6 resolved_ip4 resolved_ip6
