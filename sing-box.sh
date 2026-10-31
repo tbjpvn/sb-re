@@ -2841,8 +2841,13 @@ custom_rule_menu() {
     esac
 
     if jq -e --arg tag "$custom_tag" '.route.rule_set[]? | select(.tag == $tag)' "$route_file" >/dev/null 2>&1; then
-        yellow "名称 '${custom_tag}' 已存在，请换一个名称，或先在「2. 删除分流服务」中移除旧规则"
-        sleep 2; custom_rule_menu; return
+        if jq -e --arg tag "$custom_tag" '.route.rules[]? | select(.rule_set != null) | .rule_set[]? | select(. == $tag)' "$route_file" >/dev/null 2>&1; then
+            yellow "名称 '${custom_tag}' 已存在，请换一个名称，或先在「2. 删除分流服务」中移除旧规则"
+            sleep 2; custom_rule_menu; return
+        fi
+        # 规则集定义存在但没有任何分流规则引用它：上次创建中途退出留下的残留，自动清理后继续
+        jq_write "$route_file" --arg tag "$custom_tag" '.route.rule_set = [.route.rule_set[]? | select(.tag != $tag)]'
+        yellow "检测到名称 '${custom_tag}' 有上次未完成创建留下的残留定义，已自动清理，继续创建。"
     fi
 
     echo ""
@@ -2875,10 +2880,12 @@ custom_rule_menu() {
     local domains_json
     domains_json=$(printf '%s\n' "${domains[@]}" | jq -R . | jq -s .)
 
-    jq_write "$route_file" --arg tag "$custom_tag" --argjson domains "$domains_json" \
-        '.route.rule_set += [{"tag": $tag, "type": "inline", "rules": [{"domain_suffix": $domains}]}]'
+    # 规则集定义暂不写入 route.json：等 finalize_rule_add 选完出站、真正建立分流规则时再一并写入，
+    # 避免中途取消/出错后留下没人引用的残留定义(再用同名会提示已存在)
+    custom_pending_tag="$custom_tag"
+    custom_pending_domains="$domains_json"
 
-    green "\n已创建自定义分流规则 '${custom_tag}'，包含域名: ${domains[*]}\n"
+    green "\n自定义分流规则 '${custom_tag}'，包含域名: ${domains[*]}\n"
 
     finalize_rule_add "$custom_tag"
 }
@@ -2897,7 +2904,7 @@ finalize_rule_add() {
         yellow "规则集 '${rule_tag}' 已启用。"; sleep 1; warp_manage; return
     fi
 
-    if ! jq -e --arg tag "$rule_tag" '.route.rule_set[]? | select(.tag == $tag)' "$route_file" > /dev/null 2>&1; then
+    if [ "$rule_tag" != "${custom_pending_tag:-}" ] && ! jq -e --arg tag "$rule_tag" '.route.rule_set[]? | select(.tag == $tag)' "$route_file" > /dev/null 2>&1; then
         local builtin_defs matched_count
         builtin_defs=$(default_route_rule_sets_json 2>/dev/null)
         matched_count=$(echo "$builtin_defs" | jq --arg tag "$rule_tag" '[.[] | select(.tag == $tag)] | length' 2>/dev/null)
@@ -2977,6 +2984,13 @@ finalize_rule_add() {
             [.route.rule_set[]? | select(.tag != "gemini" and .tag != "gemini-dm" and .tag != "gemini-gm")]
             + [$defs[] | select(.tag == "gemini" or .tag == "gemini-dm" or .tag == "gemini-gm")]
           )'
+    fi
+
+    if [ -n "${custom_pending_tag:-}" ] && [ "$rule_tag" = "$custom_pending_tag" ]; then
+        jq_write "$route_file" --arg tag "$custom_pending_tag" --argjson domains "$custom_pending_domains" '
+          .route.rule_set = ([.route.rule_set[]? | select(.tag != $tag)]
+            + [{"tag": $tag, "type": "inline", "rules": [{"domain_suffix": $domains}]}])'
+        custom_pending_tag=""; custom_pending_domains=""
     fi
 
     for tag in "${tags_to_add[@]}"; do
