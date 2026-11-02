@@ -42,6 +42,8 @@ command_exists() {
 
 # 插件钩子: 插件通过定义 sbhook_<事件>__<插件ID> 函数接入, 主脚本在对应时机统一调用
 # 事件: outbound_flag <tag>(出站列表追加显示) / outbound_deleted <tag>(出站被删除后) / uninstall(卸载sing-box前)
+# 事件: rule_extra_choices <规则名>(输出若干行 "id<TAB>显示名"，作为额外出站选项追加到「设置分流服务」的出站列表末尾)
+#       rule_extra_commit <id> <规则集tag...>(用户选中某个额外选项后由对应插件接管建立规则，须自行校验/重载；非本插件的id应直接忽略)
 sb_run_hooks() {
     local ev=$1 fn
     shift
@@ -2935,7 +2937,11 @@ finalize_rule_add() {
     '
 
     local out_tags=($(jq -r '.outbounds[] | select(.tag != "direct") | .tag' "$outbound_file" 2>/dev/null))
-    if [ ${#out_tags[@]} -eq 0 ]; then
+    local ext_ids=() ext_labels=() ext_id ext_label selected_ext=""
+    while IFS=$'\t' read -r ext_id ext_label; do
+        [ -n "$ext_id" ] && { ext_ids+=("$ext_id"); ext_labels+=("${ext_label:-$ext_id}"); }
+    done < <(sb_run_hooks rule_extra_choices "$rule_tag" 2>/dev/null)
+    if [ ${#out_tags[@]} -eq 0 ] && [ ${#ext_ids[@]} -eq 0 ]; then
         if ! ensure_warp_endpoint; then
             red "WARP 出站不可用，本次分流设置已取消，请检查网络后重试，或先添加其他代理出站。"
             sleep 2; warp_manage; return
@@ -2947,6 +2953,9 @@ finalize_rule_add() {
         green "请选择分流流量要走的出站:(直接回车使用warp分流)"
         for i in "${!out_tags[@]}"; do
             echo -e "  ${green}$((i+1)). ${skyblue}${out_tags[$i]}${re}"
+        done
+        for i in "${!ext_ids[@]}"; do
+            echo -e "  ${green}$((${#out_tags[@]}+i+1)). ${skyblue}${ext_labels[$i]}${re}"
         done
         echo -e "  ${purple}0. 返回上级菜单${re}"
         reading "请输入编号: " out_choice
@@ -2960,8 +2969,10 @@ finalize_rule_add() {
             yellow "已取消"; sleep 1; warp_manage; return
         elif [[ ! "$out_choice" =~ ^[0-9]+$ ]] || \
            [ "$out_choice" -lt 1 ] || \
-           [ "$out_choice" -gt "${#out_tags[@]}" ]; then
+           [ "$out_choice" -gt "$(( ${#out_tags[@]} + ${#ext_ids[@]} ))" ]; then
             red "无效选择"; sleep 1; warp_manage; return
+        elif [ "$out_choice" -gt "${#out_tags[@]}" ]; then
+            selected_ext="${ext_ids[$((out_choice-${#out_tags[@]}-1))]}"
         else
             selected_out="${out_tags[$((out_choice-1))]}"
         fi
@@ -2991,6 +3002,11 @@ finalize_rule_add() {
           .route.rule_set = ([.route.rule_set[]? | select(.tag != $tag)]
             + [{"tag": $tag, "type": "inline", "rules": [{"domain_suffix": $domains}]}])'
         custom_pending_tag=""; custom_pending_domains=""
+    fi
+
+    if [ -n "$selected_ext" ]; then
+        sb_run_hooks rule_extra_commit "$selected_ext" "${tags_to_add[@]}"
+        sleep 2; warp_manage; return
     fi
 
     for tag in "${tags_to_add[@]}"; do
