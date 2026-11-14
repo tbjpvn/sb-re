@@ -1354,22 +1354,14 @@ system_warp_menu() {
     green  "1. 纯IPv6VPS —— 加装IPv4 WARP出站"
     green  "2. 纯IPv4VPS —— 加装IPv6 WARP出站"
     red    "3. 删除WARP出站"
-    green  "4. 启用/更新WARP看门狗(握手卡死自动重启接口)"
     purple "0. 返回主菜单"
     echo "==========================="
-    reading "请输入选择(0-4): " sw_choice
+    reading "请输入选择(0-3): " sw_choice
     echo ""
     case "$sw_choice" in
         1) sys_warp_add 4; read -n 1 -s -r -p $'\n按任意键返回...'; system_warp_menu ;;
         2) sys_warp_add 6; read -n 1 -s -r -p $'\n按任意键返回...'; system_warp_menu ;;
         3) sys_warp_delete_menu ;;
-        4)
-            if [ -f "${sys_warp_dir}/wgcf-v4.conf" ] || [ -f "${sys_warp_dir}/wgcf-v6.conf" ]; then
-                sys_warp_watchdog_install
-            else
-                yellow "尚未加装WARP出站，无需看门狗\n"
-            fi
-            read -n 1 -s -r -p $'\n按任意键返回...'; system_warp_menu ;;
         0) return ;;
         *) red "无效选项\n"; sleep 1; system_warp_menu ;;
     esac
