@@ -1086,6 +1086,7 @@ EOF
 
 sys_warp_enable_boot() {
     local iface="$1"
+    sys_warp_watchdog_install
     if command_exists systemctl; then
         systemctl enable "wg-quick@${iface}" &>/dev/null
     elif command_exists crontab; then
@@ -1101,8 +1102,92 @@ sys_warp_disable_boot() {
     command_exists crontab && { crontab -l 2>/dev/null | grep -v "wg-quick up ${iface}" | crontab - 2>/dev/null; }
 }
 
+sys_warp_wd_bin="/usr/local/bin/sb-wgcf-watchdog.sh"
+sys_warp_wd_log="/var/log/sb-wgcf-watchdog.log"
+
+# WARP看门狗：wg-quick@ 是一次性服务，握手卡死后接口仍显示UP且不会自愈，
+# 这里每3分钟检查一次，接口缺失则拉起，握手超过300秒未更新则重启接口
+sys_warp_watchdog_install() {
+    if ! command_exists crontab; then
+        if command_exists apt-get || command_exists apt; then
+            manage_packages install cron >/dev/null 2>&1
+            systemctl enable --now cron >/dev/null 2>&1
+        elif command_exists dnf || command_exists yum; then
+            manage_packages install cronie >/dev/null 2>&1
+            systemctl enable --now crond >/dev/null 2>&1
+        elif command_exists apk; then
+            manage_packages install dcron >/dev/null 2>&1
+            rc-update add dcron default >/dev/null 2>&1
+            rc-service dcron start >/dev/null 2>&1
+        fi
+    fi
+    if ! command_exists crontab; then
+        yellow "未检测到crontab且自动安装失败，WARP看门狗未启用(不影响WARP本身)\n"
+        return 1
+    fi
+
+    cat > "$sys_warp_wd_bin" << EOF
+#!/bin/bash
+STALE=300
+LOG="${sys_warp_wd_log}"
+LOCK=/tmp/sb-wgcf-watchdog.lock
+WG_DIR="${sys_warp_dir}"
+
+exec 9>"\$LOCK"
+command -v flock >/dev/null 2>&1 && { flock -n 9 || exit 0; }
+
+log() { echo "\$(date '+%F %T') \$*" >> "\$LOG"; }
+
+if [ -f "\$LOG" ] && [ "\$(wc -c < "\$LOG" 2>/dev/null || echo 0)" -gt 1048576 ]; then
+    tail -n 200 "\$LOG" > "\$LOG.tmp" && mv "\$LOG.tmp" "\$LOG"
+fi
+
+for conf in "\$WG_DIR"/wgcf-v4.conf "\$WG_DIR"/wgcf-v6.conf; do
+    [ -f "\$conf" ] || continue
+    IF=\$(basename "\$conf" .conf)
+
+    if ! ip link show "\$IF" >/dev/null 2>&1; then
+        if wg-quick up "\$IF" >/dev/null 2>&1; then
+            log "\$IF 接口缺失，已拉起"
+        else
+            log "\$IF 接口缺失，拉起失败"
+        fi
+        continue
+    fi
+
+    hs=\$(wg show "\$IF" latest-handshakes 2>/dev/null | awk '{print \$2; exit}')
+    now=\$(date +%s)
+    if [ -z "\$hs" ] || [ "\$hs" = "0" ] || [ \$((now - hs)) -gt "\$STALE" ]; then
+        wg-quick down "\$IF" >/dev/null 2>&1
+        if wg-quick up "\$IF" >/dev/null 2>&1; then
+            log "\$IF 握手过期(hs=\${hs:-none})，已重启接口"
+        else
+            log "\$IF 握手过期，重启接口失败"
+        fi
+    fi
+done
+EOF
+    chmod +x "$sys_warp_wd_bin"
+    (crontab -l 2>/dev/null | grep -v "sb-wgcf-watchdog"; echo "*/3 * * * * ${sys_warp_wd_bin}") | crontab - 2>/dev/null
+    green "WARP看门狗已启用(每3分钟检查，日志: ${sys_warp_wd_log})\n"
+}
+
+sys_warp_watchdog_remove() {
+    command_exists crontab && { crontab -l 2>/dev/null | grep -v "sb-wgcf-watchdog" | crontab - 2>/dev/null; }
+    rm -f "$sys_warp_wd_bin" "$sys_warp_wd_log" "${sys_warp_wd_log}.tmp" /tmp/sb-wgcf-watchdog.lock
+}
+
+sys_warp_watchdog_status() {
+    if [ -x "$sys_warp_wd_bin" ] && crontab -l 2>/dev/null | grep -q "sb-wgcf-watchdog"; then
+        green "  WARP看门狗: ${green}已启用${re}\n"
+    else
+        yellow "  WARP看门狗: 未启用\n"
+    fi
+}
+
 sys_warp_status() {
     local f iface
+    sys_warp_watchdog_status
     for f in 4 6; do
         iface=$(sys_warp_iface "$f")
         if [ -f "${sys_warp_dir}/${iface}.conf" ]; then
@@ -1233,6 +1318,9 @@ sys_warp_remove() {
     else
         yellow "${iface} 未安装，无需删除\n"
     fi
+    if [ ! -f "${sys_warp_dir}/wgcf-v4.conf" ] && [ ! -f "${sys_warp_dir}/wgcf-v6.conf" ]; then
+        sys_warp_watchdog_remove
+    fi
     _sb_cache_clear
 }
 
@@ -1266,14 +1354,22 @@ system_warp_menu() {
     green  "1. 纯IPv6VPS —— 加装IPv4 WARP出站"
     green  "2. 纯IPv4VPS —— 加装IPv6 WARP出站"
     red    "3. 删除WARP出站"
+    green  "4. 启用/更新WARP看门狗(握手卡死自动重启接口)"
     purple "0. 返回主菜单"
     echo "==========================="
-    reading "请输入选择(0-3): " sw_choice
+    reading "请输入选择(0-4): " sw_choice
     echo ""
     case "$sw_choice" in
         1) sys_warp_add 4; read -n 1 -s -r -p $'\n按任意键返回...'; system_warp_menu ;;
         2) sys_warp_add 6; read -n 1 -s -r -p $'\n按任意键返回...'; system_warp_menu ;;
         3) sys_warp_delete_menu ;;
+        4)
+            if [ -f "${sys_warp_dir}/wgcf-v4.conf" ] || [ -f "${sys_warp_dir}/wgcf-v6.conf" ]; then
+                sys_warp_watchdog_install
+            else
+                yellow "尚未加装WARP出站，无需看门狗\n"
+            fi
+            read -n 1 -s -r -p $'\n按任意键返回...'; system_warp_menu ;;
         0) return ;;
         *) red "无效选项\n"; sleep 1; system_warp_menu ;;
     esac
