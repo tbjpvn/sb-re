@@ -2074,6 +2074,86 @@ auto_uninstall() {
 }
 
 # 变更配置
+# 一键设置 Jetpac eSIM 免流节点（移植自老王 2026.11.25 版，适配本修改版）
+set_jetpac_esim() {
+    local domain esim_choice inbounds_file="${conf_dir}/inbounds.json" fingerprint
+
+    if [ -f "${work_dir}/cert_domain.txt" ]; then
+        red "\n当前正在使用域名证书($(cat "${work_dir}/cert_domain.txt"))，设置免流会覆盖证书并导致域名证书失效。"
+        yellow "请先在证书管理中恢复 bing.com 自签证书后再使用此功能。\n"
+        return 1
+    fi
+    if [ ! -f "$inbounds_file" ]; then
+        red "错误：未找到 ${inbounds_file}"; return 1
+    fi
+    if [ ! -f "$client_dir" ]; then
+        red "错误：未找到 ${client_dir}"; return 1
+    fi
+
+    clear; echo ""
+    green "=== 一键设置 Jetpac eSIM 免流节点 ===\n"
+    green "请选择免流域名:"
+    echo "  1. maps.google.com"
+    echo "  2. api.whatsapp.com"
+    echo "  3. grab.com"
+    echo "  4. wa.me"
+    skyblue "--------------------------------"
+    reading "请输入选择 (直接回车默认使用 1): " esim_choice
+
+    case "$esim_choice" in
+        2) domain="api.whatsapp.com" ;;
+        3) domain="grab.com" ;;
+        4) domain="wa.me" ;;
+        *) domain="maps.google.com" ;;
+    esac
+    green "\n已选择免流域名：${purple}${domain}${re}\n"
+
+    cp "$inbounds_file" "${inbounds_file}.bak.jetpac" 2>/dev/null
+    cp "${work_dir}/cert.pem" "${work_dir}/cert.pem.bak.jetpac" 2>/dev/null
+    cp "${work_dir}/private.key" "${work_dir}/private.key.bak.jetpac" 2>/dev/null
+
+    yellow "正在修改配置文件 ..."
+    jq_write "$inbounds_file" --arg domain "$domain" '
+        (.inbounds[] | select(.tag == "vless-reality") | .tls.server_name) = $domain |
+        (.inbounds[] | select(.tag == "vless-reality") | .tls.reality.handshake.server) = $domain |
+        (.inbounds[] | select(.tag == "hysteria2") | .masquerade) = ("https://" + $domain)
+    ' || { red "修改 inbounds.json 失败，已保持原配置"; return 1; }
+
+    yellow "正在重新生成自签证书和指纹 ..."
+    openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key" 2>/dev/null
+    openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" \
+        -out "${work_dir}/cert.pem" -subj "/CN=${domain}" 2>/dev/null
+    chmod 600 "${work_dir}/private.key"
+    chmod 644 "${work_dir}/cert.pem"
+    fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
+
+    yellow "正在重启 sing-box 服务 ..."
+    if ! restart_singbox; then
+        red "重启失败，正在回滚配置与证书 ..."
+        mv -f "${inbounds_file}.bak.jetpac" "$inbounds_file"
+        mv -f "${work_dir}/cert.pem.bak.jetpac" "${work_dir}/cert.pem"
+        mv -f "${work_dir}/private.key.bak.jetpac" "${work_dir}/private.key"
+        restart_singbox
+        return 1
+    fi
+    ensure_singbox_running || return 1
+    rm -f "${inbounds_file}.bak.jetpac" "${work_dir}/cert.pem.bak.jetpac" "${work_dir}/private.key.bak.jetpac"
+
+    yellow "正在更新节点链接中的域名与指纹 ..."
+    sed -i -E "/^vless:\/\//   s#([?&]sni=)[^&\#]*#\1${domain}#" "$client_dir"
+    sed -i -E "/^hysteria2:\/\// { s#([?&]sni=)[^&\#]*#\1${domain}#; s#([?&]pinSHA256=)[^&\#]*#\1${fingerprint}#; }" "$client_dir"
+    sed -i -E "/^tuic:\/\//    s#([?&]sni=)[^&\#]*#\1${domain}#" "$client_dir"
+    sed -i -E "/^anytls:\/\//  s#([?&]sni=)[^&\#]*#\1${domain}#" "$client_dir"
+    update_subscription
+
+    echo ""
+    green "=== 更新后的节点信息 ===\n"
+    print_client_urls
+    echo ""
+    green "Jetpac eSIM 免流节点设置完成！免流域名：${purple}${domain}${re}"
+    green "订阅已更新，请在客户端更新订阅。\n"
+}
+
 change_config() {
     local singbox_status=$(check_singbox 2>/dev/null)
     local singbox_installed=$?
@@ -2116,6 +2196,8 @@ change_config() {
     green "7. 修改节点ip为ipv4"
     skyblue "------------"
     green "8. 修改节点ip为ipv6"
+    skyblue "------------"
+    green "9. 一键设置节点为Jetpac-Esim免流节点"
     skyblue "------------"
     purple "0. 返回主菜单"
     skyblue "------------"
@@ -2353,6 +2435,7 @@ IEOF
             fi
             update_subscription
            ;;
+        9) set_jetpac_esim ;;
         0) return 10 ;;
         *) red "无效的选项！\n" ;;
     esac
