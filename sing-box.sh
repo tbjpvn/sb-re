@@ -40,8 +40,6 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# 插件钩子: 插件通过定义 sbhook_<事件>__<插件ID> 函数接入, 主脚本在对应时机统一调用
-# 事件: outbound_flag <tag>(出站列表追加显示) / outbound_deleted <tag>(出站被删除后) / uninstall(卸载sing-box前)
 sb_run_hooks() {
     local ev=$1 fn
     shift
@@ -198,7 +196,6 @@ verify_udp_listening() {
     return 0
 }
 
-# 检查sing-box状态
 check_singbox() {
     check_service "sing-box" "${work_dir}/${server_name}"
 }
@@ -219,7 +216,6 @@ check_congestion() {
     return 0
 }
 
-# 检查argo状态
 check_argo() {
     check_service "argo" "${work_dir}/argo"
 }
@@ -312,7 +308,6 @@ _ensure_pkg_index() {
     return 0
 }
 
-# 根据系统类型安装、卸载依赖
 manage_packages() {
     if [ $# -lt 2 ]; then
         red "Unspecified package name or action"
@@ -411,7 +406,6 @@ is_warp_org() {
     curl -"${flag}" -sm "$timeout" http://ipinfo.io/org 2>/dev/null | grep -qE 'Cloudflare|UnReal|AEZA|Andrei'
 }
 
-# 获取ip
 get_realip() {
     local cached ip v6
     if cached=$(_sb_cache_get realip); then
@@ -520,7 +514,6 @@ persist_iptables() {
     return 0
 }
 
-# 处理防火墙
 allow_port() {
     has_ufw=0
     has_firewalld=0
@@ -1105,8 +1098,6 @@ sys_warp_disable_boot() {
 sys_warp_wd_bin="/usr/local/bin/sb-wgcf-watchdog.sh"
 sys_warp_wd_log="/var/log/sb-wgcf-watchdog.log"
 
-# WARP看门狗：wg-quick@ 是一次性服务，握手卡死后接口仍显示UP且不会自愈，
-# 这里每3分钟检查一次，接口缺失则拉起，握手超过300秒未更新则重启接口
 sys_warp_watchdog_install() {
     if ! command_exists crontab; then
         if command_exists apt-get || command_exists apt; then
@@ -1502,7 +1493,6 @@ write_install_configs() {
     write_default_route_json "$resolver_tag" "$dns_strategy"
 }
 
-# 下载并安装 sing-box,cloudflared
 install_singbox() {
     clear
     purple "正在安装sing-box中，请稍后..."
@@ -1624,7 +1614,6 @@ install_singbox() {
 
 }
 
-# debian/ubuntu/centos 守护进程
 main_systemd_services() {
     cat > /etc/systemd/system/sing-box.service << EOF
 [Unit]
@@ -1680,7 +1669,6 @@ EOF
     systemctl start argo
 }
 
-# 适配alpine 守护进程
 alpine_openrc_services() {
     cat > /etc/init.d/sing-box << 'EOF'
 #!/sbin/openrc-run
@@ -1716,7 +1704,6 @@ EOF
     rc-update add argo default     > /dev/null 2>&1
 }
 
-# 生成节点和订阅链接
 get_info() {
     yellow "\nip检测中,请稍等...\n"
     server_ip=$(get_realip)
@@ -1778,7 +1765,6 @@ get_argo_port() {
     echo "${p:-${ARGO_PORT}}"
 }
 
-# 从已安装配置中获取UUID
 get_current_uuid() {
     local inbounds_file="${conf_dir}/inbounds.json"
     if [ -f "$inbounds_file" ]; then
@@ -1790,7 +1776,6 @@ get_current_uuid() {
     fi
 }
 
-# 通用服务管理函数
 manage_service() {
     local service_name="$1"
     local action="$2"
@@ -1920,7 +1905,6 @@ start_argo()     { manage_service "argo" "start"; }
 stop_argo()      { manage_service "argo" "stop"; }
 restart_argo()   { manage_service "argo" "restart"; }
 
-# 卸载 sing-box（交互式）
 stop_and_remove_services() {
     sb_run_hooks uninstall >/dev/null 2>&1 || true
     if command_exists rc-service; then
@@ -1945,7 +1929,6 @@ stop_and_remove_services() {
 cleanup_singbox_residuals() {
     rm -rf "${work_dir}" 2>/dev/null || true
 
-    # 快捷命令
     rm -f /usr/bin/sb 2>/dev/null || true
 
     rm -rf "${TMPDIR:-/tmp}/sb-ip-cache" 2>/dev/null || true
@@ -1972,7 +1955,6 @@ cleanup_acme_if_needed() {
     rm -rf "${HOME}/.acme.sh/${domain}_ecc" 2>/dev/null || true
 }
 
-# 卸载 sing-box（交互式）
 uninstall_singbox() {
     reading "确定要卸载 sing-box 吗? (y/n): " choice
     case "${choice}" in
@@ -2005,7 +1987,6 @@ uninstall_singbox() {
     esac
 }
 
-# 创建快捷指令
 create_shortcut() {
     cat > "$work_dir/sb.sh" << 'EOF'
 #!/usr/bin/env bash
@@ -2016,14 +1997,12 @@ EOF
     [ -s /usr/bin/sb ] && green "\n快捷指令 sb 创建成功\n" || red "\n快捷指令创建失败\n"
 }
 
-# 适配alpine
 change_hosts() {
     sh -c 'echo "0 0" > /proc/sys/net/ipv4/ping_group_range' 2>/dev/null || true
     grep -qE '^127\.0\.0\.1[[:space:]]+localhost' /etc/hosts 2>/dev/null || echo "127.0.0.1   localhost" >> /etc/hosts
     grep -qE '^::1[[:space:]]+localhost' /etc/hosts 2>/dev/null || echo "::1         localhost" >> /etc/hosts
 }
 
-# 非交互静默安装（-i 参数）
 auto_install() {
     check_singbox &>/dev/null
     if [ $? -eq 0 ]; then
@@ -2073,8 +2052,6 @@ auto_uninstall() {
     green "\nsing-box 已完全卸载!\n"
 }
 
-# 变更配置
-# 一键设置 Jetpac eSIM 免流节点（移植自老王 2026.11.25 版，适配本修改版）
 set_jetpac_esim() {
     local domain esim_choice inbounds_file="${conf_dir}/inbounds.json" fingerprint
 
@@ -2441,7 +2418,6 @@ IEOF
     esac
 }
 
-# singbox 管理
 manage_singbox() {
     local singbox_status=$(check_singbox 2>/dev/null)
     clear; echo ""
@@ -2466,8 +2442,6 @@ manage_singbox() {
     read -n 1 -s -r -p $'\n\033[1;91m按任意键返回...\033[0m\n'
 }
 
-# Argo 管理
-# 更新 Argo 内核 (cloudflared)
 update_argo_core() {
     clear; echo ""
     green "=== Argo 内核 (cloudflared) 更新 ===\n"
@@ -2920,7 +2894,6 @@ warp_manage() {
     esac
 }
 
-# 让 gemini 规则排在 google 等宽泛规则之前（sing-box 按顺序匹配，先命中先生效）
 sort_gemini_first() {
     jq_write "$route_file" '
       .route.rules = (
@@ -2930,7 +2903,6 @@ sort_gemini_first() {
       )'
 }
 
-# 旧版 route.json 里 gemini 只有 4 个域名：自动升级为新版（扩充域名 + google-deepmind/google-gemini）
 upgrade_gemini_rules() {
     local rf="${conf_dir}/route.json" defs
     [ -s "$rf" ] || return 0
@@ -3016,7 +2988,6 @@ custom_rule_menu() {
             yellow "名称 '${custom_tag}' 已存在，请换一个名称，或先在「2. 删除分流服务」中移除旧规则"
             sleep 2; custom_rule_menu; return
         fi
-        # 规则集定义存在但没有任何分流规则引用它：上次创建中途退出留下的残留，自动清理后继续
         jq_write "$route_file" --arg tag "$custom_tag" '.route.rule_set = [.route.rule_set[]? | select(.tag != $tag)]'
         yellow "检测到名称 '${custom_tag}' 有上次未完成创建留下的残留定义，已自动清理，继续创建。"
     fi
@@ -3051,8 +3022,6 @@ custom_rule_menu() {
     local domains_json
     domains_json=$(printf '%s\n' "${domains[@]}" | jq -R . | jq -s .)
 
-    # 规则集定义暂不写入 route.json：等 finalize_rule_add 选完出站、真正建立分流规则时再一并写入，
-    # 避免中途取消/出错后留下没人引用的残留定义(再用同名会提示已存在)
     custom_pending_tag="$custom_tag"
     custom_pending_domains="$domains_json"
 
@@ -4207,7 +4176,6 @@ restore_selfsigned_cert() {
     green "\n已恢复为bing.com自签证书\n"
 }
 
-# 显示当前证书是否在有效期内及有效期时间
 show_cert_validity() {
     local cert="${work_dir}/cert.pem"
     if [ ! -s "$cert" ] || ! command_exists openssl; then
@@ -4521,8 +4489,6 @@ manage_singbox_core() {
     manage_singbox_core
 }
 
-# 检查是否有其它 sysctl 配置会在重启后覆盖 BBR+fq：
-# 只报「值不一致」且「加载顺序晚于本配置」的文件；软链接按真实路径去重
 check_sysctl_conflicts() {
     local ours="$1" ours_real f real base line key val expected found=0
     local seen=" "
@@ -4536,7 +4502,6 @@ check_sysctl_conflicts() {
         case "$seen" in *" $real "*) continue ;; esac
         seen="$seen$real "
 
-        # /etc/sysctl.conf 最后加载；sysctl.d 内按文件名排序，排在本配置之前的会被本配置覆盖，无需关心
         if [ "$f" != "/etc/sysctl.conf" ] && [ "$real" != "/etc/sysctl.conf" ]; then
             base=$(basename "$f")
             [ "$(printf '%s\n%s\n' "$base" "$(basename "$ours")" | LC_ALL=C sort | tail -n1)" = "$base" ] || continue
@@ -4561,14 +4526,12 @@ check_sysctl_conflicts() {
     done
 }
 
-# 让网卡立即用上 fq：单队列网卡直接替换（无需重启），多队列(mq)只提示，虚拟网卡(noqueue)跳过
 apply_fq_to_nics() {
     local iface root_qdisc ifaces
 
     command -v tc >/dev/null 2>&1 || return 0
     command -v ip >/dev/null 2>&1 || return 0
 
-    # 默认路由出口 + 物理/半虚拟化网卡（/sys/class/net/xxx/device 存在）
     ifaces=$( {
         ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}'
         ip -6 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}'
@@ -4582,7 +4545,6 @@ apply_fq_to_nics() {
         root_qdisc=$(tc qdisc show dev "$iface" 2>/dev/null | awk '/ root/ {print $2; exit}')
         case "$root_qdisc" in
             ""|noqueue)
-                # 虚拟网卡（隧道/NAT64/veth 等），本身不排队，无需处理
                 ;;
             fq)
                 green "网卡 ${iface} 当前队列已是 fq。"
@@ -4618,7 +4580,6 @@ enable_bbr_fq() {
         return 1
     fi
 
-    # 先改运行时参数，成功后再写配置文件，避免失败时残留无效配置
     if ! sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || \
        ! sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; then
         [ -n "$old_qdisc" ] && sysctl -w net.core.default_qdisc="$old_qdisc" >/dev/null 2>&1
@@ -4633,7 +4594,6 @@ net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
 
-    # 开机提前加载 tcp_bbr 模块，避免 sysctl 先于模块加载而失效
     if [ -d /etc/modules-load.d ]; then
         echo "tcp_bbr" > "$modload_conf"
     fi
@@ -4650,7 +4610,6 @@ EOF
 
     check_sysctl_conflicts "$sysctl_conf"
 
-    # default_qdisc 只对新建的队列生效，这里让现有网卡立即切换
     apply_fq_to_nics
 }
 
@@ -4911,7 +4870,6 @@ system_swap_summary() {
     fi
 }
 
-# 是否存在非本脚本创建的系统默认swap
 has_system_swap() {
     local n
     n=$(awk -v f="$swap_file" 'NR>1 && $1!=f{c++} END{print c+0}' /proc/swaps 2>/dev/null)
