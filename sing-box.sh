@@ -4967,8 +4967,50 @@ swap_manage_menu() {
 }
 
 # 主菜单
+check_virt() {
+    local v="" dmi=""
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        v=$(systemd-detect-virt 2>/dev/null | head -n1)
+    fi
+    if [ -z "$v" ]; then
+        if [ -r /proc/1/environ ] && tr '\0' '\n' < /proc/1/environ 2>/dev/null | grep -q '^container=lxc'; then
+            v="lxc"
+        elif [ -d /proc/vz ] && [ ! -d /proc/bc ]; then
+            v="openvz"
+        elif [ -f /.dockerenv ]; then
+            v="docker"
+        elif grep -qi 'hypervisor' /proc/cpuinfo 2>/dev/null; then
+            dmi=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr 'A-Z' 'a-z' | tr '\n' ' ')
+            case "$dmi" in
+                *vmware*) v="vmware" ;;
+                *virtualbox*|*innotek*) v="oracle" ;;
+                *microsoft*) v="microsoft" ;;
+                *xen*) v="xen" ;;
+                *qemu*|*kvm*|*standard\ pc*|*bochs*|*openstack*|*alibaba*|*tencent*|*google*|*amazon*) v="kvm" ;;
+                *) v="vm" ;;
+            esac
+        else
+            v="none"
+        fi
+    fi
+    case "$v" in
+        none)          echo "物理机" ;;
+        kvm)           echo "KVM" ;;
+        lxc|lxc-libvirt) echo "LXC" ;;
+        openvz)        echo "OpenVZ" ;;
+        microsoft)     echo "Hyper-V" ;;
+        oracle)        echo "VirtualBox" ;;
+        vmware)        echo "VMware" ;;
+        xen)           echo "Xen" ;;
+        docker)        echo "Docker" ;;
+        podman)        echo "Podman" ;;
+        *)             echo "$v" | tr 'a-z' 'A-Z' ;;
+    esac
+}
+
 menu() {
     singbox_status=$(check_singbox 2>/dev/null)
+    virt_status=$(check_virt 2>/dev/null)
     dualstack_status=$(check_dualstack 2>/dev/null)
     argo_status=$(check_argo 2>/dev/null)
     congestion_status=$(check_congestion 2>/dev/null)
@@ -4980,6 +5022,7 @@ menu() {
     purple "=== 老王sing-box四合一安装脚本 ===\n"
     purple "---Argo 状态: ${argo_status}"
     purple "singbox 状态: ${singbox_status}"
+    purple "虚拟化架构: ${virt_status}"
     purple "拥塞控制算法: ${congestion_status}"
     purple "-双栈IP 状态: ${dualstack_status}\n"
     green " 1. 安装sing-box"
